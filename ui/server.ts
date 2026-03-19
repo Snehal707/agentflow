@@ -23,6 +23,7 @@ const CHAIN_ID = 5042002;
 const GATEWAY_API_BASE_URL =
   process.env.GATEWAY_API_BASE_URL || 'https://gateway-api-testnet.circle.com/v1';
 const GATEWAY_DOMAIN = Number(process.env.GATEWAY_DOMAIN || 26);
+const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15_000);
 
 const RESEARCH_URL = process.env.RESEARCH_AGENT_URL || 'http://localhost:3001/run';
 const ANALYST_URL = process.env.ANALYST_AGENT_URL || 'http://localhost:3002/run';
@@ -433,13 +434,31 @@ app.post('/run', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   // @ts-ignore
   res.flushHeaders?.();
 
+  let clientClosed = false;
+  const clearHeartbeat = () => {
+    clearInterval(heartbeat);
+  };
+  req.on('close', () => {
+    clientClosed = true;
+    clearHeartbeat();
+  });
+
   const sendEvent = (event: Record<string, unknown>) => {
-    if (res.writableEnded) return;
+    if (clientClosed || res.writableEnded) return;
     res.write(`data: ${JSON.stringify(event)}\n\n`);
   };
+
+  const heartbeat = setInterval(() => {
+    if (clientClosed || res.writableEnded) {
+      clearHeartbeat();
+      return;
+    }
+    res.write(`: keep-alive ${Date.now()}\n\n`);
+  }, SSE_HEARTBEAT_MS);
 
   if (!task.trim()) {
     sendEvent({ type: 'error', message: 'Task is required' });
@@ -609,6 +628,7 @@ app.post('/run', async (req, res) => {
   } catch (err) {
     sendEvent({ type: 'error', message: getErrorMessage(err) });
   } finally {
+    clearHeartbeat();
     if (!res.writableEnded) res.end();
   }
 });

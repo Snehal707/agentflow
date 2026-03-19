@@ -11,6 +11,12 @@ const app = express();
 app.use(express.json());
 
 const port = Number(process.env.WRITER_AGENT_PORT || 3003);
+const HERMES_TIMEOUT_MS = Number(
+  process.env.WRITER_HERMES_TIMEOUT_MS ||
+  process.env.WRITER_AGENT_TIMEOUT_MS ||
+  process.env.AGENT_TIMEOUT_MS ||
+  80_000,
+);
 let privateKey = process.env.PRIVATE_KEY?.trim() ?? '';
 if (privateKey && !privateKey.startsWith('0x')) privateKey = `0x${privateKey}`;
 const account = privateKeyToAccount(privateKey as `0x${string}`);
@@ -28,6 +34,21 @@ const gateway = createGatewayMiddleware({
   facilitatorUrl,
 });
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label)), ms);
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 const runHandler = async (req: express.Request, res: express.Response) => {
   try {
     const research =
@@ -40,11 +61,17 @@ const runHandler = async (req: express.Request, res: express.Response) => {
       ? `TOPIC:\n${task}\n\nRESEARCH:\n${research}\n\nANALYSIS:\n${analysis}`
       : `RESEARCH:\n${research}\n\nANALYSIS:\n${analysis}`;
 
-    const result = await callHermes(WRITER_SYSTEM_PROMPT, combinedInput);
+    const result = await withTimeout(
+      callHermes(WRITER_SYSTEM_PROMPT, combinedInput),
+      HERMES_TIMEOUT_MS,
+      `Writer Hermes timed out after ${HERMES_TIMEOUT_MS / 1000}s`,
+    );
     res.json({ research, analysis, result });
   } catch (err) {
     console.error('Writer agent error:', err);
-    res.status(500).json({ error: 'Writer agent failed' });
+    const message = err instanceof Error ? err.message : String(err);
+    const statusCode = message.includes('timed out') ? 504 : 500;
+    res.status(statusCode).json({ error: 'Writer agent failed', details: message });
   }
 };
 

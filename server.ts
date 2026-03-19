@@ -72,6 +72,7 @@ const WRITER_AGENT_TIMEOUT_MS = Number(
   process.env.WRITER_AGENT_TIMEOUT_MS || AGENT_TIMEOUT_MS,
 );
 const LIVE_DATA_TIMEOUT_MS = Number(process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS || 5_000);
+const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15_000);
 
 const SYSTEM_PROMPTS = {
   research: `You are a research agent. Given a topic, find and summarize key facts, recent developments, and relevant data. Be thorough and factual. Return structured JSON. When the user message includes LIVE DATA, use it for current figures. Do not use training data for prices or recent events when live data is provided. CRITICAL: Never start any line with >. Never use blockquote formatting. Write in clean plain paragraphs.`,
@@ -723,13 +724,31 @@ function createPublicApp(): express.Express {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     // @ts-ignore
     res.flushHeaders?.();
 
+    let clientClosed = false;
+    const clearHeartbeat = () => {
+      clearInterval(heartbeat);
+    };
+    req.on('close', () => {
+      clientClosed = true;
+      clearHeartbeat();
+    });
+
     const sendEvent = (event: Record<string, unknown>) => {
-      if (res.writableEnded) return;
+      if (clientClosed || res.writableEnded) return;
       res.write(`data: ${JSON.stringify(event)}\n\n`);
     };
+
+    const heartbeat = setInterval(() => {
+      if (clientClosed || res.writableEnded) {
+        clearHeartbeat();
+        return;
+      }
+      res.write(`: keep-alive ${Date.now()}\n\n`);
+    }, SSE_HEARTBEAT_MS);
 
     if (!task.trim()) {
       sendEvent({
@@ -916,6 +935,7 @@ function createPublicApp(): express.Express {
         message: getErrorMessage(err),
       });
     } finally {
+      clearHeartbeat();
       if (!res.writableEnded) res.end();
     }
   });

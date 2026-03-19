@@ -8,3 +8,11 @@ web/out
 *.log
 .cursor-skill
 agentflow-frontend
+output/
+wallets.json
+.vs/
+.claude/
+web/tsconfig.tsbuildinfo
+scripts/circle-setup/
+scripts/generate-ciphertext.ts
+scripts/test-circle.ts
