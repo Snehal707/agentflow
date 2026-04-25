@@ -23,3 +23,6 @@ wallets.json
 scripts/circle-setup/
 scripts/generate-ciphertext.ts
 scripts/test-circle.ts
+
+# Local all-in-one export for hackathon (single-URL submission); not part of backend-only repo
+agentic-economy-arc/
