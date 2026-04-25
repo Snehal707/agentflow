@@ -5515,8 +5515,16 @@ function createRunId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Extra origins (VPS, prod domain) — must match `Origin` header exactly. */
+const CORS_EXTRA_ALLOWED_ORIGINS = new Set([
+  'http://178.104.240.191',
+  'https://agentflow.one',
+  'http://agentflow.one',
+]);
+
 function isAllowedOrigin(origin: string | undefined): boolean {
   if (!origin) return true;
+  if (CORS_EXTRA_ALLOWED_ORIGINS.has(origin)) return true;
   try {
     const url = new URL(origin);
     const host = url.hostname.toLowerCase();
