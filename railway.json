@@ -1,7 +1,7 @@
 {
   "build": { "builder": "nixpacks" },
   "deploy": {
-    "startCommand": "npm run start",
+    "startCommand": "npm run start:api",
     "healthcheckPath": "/health",
     "restartPolicyType": "always"
   }
