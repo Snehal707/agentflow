@@ -15,12 +15,12 @@ async function main() {
 
   const client = new GatewayClient({
     chain: 'arcTestnet',
-    privateKey,
+    privateKey: privateKey as `0x${string}`,
   });
 
   const balances = await client.getBalances();
   console.log('Wallet + Gateway balances on Arc Testnet:');
-  console.log(`- Wallet USDC:    ${balances.wallet.formattedTotal}`);
+  console.log(`- Wallet USDC:    ${balances.wallet.formatted}`);
   console.log(`- Gateway total:  ${balances.gateway.formattedTotal}`);
   console.log(`- Gateway avail.: ${balances.gateway.formattedAvailable}`);
 }

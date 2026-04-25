@@ -1,13 +1,14 @@
 import dotenv from 'dotenv';
 import { getAddress, isAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { getFacilitatorBaseUrl } from '../lib/facilitator-url';
 
 dotenv.config();
 
 const FETCH_TIMEOUT_MS = 5000;
 
 const BACKEND_URL = (process.env.BACKEND_URL || 'http://localhost:4000').replace(/\/$/, '');
-const FACILITATOR_URL = (process.env.FACILITATOR_URL || 'http://localhost:3000').replace(/\/$/, '');
+const FACILITATOR_URL = getFacilitatorBaseUrl();
 const RESEARCH_AGENT_URL = process.env.RESEARCH_AGENT_URL || 'http://localhost:3001/run';
 const ANALYST_AGENT_URL = process.env.ANALYST_AGENT_URL || 'http://localhost:3002/run';
 const WRITER_AGENT_URL = process.env.WRITER_AGENT_URL || 'http://localhost:3003/run';
@@ -138,7 +139,7 @@ async function check4GatewayBalance(): Promise<CheckResult & { balance?: string;
     return {
       pass: true,
       reason: undefined,
-      details: { address: body.address ?? address, balance: body.balance ?? body.formatted, total: body.total },
+      details: { address: body.address ?? address, balance: body.balance, total: body.total },
     };
   } catch (e) {
     return {
@@ -211,11 +212,11 @@ async function main() {
   results.push({ label: '2. GET /health', result: r2 });
 
   const r3 = await check3HealthStack();
-  const stackLines =
-    r3.details?.stack &&
-    Object.entries(r3.details.stack as Record<string, boolean>)
-      .map(([k, v]) => `   ${k}: ${v ? 'ok' : 'down'}`)
-      .join('\n');
+  const stackLines = r3.details?.stack
+    ? Object.entries(r3.details.stack as Record<string, boolean>)
+        .map(([k, v]) => `   ${k}: ${v ? 'ok' : 'down'}`)
+        .join('\n')
+    : undefined;
   results.push({
     label: '3. GET /health/stack',
     result: r3,

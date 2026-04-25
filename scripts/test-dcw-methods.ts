@@ -15,7 +15,6 @@ if (!apiKey || !entitySecret) {
 const client = initiateDeveloperControlledWalletsClient({
   apiKey,
   entitySecret,
-  environment: 'sandbox',
 });
 
 // eslint-disable-next-line no-console

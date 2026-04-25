@@ -41,7 +41,7 @@ async function main(): Promise<void> {
     envContents = fs.readFileSync(envPath, 'utf8');
   }
 
-  if (!/^\s*CIRCLE_WALLET_SET_ID\s*=/.m.test(envContents)) {
+  if (!/^\s*CIRCLE_WALLET_SET_ID\s*=/m.test(envContents)) {
     const prefix = envContents && !envContents.endsWith('\n') ? '\n' : '';
     const line = `CIRCLE_WALLET_SET_ID=${walletSetId}`;
     fs.writeFileSync(envPath, envContents + prefix + line + '\n', 'utf8');

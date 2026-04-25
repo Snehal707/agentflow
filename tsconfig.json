@@ -1,8 +1,8 @@
 {
   "compilerOptions": {
     "target": "ES2020",
-    "module": "commonjs",
-    "moduleResolution": "node",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "rootDir": ".",
     "outDir": "dist",
     "esModuleInterop": true,
@@ -11,5 +11,5 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "include": ["agents", "orchestrator", "scripts", "lib", "facilitator"]
+  "include": ["agents", "orchestrator", "scripts", "lib", "facilitator", "db", "crons", "server.ts", "api"]
 }

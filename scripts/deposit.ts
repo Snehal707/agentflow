@@ -15,7 +15,7 @@ async function main() {
 
   const client = new GatewayClient({
     chain: 'arcTestnet',
-    privateKey,
+    privateKey: privateKey as `0x${string}`,
   });
 
   const balances = await client.getBalances();

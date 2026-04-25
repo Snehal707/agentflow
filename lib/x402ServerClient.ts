@@ -1,11 +1,30 @@
+import { randomBytes, randomUUID } from 'node:crypto';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import {
   decodePaymentRequiredHeader,
   decodePaymentResponseHeader,
 } from '@x402/core/http';
-import type { PaymentRequired, PaymentRequirements } from '@x402/core/types';
+import type {
+  PaymentRequired,
+  PaymentRequirements,
+  SettleResponse,
+} from '@x402/core/types';
 import { getAddress, type Address } from 'viem';
 import { signTypedDataWithCircleWallet } from './circleWallet';
+import { ensureGatewayBuyerBalance } from './gatewayLiquidity';
+import {
+  checkHttpHealth,
+  deriveHealthUrlFromRunUrl,
+  resolveFacilitatorHealthUrl,
+  type X402HealthCheckResult,
+} from './x402Health';
+import {
+  acquireX402InflightLock,
+  buildDefaultIdempotencyKey,
+  releaseX402InflightLock,
+  type JsonRequestBody,
+  writeX402AttemptRecord,
+} from './x402AttemptLedger';
 
 const CIRCLE_BATCHING_NAME = 'GatewayWalletBatched';
 const CIRCLE_BATCHING_VERSION = '1';
@@ -22,8 +41,6 @@ const transferWithAuthorizationTypes = {
   ],
 } as const;
 
-type JsonRequestBody = Record<string, unknown> | undefined;
-
 type GatewayBatchingRequirement = PaymentRequirements & {
   extra: Record<string, unknown> & {
     name?: string;
@@ -32,10 +49,21 @@ type GatewayBatchingRequirement = PaymentRequirements & {
   };
 };
 
+export interface X402SettlementTransaction {
+  id?: string;
+  txHash?: string;
+  payer?: string;
+  network?: string;
+  rawTransaction?: string;
+}
+
 export interface PayProtectedResourceServerResult<T> {
   data: T;
   status: number;
-  transaction?: string;
+  requestId: string;
+  transaction?: X402SettlementTransaction;
+  transactionRef?: string;
+  settlement?: SettleResponse;
 }
 
 export interface PayProtectedResourceServerInput<TBody extends JsonRequestBody> {
@@ -46,16 +74,33 @@ export interface PayProtectedResourceServerInput<TBody extends JsonRequestBody> 
   payer: Address;
   chainId: number;
   headers?: Record<string, string>;
+  requestId?: string;
+  idempotencyKey?: string;
+  skipPreflight?: boolean;
 }
 
 function createNonce(): `0x${string}` {
-  const bytes = new Uint8Array(32);
-  for (let i = 0; i < bytes.length; i += 1) {
-    bytes[i] = Math.floor(Math.random() * 256);
-  }
-  return `0x${Array.from(bytes)
-    .map((byte) => byte.toString(16).padStart(2, '0'))
-    .join('')}` as `0x${string}`;
+  return `0x${randomBytes(32).toString('hex')}` as `0x${string}`;
+}
+
+
+function formatHealthForMessage(label: string, health: X402HealthCheckResult): string {
+  return `${label}: ${health.ok ? 'ok' : 'down'} (${health.url}${health.error ? ` — ${health.error}` : ''})`;
+}
+
+
+async function assertX402RailHealthy(runUrl: string): Promise<{
+  facilitator: X402HealthCheckResult;
+  target: X402HealthCheckResult;
+}> {
+  const facilitatorUrl = resolveFacilitatorHealthUrl();
+  const targetHealthUrl = deriveHealthUrlFromRunUrl(runUrl);
+  const [facilitator, target] = await Promise.all([
+    checkHttpHealth(facilitatorUrl),
+    checkHttpHealth(targetHealthUrl),
+  ]);
+
+  return { facilitator, target };
 }
 
 function isGatewayBatchingOption(
@@ -73,6 +118,61 @@ function isGatewayBatchingOption(
     typedExtra.version === CIRCLE_BATCHING_VERSION &&
     typeof typedExtra.verifyingContract === 'string'
   );
+}
+
+function findGatewayBatchingRequirement(
+  paymentRequired: PaymentRequired,
+  chainId: number,
+): GatewayBatchingRequirement | null {
+  const matching = paymentRequired.accepts.find((requirements) =>
+    isGatewayBatchingOption(requirements, chainId),
+  );
+  return matching ?? null;
+}
+
+function gatewayAtomicAmountToUsdc(amount: string): number {
+  const parsed = Number(amount);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return parsed / 1_000_000;
+}
+
+function isTxHash(value: string | undefined): boolean {
+  return Boolean(value && /^0x[a-fA-F0-9]{64}$/.test(value));
+}
+
+function normalizeSettlement(
+  settle: SettleResponse | undefined,
+): X402SettlementTransaction | undefined {
+  if (!settle) {
+    return undefined;
+  }
+
+  const rawTransaction =
+    typeof settle.transaction === 'string' && settle.transaction.trim()
+      ? settle.transaction.trim()
+      : undefined;
+
+  return {
+    id: rawTransaction && !isTxHash(rawTransaction) ? rawTransaction : undefined,
+    txHash: rawTransaction && isTxHash(rawTransaction) ? rawTransaction : undefined,
+    payer: typeof settle.payer === 'string' ? settle.payer : undefined,
+    network: typeof settle.network === 'string' ? settle.network : undefined,
+    rawTransaction,
+  };
+}
+
+export function pickX402SettlementReference(
+  transaction: X402SettlementTransaction | undefined,
+): string | undefined {
+  return transaction?.txHash ?? transaction?.id ?? transaction?.rawTransaction;
+}
+
+export function pickX402GatewayTransferId(
+  transaction: X402SettlementTransaction | undefined,
+): string | undefined {
+  return transaction?.id;
 }
 
 class ServerGatewayBatchScheme {
@@ -154,8 +254,16 @@ class ServerGatewayBatchScheme {
       },
     };
 
-    // eslint-disable-next-line no-console
-    console.log('[x402Server] FULL typedData:', JSON.stringify(typedData, null, 2));
+    console.log(
+      '[x402Server] signing typed data',
+      JSON.stringify({
+        payer: authorization.from,
+        payTo: authorization.to,
+        value: authorization.value,
+        validBefore: authorization.validBefore,
+        network: requirements.network,
+      }),
+    );
 
     const signature = (await signTypedDataWithCircleWallet(
       this.circleWalletId,
@@ -217,6 +325,22 @@ export async function payProtectedResourceServer<
   PayProtectedResourceServerResult<TResponse>
 > {
   const method = input.method ?? 'POST';
+  const requestId = input.requestId?.trim() || `x402_${randomUUID()}`;
+  const idempotencyKey =
+    input.idempotencyKey?.trim() || buildDefaultIdempotencyKey(input);
+  const facilitatorUrl = resolveFacilitatorHealthUrl();
+  console.log('[x402] attempting payment:', {
+    requestId,
+    url: input.url,
+    circleWalletId: input.circleWalletId,
+    payer: input.payer,
+    chainId: input.chainId,
+  });
+  console.log('[x402] chain config:', {
+    chainId: input.chainId,
+    facilitatorUrl,
+  });
+  await acquireX402InflightLock(requestId, idempotencyKey);
   const baseHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(input.headers || {}),
@@ -229,67 +353,267 @@ export async function payProtectedResourceServer<
       body: method === 'POST' ? JSON.stringify(input.body ?? {}) : undefined,
     });
 
-  const initialResponse = await execute(baseHeaders);
-
-  if (initialResponse.status !== 402) {
-    const data = await parseResponseBody<TResponse>(initialResponse);
-    if (!initialResponse.ok) {
-      const details = typeof data === 'string' ? data : JSON.stringify(data);
-      throw new Error(
-        `Agent call failed with status ${initialResponse.status}: ${details}`,
-      );
-    }
-    const settleHeader = initialResponse.headers.get('PAYMENT-RESPONSE');
-    const settle = settleHeader
-      ? decodePaymentResponseHeader(settleHeader)
-      : undefined;
-    return {
-      data,
-      status: initialResponse.status,
-      transaction: settle?.transaction,
-    };
-  }
-
-  const paymentRequiredHeader = initialResponse.headers.get('PAYMENT-REQUIRED');
-  if (!paymentRequiredHeader) {
-    throw new Error('Missing PAYMENT-REQUIRED header in 402 response.');
-  }
-
-  const paymentRequired = decodePaymentRequiredHeader(
-    paymentRequiredHeader,
-  ) as PaymentRequired;
-  const httpClient = await buildX402HttpClient(
-    input.circleWalletId,
-    input.payer,
-    input.chainId,
-  );
-
-  const paymentPayload = await httpClient.createPaymentPayload(paymentRequired);
-  const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
-
-  const paidResponse = await execute({
-    ...baseHeaders,
-    ...paymentHeaders,
+  await writeX402AttemptRecord({
+    requestId,
+    idempotencyKey,
+    route: input.url,
+    method,
+    payer: getAddress(input.payer),
+    chainId: input.chainId,
+    stage: 'started',
   });
 
-  const paidData = await parseResponseBody<TResponse>(paidResponse);
-  if (!paidResponse.ok) {
-    const details =
-      typeof paidData === 'string' ? paidData : JSON.stringify(paidData);
-    throw new Error(
-      `Payment retry failed with status ${paidResponse.status}: ${details}`,
+  try {
+    if (!input.skipPreflight) {
+      const health = await assertX402RailHealthy(input.url);
+      if (!health.facilitator.ok || !health.target.ok) {
+        await writeX402AttemptRecord({
+          requestId,
+          idempotencyKey,
+          route: input.url,
+          method,
+          payer: getAddress(input.payer),
+          chainId: input.chainId,
+          stage: 'preflight_failed',
+          error: [
+            'x402 preflight failed.',
+            `Request ID: ${requestId}`,
+            formatHealthForMessage('Facilitator', health.facilitator),
+            formatHealthForMessage('Target', health.target),
+          ].join('\n'),
+          facilitator: health.facilitator,
+          target: health.target,
+        });
+        throw new Error(
+          [
+            'x402 preflight failed.',
+            `Request ID: ${requestId}`,
+            formatHealthForMessage('Facilitator', health.facilitator),
+            formatHealthForMessage('Target', health.target),
+          ].join('\n'),
+        );
+      }
+
+      await writeX402AttemptRecord({
+        requestId,
+        idempotencyKey,
+        route: input.url,
+        method,
+        payer: getAddress(input.payer),
+        chainId: input.chainId,
+        stage: 'preflight_ok',
+        facilitator: health.facilitator,
+        target: health.target,
+      });
+    }
+
+    const initialResponse = await execute(baseHeaders);
+
+    if (initialResponse.status !== 402) {
+      const data = await parseResponseBody<TResponse>(initialResponse);
+      if (!initialResponse.ok) {
+        const details = typeof data === 'string' ? data : JSON.stringify(data);
+        await writeX402AttemptRecord({
+          requestId,
+          idempotencyKey,
+          route: input.url,
+          method,
+          payer: getAddress(input.payer),
+          chainId: input.chainId,
+          stage: 'failed',
+          httpStatus: initialResponse.status,
+          error: `Agent call failed with status ${initialResponse.status}: ${details}`,
+        });
+        throw new Error(
+          `Agent call failed with status ${initialResponse.status}: ${details}`,
+        );
+      }
+      const settleHeader = initialResponse.headers.get('PAYMENT-RESPONSE');
+      const settle = settleHeader
+        ? decodePaymentResponseHeader(settleHeader)
+        : undefined;
+      const transaction = normalizeSettlement(settle);
+      if (transaction) {
+        console.log('[x402] settlement:', JSON.stringify(transaction));
+      }
+      await writeX402AttemptRecord({
+        requestId,
+        idempotencyKey,
+        route: input.url,
+        method,
+        payer: getAddress(input.payer),
+        chainId: input.chainId,
+        stage: 'succeeded',
+        httpStatus: initialResponse.status,
+        transaction: pickX402SettlementReference(transaction),
+      });
+      return {
+        data,
+        status: initialResponse.status,
+        requestId,
+        transaction,
+        transactionRef: pickX402SettlementReference(transaction),
+        settlement: settle,
+      };
+    }
+
+    await writeX402AttemptRecord({
+      requestId,
+      idempotencyKey,
+      route: input.url,
+      method,
+      payer: getAddress(input.payer),
+      chainId: input.chainId,
+      stage: 'payment_required',
+      httpStatus: initialResponse.status,
+    });
+    console.log('[x402] 402 received, payment required');
+
+    const paymentRequiredHeader = initialResponse.headers.get('PAYMENT-REQUIRED');
+    if (!paymentRequiredHeader) {
+      await writeX402AttemptRecord({
+        requestId,
+        idempotencyKey,
+        route: input.url,
+        method,
+        payer: getAddress(input.payer),
+        chainId: input.chainId,
+        stage: 'failed',
+        httpStatus: initialResponse.status,
+        error: 'Missing PAYMENT-REQUIRED header in 402 response.',
+      });
+      throw new Error(`Missing PAYMENT-REQUIRED header in 402 response. Request ID: ${requestId}`);
+    }
+
+    const paymentRequired = decodePaymentRequiredHeader(
+      paymentRequiredHeader,
+    ) as PaymentRequired;
+    console.log('[x402] payment requirements:', JSON.stringify(paymentRequired, null, 2));
+    const gatewayRequirement = findGatewayBatchingRequirement(paymentRequired, input.chainId);
+    if (!gatewayRequirement) {
+      await writeX402AttemptRecord({
+        requestId,
+        idempotencyKey,
+        route: input.url,
+        method,
+        payer: getAddress(input.payer),
+        chainId: input.chainId,
+        stage: 'failed',
+        httpStatus: initialResponse.status,
+        error: `No GatewayWalletBatched payment option found for eip155:${input.chainId}.`,
+      });
+      throw new Error(
+        `No GatewayWalletBatched payment option found for eip155:${input.chainId}. Request ID: ${requestId}`,
+      );
+    }
+    const requiredAmountUsdc = gatewayAtomicAmountToUsdc(gatewayRequirement.amount);
+    const buyerGatewayBalance = await ensureGatewayBuyerBalance({
+      walletId: input.circleWalletId,
+      walletAddress: input.payer,
+      requiredAmountUsdc,
+      label: input.url,
+      requestId,
+    });
+    console.log('[x402] buyer gateway balance ready:', buyerGatewayBalance);
+    const httpClient = await buildX402HttpClient(
+      input.circleWalletId,
+      input.payer,
+      input.chainId,
     );
+
+    const paymentPayload = await httpClient.createPaymentPayload(paymentRequired);
+    console.log('[x402] payment built:', JSON.stringify(paymentPayload, null, 2));
+    await writeX402AttemptRecord({
+      requestId,
+      idempotencyKey,
+      route: input.url,
+      method,
+      payer: getAddress(input.payer),
+      chainId: input.chainId,
+      stage: 'payload_created',
+    });
+    const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
+
+    await writeX402AttemptRecord({
+      requestId,
+      idempotencyKey,
+      route: input.url,
+      method,
+      payer: getAddress(input.payer),
+      chainId: input.chainId,
+      stage: 'paid_request_sent',
+    });
+    const paidResponse = await execute({
+      ...baseHeaders,
+      ...paymentHeaders,
+    });
+    const paidResponseBody = await paidResponse.clone().text();
+    console.log('[x402] payment response status:', paidResponse.status);
+    console.log('[x402] payment response body:', paidResponseBody);
+
+    const paidData = await parseResponseBody<TResponse>(paidResponse);
+    if (!paidResponse.ok) {
+      const details =
+        typeof paidData === 'string' ? paidData : JSON.stringify(paidData);
+      await writeX402AttemptRecord({
+        requestId,
+        idempotencyKey,
+        route: input.url,
+        method,
+        payer: getAddress(input.payer),
+        chainId: input.chainId,
+        stage: 'failed',
+        httpStatus: paidResponse.status,
+        error: `Payment retry failed with status ${paidResponse.status}: ${details}`,
+      });
+      throw new Error(
+        `Payment retry failed with status ${paidResponse.status}: ${details}`,
+      );
+    }
+
+    const paymentResponseHeader = paidResponse.headers.get('PAYMENT-RESPONSE');
+    const settle = paymentResponseHeader
+      ? decodePaymentResponseHeader(paymentResponseHeader)
+      : undefined;
+    const transaction = normalizeSettlement(settle);
+    if (transaction) {
+      console.log('[x402] settlement:', JSON.stringify(transaction));
+    }
+
+    await writeX402AttemptRecord({
+      requestId,
+      idempotencyKey,
+      route: input.url,
+      method,
+      payer: getAddress(input.payer),
+      chainId: input.chainId,
+      stage: 'succeeded',
+      httpStatus: paidResponse.status,
+      transaction: pickX402SettlementReference(transaction),
+    });
+
+    return {
+      data: paidData,
+      status: paidResponse.status,
+      requestId,
+      transaction,
+      transactionRef: pickX402SettlementReference(transaction),
+      settlement: settle,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await writeX402AttemptRecord({
+      requestId,
+      idempotencyKey,
+      route: input.url,
+      method,
+      payer: getAddress(input.payer),
+      chainId: input.chainId,
+      stage: 'failed',
+      error: message,
+    });
+    throw error;
+  } finally {
+    await releaseX402InflightLock(requestId, idempotencyKey);
   }
-
-  const paymentResponseHeader = paidResponse.headers.get('PAYMENT-RESPONSE');
-  const settle = paymentResponseHeader
-    ? decodePaymentResponseHeader(paymentResponseHeader)
-    : undefined;
-
-  return {
-    data: paidData,
-    status: paidResponse.status,
-    transaction: settle?.transaction,
-  };
 }
-

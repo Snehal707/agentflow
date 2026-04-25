@@ -1,8 +1,8 @@
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import {
-  generateEntitySecret,
   registerEntitySecretCiphertext,
   initiateDeveloperControlledWalletsClient,
 } from '@circle-fin/developer-controlled-wallets';
@@ -32,8 +32,8 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  console.log('[CircleReset] Generating new entity secret via generateEntitySecret()...');
-  const entitySecret = generateEntitySecret();
+  console.log('[CircleReset] Generating new entity secret...');
+  const entitySecret = crypto.randomBytes(32).toString('hex');
 
   const recoveryDir = path.join(process.cwd(), 'output');
   if (!fs.existsSync(recoveryDir)) {

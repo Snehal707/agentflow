@@ -1,12 +1,13 @@
 import dotenv from 'dotenv';
-import { createPublicClient, formatUnits, getAddress, http } from 'viem';
+import { createPublicClient, formatUnits, getAddress, http, parseUnits } from 'viem';
+import { resolveArcRpcUrl } from './arc-config';
 import { getWalletForUser, setWalletForUser } from './walletStore';
 
 dotenv.config();
 
 const ARC_CHAIN_ID = 5042002;
 const ARC_TESTNET_BLOCKCHAIN = 'ARC-TESTNET';
-const ARC_RPC_URL = process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network';
+const ARC_RPC_URL = resolveArcRpcUrl();
 const GATEWAY_API_BASE_URL =
   process.env.GATEWAY_API_BASE_URL || 'https://gateway-api-testnet.circle.com/v1';
 const ARC_TESTNET_DOMAIN = Number(process.env.GATEWAY_DOMAIN || 26);
@@ -191,11 +192,14 @@ export async function getDCWClient(): Promise<any> {
   return dcwClientPromise;
 }
 
-let walletSetId: string | null = process.env.CIRCLE_WALLET_SET_ID || null;
+let walletSetId: string | null =
+  process.env.WALLET_SET_ID?.trim() ||
+  process.env.CIRCLE_WALLET_SET_ID?.trim() ||
+  null;
 
 export async function getOrCreateWalletSetId(): Promise<string> {
   if (!walletSetId) {
-    throw new Error('CIRCLE_WALLET_SET_ID is required in .env for Circle wallets.');
+    throw new Error('WALLET_SET_ID (or legacy CIRCLE_WALLET_SET_ID) is required in .env for Circle wallets.');
   }
   return walletSetId;
 }
@@ -365,6 +369,32 @@ export async function getCircleWalletForUser(userAddress: string): Promise<{
   };
 }
 
+export async function getOrCreateCircleWalletForUser(userAddress: string): Promise<{
+  walletId: string;
+  address: string;
+}> {
+  const normalized = getAddress(userAddress);
+  const existing = await findCircleWalletForUser(normalized);
+  if (existing) {
+    return {
+      walletId: existing.walletId,
+      address: existing.address,
+    };
+  }
+
+  await getOrCreateWalletSetId();
+  const created = await createUserWallet(normalized);
+  setWalletForUser(normalized, {
+    circleWalletId: created.id,
+    circleWalletAddress: created.address,
+  });
+
+  return {
+    walletId: created.id,
+    address: created.address,
+  };
+}
+
 /**
  * Low-level helper for x402 server client: sign arbitrary EIP-712 typed data
  * with a Circle dev-controlled wallet.
@@ -479,6 +509,8 @@ export async function getCircleWalletUSDCBalance(walletId: string): Promise<numb
 
 /**
  * Transfer USDC from a dev-controlled wallet to the Circle Gateway contract on Arc Testnet.
+ * For arbitrary-address ERC-20 transfers (e.g. invoice settlement), use `executeTransaction`
+ * in `lib/dcw.ts` (see `agents/invoice/subagents/executor.ts`).
  * Performs two steps using Circle DCW:
  * 1) approve(USDC -> Gateway)
  * 2) deposit(USDC into Gateway)
@@ -490,6 +522,8 @@ export async function getCircleWalletUSDCBalance(walletId: string): Promise<numb
 export async function transferToGateway(params: {
   walletId: string;
   walletAddress: string;
+  /** When set, caps approval and deposit so at most this much USDC (6 decimals) is moved. */
+  maxAmountUsdc?: string;
 }): Promise<{
   transferId: string | undefined;
   status: string;
@@ -504,17 +538,25 @@ export async function transferToGateway(params: {
   errorReason?: string;
   errorDetails?: string;
 }> {
-  const { walletId, walletAddress } = params;
+  const { walletId, walletAddress, maxAmountUsdc } = params;
 
   const dcwClient = await getDCWClient();
-  const currentBalanceRaw = await getOnChainUSDCBalanceRaw(walletAddress);
+  const fullBalanceRaw = await getOnChainUSDCBalanceRaw(walletAddress);
+  let targetMaxRaw = fullBalanceRaw;
+  const capTrim = maxAmountUsdc?.trim();
+  if (capTrim) {
+    const capRaw = parseUnits(capTrim, USDC_DECIMALS);
+    if (capRaw < targetMaxRaw) {
+      targetMaxRaw = capRaw;
+    }
+  }
 
   // eslint-disable-next-line no-console
   console.log(
-    `[CircleWallet] On-chain wallet USDC balance before funding: ${currentBalanceRaw.toString()} (${rawUSDCToNumber(currentBalanceRaw)} USDC)`,
+    `[CircleWallet] On-chain wallet USDC balance before funding: ${fullBalanceRaw.toString()} (${rawUSDCToNumber(fullBalanceRaw)} USDC), targetMaxRaw=${targetMaxRaw.toString()}`,
   );
 
-  if (currentBalanceRaw <= 0n) {
+  if (targetMaxRaw <= 0n) {
     return {
       transferId: undefined,
       status: 'NO_FUNDS',
@@ -544,14 +586,14 @@ export async function transferToGateway(params: {
       }
     | undefined;
 
-  if (currentAllowanceRaw < currentBalanceRaw) {
+  if (currentAllowanceRaw < targetMaxRaw) {
     let approvalTx: any;
     try {
       const approvalRes = await dcwClient.createContractExecutionTransaction({
         walletId,
         contractAddress: USDC_TOKEN_ADDRESS,
         abiFunctionSignature: 'approve(address,uint256)',
-        abiParameters: [GATEWAY_CONTRACT_ADDRESS, currentBalanceRaw.toString()],
+        abiParameters: [GATEWAY_CONTRACT_ADDRESS, targetMaxRaw.toString()],
         fee: {
           type: 'level',
           config: { feeLevel: 'HIGH' },
@@ -603,27 +645,26 @@ export async function transferToGateway(params: {
   }
 
   const postApprovalBalanceRaw = await getOnChainUSDCBalanceRaw(walletAddress);
+  const baseForDeposit =
+    postApprovalBalanceRaw < targetMaxRaw ? postApprovalBalanceRaw : targetMaxRaw;
   const depositFeeReserveRaw = await estimateFeeReserveRaw(
     dcwClient,
     {
       walletId,
       contractAddress: GATEWAY_CONTRACT_ADDRESS,
       abiFunctionSignature: 'deposit(address,uint256)',
-      abiParameters: [
-        USDC_TOKEN_ADDRESS,
-        postApprovalBalanceRaw.toString(),
-      ],
+      abiParameters: [USDC_TOKEN_ADDRESS, baseForDeposit.toString()],
     },
     'deposit',
   );
   const depositAmountRaw =
-    postApprovalBalanceRaw > depositFeeReserveRaw
-      ? postApprovalBalanceRaw - depositFeeReserveRaw
+    baseForDeposit > depositFeeReserveRaw
+      ? baseForDeposit - depositFeeReserveRaw
       : 0n;
 
   // eslint-disable-next-line no-console
   console.log(
-    `[CircleWallet] Post-approval balance=${postApprovalBalanceRaw.toString()} reserve=${depositFeeReserveRaw.toString()} depositAmount=${depositAmountRaw.toString()}`,
+    `[CircleWallet] Post-approval balance=${postApprovalBalanceRaw.toString()} targetMaxRaw=${targetMaxRaw.toString()} baseForDeposit=${baseForDeposit.toString()} reserve=${depositFeeReserveRaw.toString()} depositAmount=${depositAmountRaw.toString()}`,
   );
 
   if (depositAmountRaw <= 0n) {
@@ -696,4 +737,3 @@ export async function transferToGateway(params: {
     errorDetails: depositResult.errorDetails,
   };
 }
-
