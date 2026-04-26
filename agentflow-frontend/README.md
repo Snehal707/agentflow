@@ -2,6 +2,14 @@
 
 Next.js 14 app with RainbowKit wallet connection, Arc Testnet support, and SSE streaming from the AgentFlow backend.
 
+## Related repositories
+
+| Repo | Use |
+|------|-----|
+| [**agentflow**](https://github.com/Snehal707/agentflow) | **Canonical monorepo** — this app lives in `agentflow-frontend/` next to `server.ts`, agents, and `npm run dev:stack`. |
+| [**agentflow-backend**](https://github.com/Snehal707/agentflow-backend) | Same backend `main` as the monorepo; useful if you deploy API-only from a dedicated repo. |
+| [**agentflow-frontend**](https://github.com/Snehal707/agentflow-frontend) | This repo — deploy on Vercel with **root = repo root** and `NEXT_PUBLIC_BACKEND_URL` pointing at your API. |
+
 ### App flow
 
 ```mermaid
@@ -65,7 +73,9 @@ npm start
 
 ## Backend requirements
 
-The backend at `NEXT_PUBLIC_BACKEND_URL` must expose:
+Point `NEXT_PUBLIC_BACKEND_URL` at a running AgentFlow API (e.g. `http://localhost:4000` locally). The full surface includes chat (`/api/chat/respond`, SSE), AgentPay, wallet, and agent proxies — see the monorepo [README](https://github.com/Snehal707/agentflow/blob/main/README.md) and [DEPLOY.md](https://github.com/Snehal707/agentflow/blob/main/DEPLOY.md).
+
+Legacy minimal expectations (older demos):
 
 - `POST /run` — SSE stream of agent events (task in JSON body)
 - `GET /gateway-balance` — returns `{ balance, formatted }` in USDC

@@ -4,6 +4,12 @@
 
 AgentFlow is a demo **AI agent economy** on **Arc Testnet**, with **Circle x402** micropayments, **Hermes** for chat/orchestration, and **Circle developer-controlled wallets** + Gateway where configured.
 
+| Repo | Role |
+|------|------|
+| [**agentflow**](https://github.com/Snehal707/agentflow) (this tree) | Canonical **monorepo** — backend + `agentflow-frontend/`. |
+| [**agentflow-backend**](https://github.com/Snehal707/agentflow-backend) | **Same `main`** — for API-only checkouts / links. |
+| [**agentflow-frontend**](https://github.com/Snehal707/agentflow-frontend) | **Next.js only** — Vercel deploys; stays aligned with `agentflow-frontend/` here. |
+
 ## Quick start
 
 1. **Prerequisites:** Node **20+**, npm **8+**, `CLOUDSMITH_TOKEN` for `@circlefin/*` (see [.npmrc](.npmrc)).
