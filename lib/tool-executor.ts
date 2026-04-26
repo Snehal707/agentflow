@@ -1083,14 +1083,20 @@ export async function executeTool(
           return usdValue > 0 ? `${name}: ${fmtUsd(usdValue)}` : name;
         };
         const recentTransactionLine = (transaction: Record<string, unknown>): string => {
-          const method = String(transaction.method || transaction.summary || 'transaction').trim();
+          let method = String(transaction.method || transaction.summary || 'transaction').trim();
+          if (method.includes('(')) {
+            method = method.split('(')[0]?.trim() || method;
+          }
           const status = String(transaction.status || 'unknown').trim();
-          const timestamp = String(transaction.timestamp || '').trim();
+          let timestamp = String(transaction.timestamp || '').trim();
+          if (/^\d{4}-\d{2}-\d{2}T/.test(timestamp)) {
+            timestamp = timestamp.slice(0, 19).replace('T', ' ');
+          }
           const hash = String(transaction.hash || '').trim();
-          const shortHash = hash.length > 14 ? `${hash.slice(0, 8)}...${hash.slice(-4)}` : hash;
-          return [timestamp || null, method || 'transaction', status ? `status ${status}` : null, shortHash || null]
+          const shortHash = hash.length > 14 ? `${hash.slice(0, 8)}…${hash.slice(-4)}` : hash;
+          return [timestamp || null, method || 'tx', status ? status : null, shortHash || null]
             .filter(Boolean)
-            .join(' - ');
+            .join(' · ');
         };
         const tokenBalances = holdings
           .filter((holding) => String(holding.kind || '') !== 'vault_share')
@@ -1112,7 +1118,7 @@ export async function executeTool(
           .filter((position) => String(position.kind || '') === 'gateway_position')
           .filter((position) => Number(position.usdValue || 0) > 0 || String(position.amountFormatted || '').trim())
           .map(positionLine);
-        const recentActivity = recentTransactions
+        const recentActivityLines = recentTransactions
           .slice(0, 5)
           .map(recentTransactionLine)
           .filter(Boolean);
@@ -1144,35 +1150,38 @@ export async function executeTool(
         const walletOnlyTotalUsd = Number.isFinite(totalUsdc)
           ? Math.max(0, totalUsdc - totalGatewayUsd)
           : Number.NaN;
+        const recentActivityBlock =
+          recentActivityLines.length > 0
+            ? ['**Recent activity**', '', ...recentActivityLines.map((line) => `- ${line}`)].join('\n')
+            : '_Recent activity: none in the Arc explorer snapshot._';
+
         const result = truncateText(
           [
-            'Current portfolio:',
+            '## Portfolio',
             tokenBalances.length > 0
-              ? `Wallet tokens: ${tokenBalances.join(', ')}`
-              : 'Wallet tokens: none found.',
-            vaultBalances.length > 0
-              ? `Vault: ${vaultBalances.join(', ')}`
-              : null,
-            lpPositions.length > 0 ? `Liquidity positions: ${lpPositions.join('; ')}` : null,
+              ? `**Wallet tokens:** ${tokenBalances.join(', ')}`
+              : '**Wallet tokens:** none found.',
+            vaultBalances.length > 0 ? `**Vault:** ${vaultBalances.join(', ')}` : null,
+            lpPositions.length > 0 ? `**Liquidity:** ${lpPositions.join('; ')}` : null,
             gatewayPositions.length > 0
-              ? `Gateway reserve: ${gatewayPositions.join('; ')}`
+              ? `**Gateway reserve:** ${gatewayPositions.join('; ')}`
               : null,
             otherPositions.length > 0
-              ? `Other positions: ${otherPositions.join('; ')}`
+              ? `**Other positions:** ${otherPositions.join('; ')}`
               : null,
             gatewayPositions.length > 0 && Number.isFinite(walletOnlyTotalUsd)
-              ? `Wallet value: $${formatMoney(walletOnlyTotalUsd)}`
-              : `Total marked value: $${formatMoney(totalUsdc)}`,
+              ? `**Wallet value:** $${formatMoney(walletOnlyTotalUsd)}`
+              : `**Total marked value:** $${formatMoney(totalUsdc)}`,
             gatewayPositions.length > 0 && Number.isFinite(totalUsdc)
-              ? `Combined wallet + Gateway reserve: $${formatMoney(totalUsdc)}`
+              ? `**Combined wallet + Gateway:** $${formatMoney(totalUsdc)}`
               : null,
-            recentActivity.length > 0
-              ? `Recent activity: ${recentActivity.join('; ')}`
-              : 'Recent activity: none found in the Arc explorer snapshot.',
+            recentActivityBlock,
             stableOnlyWallet
-              ? 'This is a stablecoin-heavy portfolio, so small changes usually come from swaps, fees, and tracked transfers rather than big market moves.'
+              ? '_Small moves here are usually swaps, fees, and transfers — not big market swings._'
               : null,
-          ].filter(Boolean).join('\n'),
+          ]
+            .filter((line) => line !== null && line !== undefined)
+            .join('\n\n'),
           1600,
         );
         console.log('[tool-executor] result:', result);
