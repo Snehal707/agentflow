@@ -26,3 +26,19 @@ scripts/test-circle.ts
 
 # Local all-in-one export for hackathon (single-URL submission); not part of backend-only repo
 agentic-economy-arc/
+
+# Build / codegen (do not commit)
+artifacts/
+cache_hardhat/
+typechain-types/
+
+# Local clones used only for pushing the separate frontend repo
+_agentflow-frontend-push/
+_agentflow-frontend-upstream/
+
+# Foundry deps are installed locally (`forge install`) or submodules — not vendored here
+foundry/lib/forge-std/
+foundry/lib/openzeppelin-contracts/
+
+# Full Hermes checkout (nested .git) — keep local only; use submodule if you need it in clones
+/hermes-brain/

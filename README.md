@@ -1,3 +1,7 @@
+## Active Frontend
+The active V3 frontend is `agentflow-frontend/` (port 3005)
+The `ui/` folder is legacy - do not use it
+
 ## AgentFlow — Autonomous AI agents on Arc Testnet
 
 AgentFlow is a demo of an **AI agent economy** on **Arc Testnet**, fully powered by **Circle x402 Batching** and **Hermes AI**:
@@ -71,12 +75,9 @@ agentflow/
 │       └── server.ts          # Writer agent — x402 seller + Hermes
 ├── orchestrator/
 │   └── index.ts               # CLI entrypoint, calls lib/orchestrator
-├── ui/
-│   ├── server.ts              # Express server for AgentFlow Web UI (port 4000)
-│   └── index.html             # Single-page web UI
-├── web/                       # Next.js 14 + RainbowKit app (Vercel-ready)
+├── agentflow-frontend/        # Next.js 14 + RainbowKit — AgentFlow V3 Kinetic (Vercel-ready)
 │   ├── app/                   # App router pages and layout
-│   ├── components/            # Header, Onboarding, AgentPipeline, etc.
+│   ├── components/            # Chat, portfolio, onboarding, etc.
 │   └── lib/                   # Arc chain config, wagmi, hooks
 └── scripts/
     ├── deposit.ts             # One-time: deposit USDC into Gateway
@@ -169,6 +170,23 @@ npm run dev:analyst       # agents/analyst/server.ts (default :3002)
 npm run dev:writer        # agents/writer/server.ts  (default :3003)
 ```
 
+**Embedded API mode (`EMBEDDED_AGENT_SERVERS=true`, default in local `server.ts`):** the **facilitator** and the **research / analyst / writer** agent apps are started **in-process** with the public API. Health and x402 settlement for that facilitator use **`FACILITATOR_PORT`** (commonly **`3010`** in `.env` to avoid clashing with a standalone facilitator on `:3000`). Do not assume `:3000` is live when embedded mode is on—probe **`http://127.0.0.1:${FACILITATOR_PORT}/health`**.
+
+**Stale Node processes** (old `server.ts` or agents still bound to `4000`, `3010`, agent ports, etc.) can make an A2A or x402 proof run look broken: the request hits an outdated binary, hooks never fire, or health checks point at the wrong facilitator. Clear listeners (e.g. `node scripts/stack-cleanup.js` on Windows, or `npm run dev:stack`’s built-in cleanup) and restart before judging a failure.
+
+**One-command A2A demo proof** (runs the three user-path tests, checks Redis x402 attempt stages, checks Supabase ledger rows for swap→portfolio, invoice→research, batch→portfolio; writes `.proof-a2a-output/proof-summary.json` and `proof-summary.md`; exits `1` if any pair is missing):
+
+```bash
+npm run proof:a2a
+```
+
+If the stack is **already** running (typical on macOS/Linux, or after a manual `dev:stack`):
+
+```bash
+set PROOF_A2A_SKIP_STACK=1   # PowerShell: $env:PROOF_A2A_SKIP_STACK="1"
+npm run proof:a2a
+```
+
 ### 7. Deposit and check balances
 
 Before running the orchestrator you should have some USDC in the Gateway.
@@ -231,19 +249,19 @@ In the UI you will see:
 
 ### 10. Run the Next.js + RainbowKit Web App (Vercel-ready)
 
-AgentFlow includes a Next.js 14 app in `web/` with RainbowKit wallet connection, Arc Testnet support, and SSE streaming.
+AgentFlow includes a Next.js 14 app in **`agentflow-frontend/`** (AgentFlow V3 Kinetic) with RainbowKit wallet connection, Arc Testnet support, and SSE streaming.
 
 1. Start the backend (facilitator + 3 agents + UI server) as in section 9.
 
 2. Install and run the Next.js app:
 
    ```bash
-   npm run dev:web
+   cd agentflow-frontend
+   npm install
+   npm run dev
    ```
 
-   Or from the `web/` folder: `npm install && npm run dev`
-
-3. Copy `web/.env.local.example` to `web/.env.local` and set:
+3. Copy `agentflow-frontend/.env.local.example` to `agentflow-frontend/.env.local` and set:
 
    ```env
    NEXT_PUBLIC_BACKEND_URL=http://localhost:4000
@@ -251,9 +269,9 @@ AgentFlow includes a Next.js 14 app in `web/` with RainbowKit wallet connection,
 
 4. Open http://localhost:3005 (Next.js runs on port 3005 to avoid conflicts).
 
-5. Connect your wallet (MetaMask), switch to Arc Testnet, and follow the 4-step onboarding. The Deposit button funds the Gateway balance. Run AgentFlow to stream the agent pipeline and see the final report.
+5. Connect your wallet (MetaMask), switch to Arc Testnet, and follow onboarding. Use the Workspace / chat and portfolio flows as documented in the app.
 
-**Vercel deployment:** Deploy the `web/` folder as a Next.js project. Set `NEXT_PUBLIC_BACKEND_URL` to your deployed backend URL (e.g. your Railway URL). **Step-by-step:** see [PHASE_D_VERCEL.md](PHASE_D_VERCEL.md).
+**Vercel deployment:** Set the Vercel project **Root Directory** to **`agentflow-frontend`**. Set `NEXT_PUBLIC_BACKEND_URL` to your deployed backend URL (e.g. your Railway URL). **Step-by-step:** see [PHASE_D_VERCEL.md](PHASE_D_VERCEL.md).
 
 **Railway / Nixpacks:** If you deploy the full repo (root), the build runs `npm ci`, which needs the private registry. Set **`CLOUDSMITH_TOKEN`** in your Railway (or platform) **Variables** so it is available at **build time**. Otherwise you get `npm error E401`. See [DEPLOY.md](DEPLOY.md).
 

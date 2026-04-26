@@ -2929,6 +2929,27 @@ function parseSupportedBridgeSourceChain(
   return undefined;
 }
 
+function isPortfolioSnapshotIntent(message: string): boolean {
+  const normalized = message.trim();
+  if (!normalized) return false;
+  if (
+    /\b(?:swap|trade|convert|exchange|bridge|deposit|withdraw|stake|send|pay|invoice|request)\b/i.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    /\b(?:show|scan|check|review|summarize|summary|analy[sz]e|overview|break\s*down|list)\b/i.test(
+      normalized,
+    ) &&
+    /\b(?:portfolio|holdings|wallet|balances?|vault\s+shares?|gateway\s+reserve|recent\s+(?:arc\s+)?activity|positions?)\b/i.test(
+      normalized,
+    )
+  );
+}
+
 function extractBridgeAmount(message: string): string | undefined {
   const normalized = message
     .toLowerCase()
@@ -3000,6 +3021,39 @@ function isBridgePrecheckIntent(message: string): boolean {
   return false;
 }
 
+function isBridgeCostOrSponsorshipQuestion(message: string): boolean {
+  if (!/\bbridge\b/i.test(message)) {
+    return false;
+  }
+
+  const asksAboutCostOrPayment =
+    /\b(?:free|sponsor[a-z]*|sponser[a-z]*|costs?|fees?|charge[sd]?|paid|payment|paying|gateway\s+balance|gas|funds?|need|require[sd]?)\b/i.test(
+      message,
+    );
+  if (!asksAboutCostOrPayment) {
+    return false;
+  }
+
+  return (
+    /^(?:and\s+|na+h?\s+|no+\s+|nah\s+)?(?:i\s+am\s+asking\s+)?(?:is|are|do|does|can|could|will|would|should|how|what|who|why)\b/i.test(
+      message,
+    ) ||
+    /\b(?:i\s+am\s+asking|i'?m\s+asking|asking)\b/i.test(message) ||
+    /\b(?:is|are)\s+(?:the\s+)?bridge\b/i.test(message) ||
+    /\bbridge\b[\s\S]{0,40}\b(?:free|sponsor[a-z]*|sponser[a-z]*|costs?|fees?|gas|gateway\s+balance)\b/i.test(
+      message,
+    )
+  );
+}
+
+function formatBridgeCostOrSponsorshipReply(): string {
+  return (
+    'Yes. The AgentFlow Bridge agent is sponsored in chat, so you do not need a Gateway balance for the bridge-agent fee. ' +
+    'You still need enough USDC in the source wallet for the amount you want to bridge. ' +
+    'When you want to execute, say something like: bridge 0.1 USDC from Ethereum Sepolia to Arc.'
+  );
+}
+
 function isBareSupportedBridgeChainReply(message: string): boolean {
   return /^(?:eth(?:ereum)?(?:[\s-]+sep(?:olia)?)|base(?:[\s-]+sep(?:olia)?)?)$/i.test(
     message.trim(),
@@ -3007,16 +3061,21 @@ function isBareSupportedBridgeChainReply(message: string): boolean {
 }
 
 function recentBridgeContextWantsPrecheck(history: BrainConversationMessage[] = []): boolean {
-  const recent = history
-    .slice(-6)
-    .map((entry) => entry.content)
-    .join('\n');
+  const recentAssistant = [...history]
+    .reverse()
+    .find((entry) => entry.role === 'assistant' && typeof entry.content === 'string')
+    ?.content ?? '';
 
-  return (
-    /\bbridge\b/i.test(recent) &&
-    /\b(?:gas|usdc|enough|supported|support|source wallet|source chain|ready|readiness|check)\b/i.test(
-      recent,
-    )
+  if (!/\bbridge\b/i.test(recentAssistant)) {
+    return false;
+  }
+
+  if (/supported bridge source chains right now/i.test(recentAssistant)) {
+    return false;
+  }
+
+  return /\b(?:gas|enough|source wallet|ready|readiness|precheck|check)\b/i.test(
+    recentAssistant,
   );
 }
 
@@ -3513,6 +3572,11 @@ function shouldHandleAsAgentFlowCapabilityQuestion(message: string): boolean {
   );
 }
 
+function isVaultApyLookup(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  return /\bvault\b/i.test(normalized) && /\b(?:apy|yield|rate|return)\b/i.test(normalized);
+}
+
 function buildAgentFlowProductReply(message: string): string | null {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return null;
@@ -3564,7 +3628,7 @@ function buildAgentFlowProductReply(message: string): string | null {
     ].join('\n');
   }
 
-  if (asksProductInfo && /\bvault\b/i.test(normalized)) {
+  if (asksProductInfo && /\bvault\b/i.test(normalized) && !isVaultApyLookup(normalized)) {
     return [
       'Vault lets AgentFlow deposit and withdraw Arc USDC from the AgentFlow vault using your Agent wallet / DCW.',
       '',
@@ -3996,12 +4060,24 @@ function parseDirectAgentFlowRoute(
   if (
     /^(?:show my portfolio|what(?:'s| is) my portfolio|portfolio|show my holdings|what do i own)$/i.test(
       normalized,
-    )
+    ) ||
+    isPortfolioSnapshotIntent(normalized)
   ) {
     return {
       type: 'tool',
       tool: 'get_portfolio',
       args: {},
+    };
+  }
+
+  if (isVaultApyLookup(normalized)) {
+    return {
+      type: 'tool',
+      tool: 'vault_action',
+      args: {
+        action: 'check_apy',
+        confirmed: true,
+      },
     };
   }
 
@@ -4216,6 +4292,13 @@ function parseDirectAgentFlowRoute(
       type: 'reply',
       text:
         'No. AgentFlow does not expose a manual EOA bridge in the Funding page anymore. Funding is for moving Arc USDC between your EOA, your Agent wallet, and your Gateway reserve. If you want to bridge to Arc inside AgentFlow, use the sponsored Bridge agent in chat.',
+    };
+  }
+
+  if (isBridgeCostOrSponsorshipQuestion(normalized)) {
+    return {
+      type: 'reply',
+      text: formatBridgeCostOrSponsorshipReply(),
     };
   }
 

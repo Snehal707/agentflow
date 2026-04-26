@@ -11,7 +11,7 @@ Get AgentFlow live on the internet: **frontend on Vercel**, **backend on Railway
 
 ## Option A: Same repo (recommended)
 
-Use your existing **agent-economy** repo. Vercel will build only the `web/` folder.
+Use your existing **agent-economy** repo. Vercel will build only the **`agentflow-frontend/`** folder.
 
 ### 1. Push code to GitHub
 
@@ -30,7 +30,7 @@ git push -u origin main
 2. Click **Add New…** → **Project**.
 3. **Import** your `agent-economy` (or your repo name) from GitHub.
 4. **Configure:**
-   - **Root Directory:** click **Edit**, set to **`web`** (so Vercel builds only the Next.js app).
+   - **Root Directory:** click **Edit**, set to **`agentflow-frontend`** (so Vercel builds only the Next.js app).
    - **Framework Preset:** Next.js (auto-detected).
    - **Build Command:** `npm run build` (default).
    - **Output Directory:** `.next` (default).
@@ -63,23 +63,24 @@ Click **Deploy**. Vercel will build and give you a URL like:
 
 If you prefer a repo that contains only the Next.js app:
 
-### 1. Pack the frontend into a new folder
+### 1. Copy `agentflow-frontend/` out of the monorepo
 
-From the **agent-economy** repo root:
+From the **agent-economy** repo, copy the **`agentflow-frontend/`** directory to a new folder (or use `git subtree split` / `git filter-repo` if you want only that history). Example:
 
 ```bash
-npm run pack-frontend
+# Example: copy the folder to a sibling directory
+xcopy /E /I agentflow-frontend ..\agentflow-frontend-standalone
+cd ..\agentflow-frontend-standalone
 ```
 
-This copies `web/` to `../agentflow-frontend` (or run `node scripts/pack-frontend.js /path/to/folder` for a custom path).
+(Or create a new GitHub repo and add the contents of `agentflow-frontend/` as the initial commit.)
 
 ### 2. Create GitHub repo and push
 
 1. On GitHub: **New repository** → name e.g. `agentflow-frontend` → Create (no README/license).
-2. In your terminal:
+2. In your terminal (inside the copied app root):
 
 ```bash
-cd ../agentflow-frontend
 git init
 git add .
 git commit -m "Initial frontend"
@@ -89,8 +90,8 @@ git push -u origin main
 
 ### 3. Deploy on Vercel
 
-1. [vercel.com](https://vercel.com) → **Add New… → Project** → Import **agentflow-frontend**.
-2. No Root Directory change (app is already at repo root).
+1. [vercel.com](https://vercel.com) → **Add New… → Project** → Import your **agentflow-frontend** repo.
+2. No Root Directory change if the app is at the repo root.
 3. Add **`NEXT_PUBLIC_BACKEND_URL`** = your Railway URL.
 4. **Deploy**.
 
@@ -111,6 +112,6 @@ git push -u origin main
 
 ## Troubleshooting
 
-- **CORS:** Backend (Railway) must allow the Vercel origin. The repo’s `ui/server.ts` uses `Access-Control-Allow-Origin: '*'`; for production you may want to restrict to your Vercel domain.
+- **CORS:** Backend (Railway) must allow the Vercel origin. The active backend is the public API in `server.ts`; for production, restrict allowed origins to your Vercel domain.
 - **WalletConnect:** For production wallets, add `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` in Vercel (get one at [cloud.walletconnect.com](https://cloud.walletconnect.com)).
 - **Backend URL:** Always use HTTPS and no trailing slash for `NEXT_PUBLIC_BACKEND_URL`.

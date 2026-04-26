@@ -614,6 +614,44 @@ export async function executeTool(
           console.log('[tool-executor] result:', result);
           return result;
         }
+        if (String(action) === 'check_apy') {
+          const paidResult = await executeUserPaidAgentViaX402<{
+            success?: boolean;
+            error?: string;
+            apy?: number;
+            action?: string;
+          }>({
+            agent: 'vault',
+            price: VAULT_AGENT_PRICE_LABEL,
+            userWalletAddress: normalizeAddress(userWalletAddress),
+            requestId: `chat_vault_apy_${sessionId}_${Date.now()}`,
+            url: VAULT_RUN_URL,
+            body: {
+              action: 'check_apy',
+            },
+          });
+
+          if (!paidResult.data?.success) {
+            const failure =
+              typeof paidResult.data?.error === 'string' && paidResult.data.error.trim()
+                ? paidResult.data.error.trim()
+                : 'Vault APY lookup failed.';
+            console.log('[tool-executor] result:', failure);
+            return failure;
+          }
+
+          setRecentExecutionMeta(sessionId, {
+            entries: [paidResult.paymentEntry],
+          });
+
+          const apy =
+            typeof paidResult.data.apy === 'number' && Number.isFinite(paidResult.data.apy)
+              ? `${paidResult.data.apy.toFixed(2)}%`
+              : 'Unavailable';
+          const result = `AgentFlow Vault APY: ${apy}`;
+          console.log('[tool-executor] result:', result);
+          return result;
+        }
         if (walletCtx.executionTarget === 'EOA') {
           if (confirmed) {
             await clearPendingAction(sessionId);
@@ -1014,6 +1052,9 @@ export async function executeTool(
         const positions = Array.isArray(portfolioData.positions)
           ? (portfolioData.positions as Array<Record<string, unknown>>)
           : [];
+        const recentTransactions = Array.isArray(portfolioData.recentTransactions)
+          ? (portfolioData.recentTransactions as Array<Record<string, unknown>>)
+          : [];
         const pnl =
           portfolioData.pnl && typeof portfolioData.pnl === 'object'
             ? (portfolioData.pnl as Record<string, unknown>)
@@ -1041,6 +1082,16 @@ export async function executeTool(
           }
           return usdValue > 0 ? `${name}: ${fmtUsd(usdValue)}` : name;
         };
+        const recentTransactionLine = (transaction: Record<string, unknown>): string => {
+          const method = String(transaction.method || transaction.summary || 'transaction').trim();
+          const status = String(transaction.status || 'unknown').trim();
+          const timestamp = String(transaction.timestamp || '').trim();
+          const hash = String(transaction.hash || '').trim();
+          const shortHash = hash.length > 14 ? `${hash.slice(0, 8)}...${hash.slice(-4)}` : hash;
+          return [timestamp || null, method || 'transaction', status ? `status ${status}` : null, shortHash || null]
+            .filter(Boolean)
+            .join(' - ');
+        };
         const tokenBalances = holdings
           .filter((holding) => String(holding.kind || '') !== 'vault_share')
           .filter((holding) => Number(holding.usdValue || 0) > 0 || Number(holding.balanceFormatted || 0) > 0)
@@ -1061,6 +1112,10 @@ export async function executeTool(
           .filter((position) => String(position.kind || '') === 'gateway_position')
           .filter((position) => Number(position.usdValue || 0) > 0 || String(position.amountFormatted || '').trim())
           .map(positionLine);
+        const recentActivity = recentTransactions
+          .slice(0, 5)
+          .map(recentTransactionLine)
+          .filter(Boolean);
         const otherPositions = positions
           .filter((position) => {
             const kind = String(position.kind || '');
@@ -1111,6 +1166,9 @@ export async function executeTool(
             gatewayPositions.length > 0 && Number.isFinite(totalUsdc)
               ? `Combined wallet + Gateway reserve: $${formatMoney(totalUsdc)}`
               : null,
+            recentActivity.length > 0
+              ? `Recent activity: ${recentActivity.join('; ')}`
+              : 'Recent activity: none found in the Arc explorer snapshot.',
             stableOnlyWallet
               ? 'This is a stablecoin-heavy portfolio, so small changes usually come from swaps, fees, and tracked transfers rather than big market moves.'
               : null,
