@@ -2813,9 +2813,9 @@ function ChatPageInner() {
                     void handleStructuredConfirmation(input);
                   }}
                 />
-                <div className="sticky bottom-0 z-10 flex-shrink-0 border-t border-white/5 bg-[#0d0d0d]/90 px-4 pb-3 pt-3 backdrop-blur-xl xl:px-8">
+                <div className="sticky bottom-0 z-10 flex-shrink-0 bg-transparent px-0 pb-4 pt-3">
                   {portfolioContext ? (
-                    <div className="mb-3 flex items-center gap-2 rounded-lg bg-[#1c1b1b] px-3 py-2 text-xs">
+                    <div className="mx-auto mb-3 flex max-w-5xl items-center gap-2 rounded-lg border border-white/10 bg-[#151515]/90 px-3 py-2 text-xs">
                       <span aria-hidden>📊</span>
                       <span className="text-white/50">
                         Portfolio context loaded ({portfolioWalletLabel})
@@ -2853,14 +2853,14 @@ function ChatPageInner() {
               </div>
             ) : (
               <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
-                <div className="mx-auto flex h-full w-full max-w-5xl flex-col justify-center px-6 pb-[clamp(7rem,14vh,10rem)] pt-8 xl:px-10">
+                <div className="mx-auto flex h-full w-full max-w-5xl flex-col justify-start px-6 pb-8 pt-[clamp(7rem,20vh,12rem)] xl:px-10">
                   <div className="text-center">
                     <h1 className="font-headline text-[clamp(2.35rem,4.2vw,3.5rem)] font-black leading-[1] tracking-tight text-white">
                       How can I help today?
                     </h1>
                   </div>
 
-                  <div className="mt-[clamp(3rem,8vh,5.5rem)]">
+                  <div className="mt-[clamp(2.25rem,6vh,4rem)]">
                     {portfolioContext ? (
                       <div className="mb-3 flex items-center gap-2 rounded-lg bg-[#1c1b1b] px-3 py-2 text-xs">
                         <span aria-hidden>📊</span>

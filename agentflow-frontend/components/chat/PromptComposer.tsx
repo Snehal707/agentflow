@@ -212,6 +212,8 @@ export function PromptComposer({
   const valueRef = useRef(value);
   valueRef.current = value;
   const canSend = canSubmit ?? Boolean(value.trim());
+  const composerHeightClass = isHero ? "min-h-[92px]" : "min-h-[82px]";
+  const textareaHeightClass = isHero ? "h-[72px]" : "h-[62px]";
 
   const refreshAudioInputDevices = useCallback(async () => {
     if (typeof window === "undefined" || !navigator.mediaDevices?.enumerateDevices) {
@@ -556,16 +558,18 @@ export function PromptComposer({
         className="hidden"
         onChange={handleAttachmentSelect}
       />
-      <div className="glass-panel relative mx-auto max-w-4xl rounded-xl border border-white/10 bg-[#1c1b1b] p-2 shadow-[0_24px_60px_rgba(0,0,0,0.45)]">
-        <div className="flex items-start gap-2">
+      <div
+        className={`relative mx-auto w-full max-w-5xl overflow-visible rounded-[22px] border border-white/10 bg-[linear-gradient(180deg,rgba(35,35,33,0.96),rgba(20,20,19,0.98))] px-3 py-2 shadow-[0_28px_80px_-28px_rgba(0,0,0,0.95),inset_0_1px_0_rgba(255,255,255,0.07)] ring-1 ring-[#f2ca50]/10 transition-colors focus-within:border-[#f2ca50]/35 focus-within:ring-[#f2ca50]/25 ${composerHeightClass}`}
+      >
+        <div className="flex min-w-0 items-center gap-2">
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
             disabled={isStreaming || isTranscribing || isExtractingAttachment}
-            className="rounded-lg p-2 text-white/40 transition-colors hover:text-[#f2ca50]"
+            className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.03] text-white/45 transition hover:border-[#f2ca50]/35 hover:bg-[#f2ca50]/10 hover:text-[#f2ca50] disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="Attach context"
           >
-            <span className="material-symbols-outlined">attach_file</span>
+            <span className="material-symbols-outlined text-[21px]">attach_file</span>
           </button>
 
           <textarea
@@ -574,13 +578,11 @@ export function PromptComposer({
             onChange={(event) => onChange(event.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={placeholder}
-            className={`min-h-[52px] flex-1 resize-none bg-transparent px-2 py-2 text-sm text-white/90 outline-none placeholder:text-white/30 ${
-              isHero ? "h-[76px]" : "h-[68px]"
-            }`}
+            className={`min-w-0 flex-1 resize-none bg-transparent px-2 py-4 text-[15px] leading-6 text-white/90 outline-none placeholder:text-white/30 ${textareaHeightClass}`}
           />
 
-          <div className="flex flex-col items-end gap-0.5">
-            <div className="flex items-center gap-1">
+          <div className="flex flex-shrink-0 flex-col items-end gap-1 self-center">
+            <div className="flex items-center gap-1.5 rounded-full border border-white/10 bg-black/20 p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
               <div ref={micMenuRef} className="relative flex items-center">
                 <button
                   type="button"
@@ -588,7 +590,7 @@ export function PromptComposer({
                   disabled={micBusy}
                   aria-label={micLabel}
                   aria-pressed={isRecording}
-                  className={`rounded-xl p-2 transition-colors disabled:opacity-50 ${
+                  className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors disabled:opacity-50 ${
                     isRecording
                       ? "text-[#ff6b6b]"
                       : isTranscribing
@@ -606,7 +608,7 @@ export function PromptComposer({
                     onClick={() => setIsMicMenuOpen((open) => !open)}
                     aria-label="Choose microphone"
                     aria-expanded={isMicMenuOpen}
-                    className="flex h-6 w-4 items-center justify-center rounded text-white/40 hover:text-[#f2ca50]"
+                    className="flex h-9 w-7 items-center justify-center rounded-full text-white/40 transition hover:bg-white/5 hover:text-[#f2ca50]"
                   >
                     <span className="material-symbols-outlined text-[14px]">expand_more</span>
                   </button>
@@ -668,10 +670,10 @@ export function PromptComposer({
               <button
                 type="submit"
                 disabled={isStreaming || !canSend}
-                className="burnished-gold flex h-10 w-10 items-center justify-center rounded-lg transition hover:brightness-110 active:scale-[0.96] disabled:opacity-60"
+                className="burnished-gold flex h-11 w-11 items-center justify-center rounded-full text-[#211800] transition hover:brightness-110 active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-50"
                 aria-label={isStreaming ? "Running" : "Send"}
               >
-                <span className="material-symbols-outlined">arrow_upward</span>
+                <span className="material-symbols-outlined text-[23px]">arrow_upward</span>
               </button>
             </div>
             {voiceError ? (

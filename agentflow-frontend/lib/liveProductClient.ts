@@ -118,6 +118,23 @@ async function readJson<T>(response: Response, fallback: string): Promise<T> {
   return json;
 }
 
+/** Avoid infinite “Loading…” when backend/RPC/Circle is slow or unreachable. */
+const AGENTPAY_FETCH_TIMEOUT_MS = 28_000;
+
+async function fetchWithTimeout(
+  input: string,
+  init: RequestInit,
+  timeoutMs: number = AGENTPAY_FETCH_TIMEOUT_MS,
+): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function fetchStoreAgents(): Promise<StoreAgent[]> {
   const response = await fetch("/api/agent-store/agents", {
     cache: "no-store",
@@ -295,7 +312,7 @@ export type ScheduledPaymentRow = {
 export async function fetchPayContext(
   authHeaders: Record<string, string>,
 ): Promise<PayContextResponse> {
-  const response = await fetch("/api/pay/context", {
+  const response = await fetchWithTimeout("/api/pay/context", {
     headers: authHeaders,
     cache: "no-store",
   });
@@ -453,7 +470,7 @@ export type WalletBalanceResponse = {
 export async function fetchWalletBalance(
   authHeaders: Record<string, string>,
 ): Promise<WalletBalanceResponse> {
-  const response = await fetch("/api/wallet/balance", {
+  const response = await fetchWithTimeout("/api/wallet/balance", {
     headers: authHeaders,
     cache: "no-store",
   });
@@ -504,7 +521,7 @@ export type MyArcNameResponse = {
 export async function fetchMyArcName(
   authHeaders: Record<string, string>,
 ): Promise<MyArcNameResponse> {
-  const response = await fetch("/api/pay/name/my", {
+  const response = await fetchWithTimeout("/api/pay/name/my", {
     headers: authHeaders,
     cache: "no-store",
   });

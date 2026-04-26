@@ -172,6 +172,7 @@ export default function AgentPayPage() {
   const [newDcwInput, setNewDcwInput] = useState("");
   const [dcwBusy, setDcwBusy] = useState(false);
   const arcDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const balanceFetchInFlight = useRef(false);
 
   const previewRecipient = toAddress.trim() || "recipient";
   const previewAmount = Number(amount);
@@ -186,10 +187,10 @@ export default function AgentPayPage() {
       const ctx = await fetchPayContext(headers);
       setPayContext(ctx);
       if (ctx.chain_arc_name) {
-        setMyChainArc({
-          name: ctx.chain_arc_name,
-          expiresAt: ctx.chain_arc_expires_at ?? null,
-        });
+        setMyChainArc((prev) => ({
+          name: ctx.chain_arc_name ?? prev?.name ?? null,
+          expiresAt: ctx.chain_arc_expires_at ?? prev?.expiresAt ?? null,
+        }));
       }
     } catch {
       setPayContext(null);
@@ -199,6 +200,8 @@ export default function AgentPayPage() {
   const loadBalance = useCallback(async () => {
     const headers = getAuthHeaders();
     if (!headers) return;
+    if (balanceFetchInFlight.current) return;
+    balanceFetchInFlight.current = true;
     if (process.env.NODE_ENV === "development" && address) {
       console.log("[agentpay] fetching balance for:", address);
     }
@@ -212,6 +215,7 @@ export default function AgentPayPage() {
     } catch {
       setBalanceInfo(null);
     } finally {
+      balanceFetchInFlight.current = false;
       setBalanceLoading(false);
     }
   }, [getAuthHeaders, address]);
@@ -398,9 +402,12 @@ export default function AgentPayPage() {
     if (!headers) return;
     try {
       const r = await fetchMyArcName(headers);
-      setMyChainArc({ name: r.name, expiresAt: r.expiresAt });
+      setMyChainArc((prev) => ({
+        name: r.name ?? prev?.name ?? null,
+        expiresAt: r.expiresAt ?? prev?.expiresAt ?? null,
+      }));
     } catch {
-      setMyChainArc(null);
+      /* keep prior state — do not clear name loaded from /pay/context */
     }
   }, [getAuthHeaders]);
 

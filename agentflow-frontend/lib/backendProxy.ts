@@ -13,6 +13,8 @@ export function getBackendUrl(path: string): string {
   return `${normalizeBaseUrl(base)}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+const UPSTREAM_FETCH_MS = 55_000;
+
 export async function proxyBackendRequest(
   request: Request,
   path: string,
@@ -32,12 +34,16 @@ export async function proxyBackendRequest(
   const body =
     method === "GET" || method === "HEAD" ? undefined : await request.text();
 
+  const ctrl = new AbortController();
+  const kill = setTimeout(() => ctrl.abort(), UPSTREAM_FETCH_MS);
+
   try {
     const upstream = await fetch(getBackendUrl(path), {
       method,
       headers,
       body,
       cache: "no-store",
+      signal: ctrl.signal,
     });
 
     const responseHeaders = new Headers();
@@ -77,5 +83,7 @@ export async function proxyBackendRequest(
       },
       { status: 502 },
     );
+  } finally {
+    clearTimeout(kill);
   }
 }
