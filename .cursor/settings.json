@@ -1,0 +1,10 @@
+{
+  "plugins": {
+    "circle": {
+      "enabled": true
+    },
+    "firecrawl": {
+      "enabled": true
+    }
+  }
+}
