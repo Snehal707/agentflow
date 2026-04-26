@@ -1,0 +1,395 @@
+/* Material Symbols: loaded via <link> in app/layout.tsx (more reliable than @import with PostCSS). */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #131313;
+  --bg-soft: #1c1b1b;
+  --panel: rgba(28, 27, 27, 0.94);
+  --panel-strong: rgba(32, 31, 31, 0.98);
+  --line: rgba(77, 70, 53, 0.35);
+  --text: #e5e2e1;
+  --muted: rgba(208, 197, 175, 0.68);
+  --cyan: #f2ca50;
+  --lime: #27d49a;
+  --amber: #f6c76c;
+  --rose: #ff8ea0;
+  --success: #27d49a;
+  --danger: #ff716c;
+  --surface: rgba(17, 19, 24, 0.9);
+  --surface-low: #111318;
+  --surface-high: #1d2025;
+
+  /* B+ Luxe tokens */
+  --af-bg: #131313;
+  --af-surface-low: #1c1b1b;
+  --af-surface-mid: #201f1f;
+  --af-surface-high: #2a2a2a;
+  --af-text-primary: #e5e2e1;
+  --af-text-secondary: #d0c5af;
+  --af-gold: #f2ca50;
+  --af-gold-press: #d4af37;
+  --af-outline-soft: rgba(77, 70, 53, 0.35);
+  --af-focus-ring: rgba(242, 202, 80, 0.55);
+  --af-radius-md: 10px;
+  --af-radius-lg: 14px;
+  --af-ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --af-speed-fast: 120ms;
+  --af-speed-base: 160ms;
+  --af-speed-slow: 180ms;
+  --af-shadow-soft: 0 8px 24px rgba(212, 175, 55, 0.12);
+  --af-shadow-press: 0 4px 12px rgba(212, 175, 55, 0.16);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-body), "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(242, 202, 80, 0.07), transparent 24%),
+    linear-gradient(180deg, #131313 0%, #101010 100%);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+/* Icon ligatures only render when this font is used; without font-family, labels show as plain text. */
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined", sans-serif;
+  font-weight: normal;
+  font-style: normal;
+  font-size: inherit;
+  line-height: 1;
+  display: inline-block;
+  white-space: nowrap;
+  direction: ltr;
+  font-feature-settings: "liga";
+  -webkit-font-smoothing: antialiased;
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+  vertical-align: middle;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+.glass-panel {
+  backdrop-filter: blur(16px);
+  background: rgba(32, 31, 31, 0.7);
+}
+
+::selection {
+  background: rgba(242, 202, 80, 0.28);
+  color: #241a00;
+}
+
+.font-display {
+  font-family: var(--font-headline), "Newsreader", Georgia, serif;
+}
+
+/* Stitch design utility classes */
+.gold-shimmer {
+  background: linear-gradient(135deg, #f2ca50 0%, #d4af37 50%, #f2ca50 100%);
+  background-size: 200% auto;
+}
+
+.gold-gradient-text {
+  background: linear-gradient(135deg, #d4af37 0%, #f2ca50 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.gold-gradient-bg {
+  background: linear-gradient(135deg, #d4af37 0%, #f2ca50 100%);
+}
+
+.glass-sidebar {
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+.glass-card {
+  background: rgba(32, 31, 31, 0.4);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(153, 144, 124, 0.1);
+}
+
+.cinematic-card {
+  background: linear-gradient(165deg, #0d0d0d 0%, #070707 100%);
+  border: 1px solid rgba(242, 202, 80, 0.08);
+}
+
+.cinematic-card:hover {
+  border-color: rgba(242, 202, 80, 0.15);
+}
+
+.active-nav-glow {
+  background: linear-gradient(90deg, rgba(242, 202, 80, 0.08) 0%, rgba(242, 202, 80, 0) 100%);
+  border-left: 2px solid #f2ca50;
+}
+
+.editorial-headline {
+  line-height: 0.95;
+  letter-spacing: -0.02em;
+}
+
+.btn-hover-effect {
+  transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.btn-hover-effect:hover {
+  transform: translateY(-2px);
+  filter: brightness(1.1);
+  box-shadow: 0 12px 24px -10px rgba(212, 175, 55, 0.4);
+}
+
+.cinematic-shadow {
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+}
+
+.obsidian-shadow {
+  box-shadow: 0 20px 60px -15px rgba(0, 0, 0, 0.95);
+}
+
+.burnished-gold {
+  background: linear-gradient(135deg, #d4af37 0%, #f2ca50 50%, #b08c10 100%);
+  box-shadow: 0 10px 40px -10px rgba(212, 175, 55, 0.3);
+}
+
+.burnished-gold:hover {
+  background: linear-gradient(135deg, #e6c35c 0%, #f7d97d 50%, #c49d15 100%);
+  box-shadow: 0 10px 45px -5px rgba(212, 175, 55, 0.4);
+}
+
+.burnished-gold:active {
+  transform: scale(0.985);
+  filter: brightness(0.9);
+}
+
+.icon-standard {
+  font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 20;
+}
+
+.icon-filled {
+  font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 20;
+}
+
+.app-shell {
+  position: relative;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+.app-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+  background-size: 72px 72px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.62), transparent);
+  pointer-events: none;
+}
+
+.dashboard-frame {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 1620px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.surface-card {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.24);
+}
+
+.section-title {
+  font-family: var(--font-display), "Segoe UI", sans-serif;
+  font-size: clamp(1.75rem, 1.6rem + 0.6vw, 2.5rem);
+  line-height: 1;
+  letter-spacing: -0.04em;
+}
+
+.eyebrow {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+  color: var(--muted);
+}
+
+.grid-cols-13 {
+  grid-template-columns: repeat(13, minmax(0, 1fr));
+}
+
+.workspace-panel {
+  background: var(--surface-low);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.2);
+}
+
+.workspace-shell {
+  background:
+    radial-gradient(circle at top left, rgba(242, 202, 80, 0.06), transparent 20%),
+    linear-gradient(180deg, #131313 0%, #101010 100%);
+}
+
+/* B+ reusable utility classes */
+.af-transition {
+  transition:
+    background-color var(--af-speed-base) var(--af-ease),
+    color var(--af-speed-base) var(--af-ease),
+    border-color var(--af-speed-base) var(--af-ease),
+    box-shadow var(--af-speed-base) var(--af-ease),
+    transform var(--af-speed-fast) var(--af-ease);
+}
+
+.af-focusable:focus-visible {
+  outline: 2px solid var(--af-focus-ring);
+  outline-offset: 2px;
+}
+
+.af-surface {
+  background: var(--af-surface-mid);
+  color: var(--af-text-primary);
+  border-radius: var(--af-radius-md);
+}
+
+.af-btn-primary {
+  background: linear-gradient(135deg, var(--af-gold), var(--af-gold-press));
+  color: #3c2f00;
+  border: 0;
+  border-radius: var(--af-radius-md);
+  box-shadow: var(--af-shadow-soft);
+}
+
+.af-btn-primary:hover {
+  filter: brightness(1.04);
+}
+
+.af-btn-primary:active,
+.af-btn-primary[data-state="pressed"] {
+  background: var(--af-gold-press);
+  box-shadow: var(--af-shadow-press);
+  transform: translateY(1px);
+}
+
+.af-btn-ghost {
+  background: transparent;
+  color: var(--af-text-primary);
+  border: 1px solid var(--af-outline-soft);
+  border-radius: var(--af-radius-md);
+}
+
+.af-btn-ghost:hover {
+  background: rgba(242, 202, 80, 0.08);
+  border-color: rgba(242, 202, 80, 0.35);
+}
+
+.af-btn-ghost:active {
+  background: rgba(242, 202, 80, 0.14);
+}
+
+.af-nav-item {
+  color: var(--af-text-secondary);
+}
+
+.af-nav-item:hover {
+  color: var(--af-text-primary);
+}
+
+.af-nav-item[data-state="active"] {
+  color: var(--af-gold);
+}
+
+.af-chip {
+  background: var(--af-surface-low);
+  border: 1px solid transparent;
+  color: var(--af-text-secondary);
+}
+
+.af-chip:hover {
+  border-color: var(--af-outline-soft);
+  color: var(--af-text-primary);
+}
+
+.af-chip[data-state="active"] {
+  border-color: rgba(242, 202, 80, 0.45);
+  color: var(--af-gold);
+  background: rgba(242, 202, 80, 0.08);
+}
+
+.af-row:active,
+.af-row[data-state="pressed"] {
+  background: var(--af-surface-high);
+}
+
+.af-bottom-nav-item {
+  color: var(--af-text-secondary);
+  border-radius: var(--af-radius-md);
+  transition: all var(--af-speed-base) var(--af-ease);
+}
+
+.af-bottom-nav-item[data-state="active"] {
+  color: var(--af-gold);
+  background: rgba(242, 202, 80, 0.12);
+}
+
+/* Cross-route visual cadence utilities */
+.af-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.af-icon-sm {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.af-icon-lg {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.af-kicker {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .af-transition,
+  .af-btn-primary,
+  .af-btn-ghost {
+    transition:
+      background-color var(--af-speed-fast) linear,
+      color var(--af-speed-fast) linear,
+      border-color var(--af-speed-fast) linear;
+    transform: none !important;
+  }
+}

@@ -14,7 +14,6 @@ foundry/.env
 .DS_Store
 *.log
 .cursor-skill
-agentflow-frontend
 tmp/
 output/
 wallets.json

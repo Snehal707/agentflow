@@ -1,0 +1,47 @@
+{
+  "name": "agentflow-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3005",
+    "build": "node -e \"require('fs').rmSync('.next',{recursive:true,force:true})\" && next build",
+    "start": "next start",
+    "start:3005": "next start -p 3005",
+    "serve:stable": "npm run build && next start -p 3005",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@circle-fin/adapter-viem-v2": "^1.8.2",
+    "@circle-fin/app-kit": "^1.4.1",
+    "@circle-fin/bridge-kit": "^1.8.3",
+    "@rainbow-me/rainbowkit": "^2.2.0",
+    "@supabase/supabase-js": "^2.100.0",
+    "@tailwindcss/typography": "^0.5.19",
+    "@tanstack/react-query": "^5.59.0",
+    "@types/qrcode": "^1.5.6",
+    "@x402/core": "^2.5.0",
+    "@zxing/browser": "^0.1.5",
+    "@zxing/library": "^0.21.3",
+    "next": "14.2.18",
+    "qrcode": "^1.5.4",
+    "qrcode.react": "^4.2.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "recharts": "^2.15.0",
+    "remark-gfm": "^4.0.1",
+    "viem": "^2.21.0",
+    "wagmi": "^2.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "autoprefixer": "^10.4.27",
+    "eslint": "^8.57.0",
+    "eslint-config-next": "14.2.18",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.7.3"
+  }
+}
