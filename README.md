@@ -1,312 +1,114 @@
-## Active Frontend
-The active V3 frontend is `agentflow-frontend/` (port 3005)
-The `ui/` folder is legacy - do not use it
+# AgentFlow
 
-## AgentFlow — Autonomous AI agents on Arc Testnet
+**Monorepo:** [github.com/Snehal707/agentflow](https://github.com/Snehal707/agentflow) — Arc Testnet **backend** (`server.ts`, agents, x402) plus **Next.js 14** UI in [`agentflow-frontend/`](agentflow-frontend/).
 
-AgentFlow is a demo of an **AI agent economy** on **Arc Testnet**, fully powered by **Circle x402 Batching** and **Hermes AI**:
+AgentFlow is a demo **AI agent economy** on **Arc Testnet**, with **Circle x402** micropayments, **Hermes** for chat/orchestration, and **Circle developer-controlled wallets** + Gateway where configured.
 
-- **Orchestrator** (Hermes LLM) receives a user task and pays:
-  - **Research agent** (research)
-  - **Analyst agent** (analysis)
-  - **Writer agent** (final report, markdown)
-- All payments are **gasless USDC micropayments** via Circle x402 Batching on **Arc Testnet**.
+## Quick start
 
-The high-level flow is:
+1. **Prerequisites:** Node **20+**, npm **8+**, `CLOUDSMITH_TOKEN` for `@circlefin/*` (see [.npmrc](.npmrc)).
+2. **Install (repo root):** copy [.env.example](.env.example) → `.env`, then `npm run setup` (or load `CLOUDSMITH_TOKEN` and `npm install`).
+3. **Frontend env:** copy `agentflow-frontend/.env.local.example` → `agentflow-frontend/.env.local` and set `NEXT_PUBLIC_BACKEND_URL=http://localhost:4000`.
+4. **Full stack (recommended):** from the repo root:
 
-User → AgentFlow Orchestrator → pays 3 agents via x402 → returns report + receipt + web UI
+   ```bash
+   npm run dev:stack
+   ```
 
-### Architecture
+   This starts the **public API** (default **:4000**), **Hermes** (**:8000**), **facilitator** (see `FACILITATOR_PORT`, often **:3010**), **dedicated agents** (swap, vault, bridge, schedule, split, research, …), and the **Next.js** app on **:3005** when a production build exists (otherwise `next dev` on **:3005**).  
+   **Health checks:** `http://localhost:4000/health`, `http://localhost:3005/api/health`, `http://localhost:8000/health`.
+
+5. **Frontend only (hot reload):** `npm run dev:frontend:hot` from root, or `cd agentflow-frontend && npm run dev`.
+
+On **Windows PowerShell**, chain commands with `;` instead of `&&` if your shell rejects `&&`.
+
+## Project structure
+
+```text
+agentflow/
+├── server.ts                 # Public API gateway
+├── agentflow-frontend/       # Next.js 14 app (chat, pay, portfolio, …)
+├── agents/                   # x402 agent microservices (swap, vault, bridge, …)
+├── facilitator/              # x402 facilitator
+├── lib/                      # Shared backend helpers
+├── scripts/                  # setup, deploy helpers, stack cleanup
+├── contracts/                # Solidity (Hardhat)
+├── foundry/                  # Foundry layout (install forge libs locally)
+├── crons/                    # Optional workers
+├── docs/                     # Extra deployment / ops notes
+├── package.json              # Root scripts (dev:stack, agents, …)
+└── tsconfig.json             # Backend TypeScript project
+```
+
+## Architecture (high level)
 
 ```mermaid
 flowchart LR
   subgraph Client
-    User[User / Web UI]
+    Web[Next.js agentflow-frontend]
   end
 
-  subgraph Backend["AgentFlow Backend"]
-    API[Public API :4000]
-    Fac[Facilitator :3000]
-    R[Research :3001]
-    A[Analyst :3002]
-    W[Writer :3003]
+  subgraph Backend
+    API[API :4000]
+    Agents[Agents :3001+ / dedicated ports]
+    Fac[Facilitator]
   end
 
   subgraph External
-    Hermes[Hermes LLM]
-    Arc[Arc Testnet / x402]
+    Hermes[Hermes :8000]
+    Arc[Arc Testnet + x402]
   end
 
-  User -->|POST /run, task| API
-  API --> Fac
-  Fac -->|pay x402| R
-  Fac -->|pay x402| A
-  Fac -->|pay x402| W
-  R --> Hermes
-  A --> Hermes
-  W --> Hermes
-  R -->|research JSON| A
-  A -->|+ analysis| W
-  W -->|report| API
-  API -->|SSE + report| User
-  Fac -->|USDC micropayments| Arc
-  Arc -->|settle| Fac
+  Web --> API
+  API --> Agents
+  API --> Hermes
+  Agents --> Fac
+  Fac --> Arc
 ```
 
-### 1. Project structure
+## Environment
 
-```text
-agentflow/
-├── .env
-├── .env.example
-├── .npmrc
-├── package.json
-├── tsconfig.json
-├── lib/
-│   ├── hermes.ts              # OpenAI-compatible Hermes helper
-│   ├── live-data.ts           # Live crypto + DuckDuckGo data for research
-│   └── orchestrator.ts        # Shared orchestrator logic + events
-├── agents/
-│   ├── research/
-│   │   └── server.ts          # Research agent — x402 seller + Hermes
-│   ├── analyst/
-│   │   └── server.ts          # Analyst agent — x402 seller + Hermes
-│   └── writer/
-│       └── server.ts          # Writer agent — x402 seller + Hermes
-├── orchestrator/
-│   └── index.ts               # CLI entrypoint, calls lib/orchestrator
-├── agentflow-frontend/        # Next.js 14 + RainbowKit — AgentFlow V3 Kinetic (Vercel-ready)
-│   ├── app/                   # App router pages and layout
-│   ├── components/            # Chat, portfolio, onboarding, etc.
-│   └── lib/                   # Arc chain config, wagmi, hooks
-└── scripts/
-    ├── deposit.ts             # One-time: deposit USDC into Gateway
-    └── check-balances.ts      # Check wallet + Gateway balances
-```
+See [.env.example](.env.example) for the full list. Commonly needed:
 
-### 2. Prerequisites
+- **Wallet / chain:** `PRIVATE_KEY` or deployer keys as documented in `.env.example`
+- **Registry:** `CLOUDSMITH_TOKEN`
+- **Hermes:** `HERMES_API_KEY`, `HERMES_BASE_URL`, `HERMES_MODEL`
+- **Circle DCW:** `CIRCLE_API_KEY`, `CIRCLE_ENTITY_SECRET`, optional `CIRCLE_WALLET_SET_ID` — `npm run script:setup-circle` can bootstrap some of this
 
-- Node.js **v20+**
-- npm **v8+**
-- **Arc Testnet** USDC test funds (via Circle faucet)
-- **Cloudsmith** entitlement token (`CLOUDSMITH_TOKEN`) for `@circlefin/*`
-- **Hermes** (Nous Research) LLM API key + base URL (OpenAI-compatible; default model: Hermes-4-405B)
- - **Circle developer-controlled wallets**:
-  - `CIRCLE_API_KEY` and `CIRCLE_ENTITY_SECRET` for the Circle Developer-Controlled Wallets SDK
-  - optional `CIRCLE_WALLET_SET_ID` for the AgentFlow wallet set (auto-created on first run if not set)
+## Running pieces separately
 
-### 3. Private registry setup (required)
+- **API only (agents external):** `npx cross-env EMBEDDED_AGENT_SERVERS=false tsx server.ts` (or `npm run start:api` for production-style).
+- **Individual agents:** `npm run dev:swap`, `npm run dev:vault`, `npm run dev:bridge`, etc.
+- **Stack cleanup (Windows):** `node scripts/stack-cleanup.js` frees ports before a clean restart.
 
-`.npmrc` is already created at the repo root with:
+Embedded vs standalone facilitator/agent ports are described in comments inside `server.ts` and your `.env`; prefer **`FACILITATOR_PORT=3010`** locally to avoid clashing with other tools on **:3000**.
 
-```ini
-@circlefin:registry=https://npm.cloudsmith.io/circle/common-private/
-//npm.cloudsmith.io/circle/common-private/:_authToken=${CLOUDSMITH_TOKEN}
-```
+## Production builds
 
-npm reads the token from the **environment** when it runs. So either export it in your shell, or use the setup script (recommended).
+- **Next.js:** `npm run build --prefix agentflow-frontend` then `npm run start:3005 --prefix agentflow-frontend` (or root `npm run dev:frontend` for stable mode when `.next` exists).
+- **Deploy:** [DEPLOY.md](DEPLOY.md) (Railway / registry), [PHASE_D_VERCEL.md](PHASE_D_VERCEL.md) (Vercel **Root Directory:** `agentflow-frontend`).
 
-### 4. Install dependencies
+## Arc Testnet
 
-Put `CLOUDSMITH_TOKEN=your_token` in your `.env` file (see step 5), then from the project root run one of:
+- **USDC as gas** · **Chain ID:** `5042002` · **RPC:** `https://rpc.testnet.arc.network` · **Explorer:** https://testnet.arcscan.app
 
-**Option A — Node setup (cross-platform):**
-```bash
-npm run setup
-```
+## Orchestrator CLI (optional)
 
-**Option B — PowerShell (Windows):** set the token from `.env` in the current shell, then install:
-```powershell
-$env:CLOUDSMITH_TOKEN=(Get-Content .env | Select-String 'CLOUDSMITH_TOKEN' | ForEach-Object { ($_ -replace 'CLOUDSMITH_TOKEN=','').Trim() })
-npm install
-```
-
-**Option C — PowerShell script (Windows):** run the script that loads `.env` and runs `npm install`:
-```powershell
-.\scripts\setup.ps1
-```
-
-If you prefer to set the token manually (no `.env`):
-
-- **Bash:** `export CLOUDSMITH_TOKEN=your_token` then `npm install`
-- **PowerShell:** `$env:CLOUDSMITH_TOKEN="your_token"; npm install`
-
-If you see 404 or auth errors for `@circlefin/x402-batching`, double-check:
-
-- `CLOUDSMITH_TOKEN` is in `.env` (and you used `npm run setup`) or exported in your shell
-- `.npmrc` matches the snippet above
-
-### 5. Environment configuration
-
-Copy `.env.example` to `.env` and fill in values:
+Legacy three-agent research pipeline driver:
 
 ```bash
-cp .env.example .env
+npm run dev:orchestrator -- "Research topic here"
 ```
 
-Key variables (see `cursorrules` for full list):
-
-- `PRIVATE_KEY` — EVM wallet private key (use the same wallet you connect in the web app)
-- `CLOUDSMITH_TOKEN` — Cloudsmith registry token
-- `HERMES_API_KEY`, `HERMES_BASE_URL`, `HERMES_MODEL`
-- `CIRCLE_API_KEY`, `CIRCLE_ENTITY_SECRET`, `CIRCLE_WALLET_SET_ID` (optional) — Circle developer-controlled wallets config. You can bootstrap these by first setting `CIRCLE_API_KEY` in `.env` and then running `npx tsx scripts/setup-circle.ts` (or `npm run script:setup-circle`), which will register a new entity secret with Circle, create the `AgentFlow` wallet set, and append `CIRCLE_ENTITY_SECRET` / `CIRCLE_WALLET_SET_ID` to `.env`.
-- `RESEARCH_AGENT_URL`, `ANALYST_AGENT_URL`, `WRITER_AGENT_URL`
-- `RESEARCH_AGENT_PRICE`, `ANALYST_AGENT_PRICE`, `WRITER_AGENT_PRICE`
-
-### 6. Running the agents
-
-Each agent is an Express server with an x402-protected `/run` endpoint.
-
-**Option A — All in one terminal:**
-```bash
-npm run dev:stack         # Facilitator + all 3 agents (ports 3000–3003)
-```
-
-**Option B — Separate terminals:**
-```bash
-npm run dev:facilitator   # Facilitator on :3000
-npm run dev:research      # agents/research/server.ts (default :3001)
-npm run dev:analyst       # agents/analyst/server.ts (default :3002)
-npm run dev:writer        # agents/writer/server.ts  (default :3003)
-```
-
-**Embedded API mode (`EMBEDDED_AGENT_SERVERS=true`, default in local `server.ts`):** the **facilitator** and the **research / analyst / writer** agent apps are started **in-process** with the public API. Health and x402 settlement for that facilitator use **`FACILITATOR_PORT`** (commonly **`3010`** in `.env` to avoid clashing with a standalone facilitator on `:3000`). Do not assume `:3000` is live when embedded mode is on—probe **`http://127.0.0.1:${FACILITATOR_PORT}/health`**.
-
-**Stale Node processes** (old `server.ts` or agents still bound to `4000`, `3010`, agent ports, etc.) can make an A2A or x402 proof run look broken: the request hits an outdated binary, hooks never fire, or health checks point at the wrong facilitator. Clear listeners (e.g. `node scripts/stack-cleanup.js` on Windows, or `npm run dev:stack`’s built-in cleanup) and restart before judging a failure.
-
-**One-command A2A demo proof** (runs the three user-path tests, checks Redis x402 attempt stages, checks Supabase ledger rows for swap→portfolio, invoice→research, batch→portfolio; writes `.proof-a2a-output/proof-summary.json` and `proof-summary.md`; exits `1` if any pair is missing):
+## A2A proof script (optional)
 
 ```bash
 npm run proof:a2a
 ```
 
-If the stack is **already** running (typical on macOS/Linux, or after a manual `dev:stack`):
+If the stack is already up: `PROOF_A2A_SKIP_STACK=1 npm run proof:a2a` (PowerShell: `$env:PROOF_A2A_SKIP_STACK="1"`).
 
-```bash
-set PROOF_A2A_SKIP_STACK=1   # PowerShell: $env:PROOF_A2A_SKIP_STACK="1"
-npm run proof:a2a
-```
+## Notes
 
-### 7. Deposit and check balances
-
-Before running the orchestrator you should have some USDC in the Gateway.
-
-```bash
-npm run script:deposit          # One-time deposit of 1 USDC
-npm run script:check-balances   # Wallet + Gateway balances
-```
-
-### 8. Run the AgentFlow orchestrator (CLI)
-
-The orchestrator CLI is the x402 buyer. It pays all three agents and prints a
-receipt plus the final report.
-
-```bash
-npm run dev:orchestrator -- "Research Ethereum's 2025 roadmap"
-```
-
-This will:
-
-1. Call the **Research agent** (`/run?task=...`) via x402.
-2. Pass research JSON to the **Analyst agent**.
-3. Pass research + analysis JSON to the **Writer agent** (markdown report).
-4. Call Hermes again to summarize the overall flow.
-5. Print an ASCII **AGENT ECONOMY RECEIPT** (now backed by real tx IDs) and show:
-   - Per-agent prices
-   - Total USDC spent
-   - Gas fees (`$0.000`, gasless)
-   - Transaction IDs used in the web UI
-
-### 9. Run the AgentFlow Web UI
-
-AgentFlow also ships a single-page web UI, ideal for demos and hackathon stages.
-
-1. Start the backend (facilitator + agents) and UI:
-
-   ```bash
-   npm run dev:stack        # Facilitator + 3 agents (ports 3000–3003)
-   npm run dev:ui           # UI backend on :4000
-   ```
-
-2. Open the classic UI in your browser:
-
-   ```text
-   http://localhost:4000
-   ```
-
-In the UI you will see:
-
-- A **prompt box** for “What should the agents research?”
-- A **Run AgentFlow** button that triggers the full orchestrator flow
-- A live **3-step pipeline**:
-  - Step 1: Research Agent — paying `$0.005` USDC
-  - Step 2: Analyst Agent — paying `$0.003` USDC
-  - Step 3: Writer Agent — paying `$0.008` USDC
-- Each step shows a spinner while working and a green check + tx hash when paid
-- A **payment receipt card** with total USDC spent and `Gas Fees: $0.000`
-- The writer agent’s **markdown report**, rendered with `marked.js`
-- Arc Testnet facts and a link to view the wallet on `https://testnet.arcscan.app`
-
-### 10. Run the Next.js + RainbowKit Web App (Vercel-ready)
-
-AgentFlow includes a Next.js 14 app in **`agentflow-frontend/`** (AgentFlow V3 Kinetic) with RainbowKit wallet connection, Arc Testnet support, and SSE streaming.
-
-1. Start the backend (facilitator + 3 agents + UI server) as in section 9.
-
-2. Install and run the Next.js app:
-
-   ```bash
-   cd agentflow-frontend
-   npm install
-   npm run dev
-   ```
-
-3. Copy `agentflow-frontend/.env.local.example` to `agentflow-frontend/.env.local` and set:
-
-   ```env
-   NEXT_PUBLIC_BACKEND_URL=http://localhost:4000
-   ```
-
-4. Open http://localhost:3005 (Next.js runs on port 3005 to avoid conflicts).
-
-5. Connect your wallet (MetaMask), switch to Arc Testnet, and follow onboarding. Use the Workspace / chat and portfolio flows as documented in the app.
-
-**Vercel deployment:** Set the Vercel project **Root Directory** to **`agentflow-frontend`**. Set `NEXT_PUBLIC_BACKEND_URL` to your deployed backend URL (e.g. your Railway URL). **Step-by-step:** see [PHASE_D_VERCEL.md](PHASE_D_VERCEL.md).
-
-**Railway / Nixpacks:** If you deploy the full repo (root), the build runs `npm ci`, which needs the private registry. Set **`CLOUDSMITH_TOKEN`** in your Railway (or platform) **Variables** so it is available at **build time**. Otherwise you get `npm error E401`. See [DEPLOY.md](DEPLOY.md).
-
-### 11. Arc Testnet key facts
-
-- Arc uses **USDC as the native gas token** — fees are around `$0.01` per tx
-- Deterministic finality in **under 1 second** — no reorgs
-- **EVM compatible** — works with standard Ethereum tooling
-- Chain ID: `5042002` · RPC: `https://rpc.testnet.arc.network`
-- Explorer: `https://testnet.arcscan.app`
-
-### 12. Circle dev-controlled wallets & auto Gateway funding (Phase 2–3)
-
-- On first connection, AgentFlow creates (or reuses) a **Circle developer-controlled wallet** for the user on Arc Testnet and stores the mapping in `wallets.json`.
-- When a Circle wallet exists, the backend automatically **funds the Circle Gateway** for that user when their Gateway balance is below `0.1` USDC:
-  - `POST /wallet/fund-gateway` checks the current Gateway balance using the Circle Gateway API.
-  - If the balance is `< 0.1` USDC, it uses the Circle Developer-Controlled Wallets SDK to transfer USDC from the user’s Circle wallet to the Circle Gateway contract on Arc Testnet.
-  - The frontend calls this endpoint automatically after wallet creation; users no longer need to sign a `depositFor` transaction manually.
-- `MIN_GATEWAY_BALANCE` is currently set to `0.1` USDC in `server.ts` and can be adjusted if pricing changes.
-
-### 13. Backend-signed agent payments (Phase 4)
-
-- After Phase 3, all three x402 agent payments (Research, Analyst, Writer) are now **signed server-side** using the user’s Circle dev-controlled wallet.
-- The `/run` endpoint accepts `{ task, userAddress }` and:
-  - looks up the user’s Circle wallet from `wallets.json`,
-  - uses a server-side x402 client to pay each agent via HTTP 402 (GatewayWalletBatched),
-  - emits SSE events for `step_start`, `step_complete`, `receipt` and `report`.
-- The frontend dashboard no longer signs payments in the browser; it simply:
-  - posts `{ task, userAddress }` to `/run`,
-  - streams SSE events to update the pipeline UI, receipt card, and report output.
-- Ensure each user’s Circle dev-controlled wallet has sufficient USDC to cover the per-step prices, and treat `wallets.json` plus Circle wallet balances as critical data in production.
-
-### 14. Notes & gotchas
-
-- **Order matters:** start all three agents, ensure `.env` is loaded, then run scripts.
-- **Gasless:** x402 batching handles payment signing off-chain; only deposits/withdrawals hit chain.
-- **Logging:** agents and orchestrator log errors and results to the console for demo readability.
-
+- **Gasless agent steps** use x402 batching; on-chain activity is mainly deposits/settlements as configured.
+- **Stale Node processes** on `4000` / agent ports cause confusing failures; clean restart after changing `server.ts` or agents.
