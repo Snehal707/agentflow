@@ -1,0 +1,136 @@
+{
+  "name": "india-rbi-rate-decision",
+  "source_fixture": "india-rbi-rate-decision",
+  "captured_at": "2026-05-23T19:43:50.764Z",
+  "captured_runtime_version": "0.1.0",
+  "capture_notes": "captured_with_natural_variance",
+  "capture_config": {
+    "claim_batch_concurrency": 1,
+    "claim_batch_timeout_ms": 45000
+  },
+  "claims_count": 8,
+  "extraction_latency_ms": 21617,
+  "claims": [
+    {
+      "claim": "Kevin Warsh takes oath of office as chairman and a member of the Board of Governors of the Federal Reserve System",
+      "date": "2026-05-22",
+      "source_url": "https://www.federalreserve.gov/newsevents/pressreleases/other20260522a.htm",
+      "source_type": "official",
+      "confidence": 0.95,
+      "supporting_snippet": "Kevin Warsh takes oath of office as chairman and a member of the Board of Governors of the Federal Reserve System, and the Federal Open Market Committee unanimously selects Warsh as its chairman",
+      "entities": [
+        "Kevin Warsh",
+        "Board of Governors",
+        "Federal Reserve System",
+        "Federal Open Market Committee"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Federal Reserve Board issues enforcement action with former employee of Commerce Bank",
+      "date": "2026-05-21",
+      "source_url": "https://www.federalreserve.gov/newsevents/pressreleases/enforcement20260521a.htm",
+      "source_type": "official",
+      "confidence": 0.95,
+      "supporting_snippet": "Federal Reserve Board issues enforcement action with former employee of Commerce Bank",
+      "entities": [
+        "Federal Reserve Board",
+        "Commerce Bank"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "US lawmakers and immigration advocates criticize the Trump administration's new green card policy",
+      "date": "2026-05-23",
+      "source_url": "https://www.livemint.com/news/us-news/12-million-indian-americans-their-families-in-limbo-us-lawmakers-slam-new-green-card-policy-11779547316159.html",
+      "source_type": "news",
+      "confidence": 0.9,
+      "supporting_snippet": "US lawmakers and immigration advocates criticise the Trump administration's new green card policy that requires applicants to apply from their home countries, calling it reckless and harmful.",
+      "entities": [
+        "US lawmakers",
+        "immigration advocates",
+        "Trump administration's new green card policy"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Thailand ends 60-day visa-free stay for Indians and others",
+      "date": "2026-05-23",
+      "source_url": "https://www.livemint.com/news/trends/thailand-visa-news-tourist-visa-free-stay-for-indians-ends-11779550734027.html",
+      "source_type": "news",
+      "confidence": 0.85,
+      "supporting_snippet": "The government said the earlier 60-day exemption had originally been introduced to revive tourism and strengthen economic recovery after the pandemic.",
+      "entities": [
+        "Thailand",
+        "Indians"
+      ],
+      "numbers": [
+        "60-day"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Delhi Gymkhana Club falls under 'highly sensitive & strategic area', says Centre, asked to hand over premises by June 5",
+      "date": "2026-05-23",
+      "source_url": "https://www.livemint.com/news/india/delhi-gymkhana-club-falls-under-highly-sensitive-strategic-area-says-centre-asked-to-hand-over-premises-june-5-11779524428808.html",
+      "source_type": "news",
+      "confidence": 0.85,
+      "supporting_snippet": "The central govt has ordered the takeover of the Delhi Gymkhana Club premises for public and national interest, citing its strategic location essential for defense infrastructure and security. The govt issued the directive for land originally leased to the club for social & sporting activities.",
+      "entities": [
+        "Delhi Gymkhana Club",
+        "Centre",
+        "govt"
+      ],
+      "numbers": [],
+      "stance": "disputes"
+    },
+    {
+      "claim": "The Bank of England's Monetary Policy Committee is responsible for making decisions about Bank Rate.",
+      "date": "2026-04-30",
+      "source_url": "https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/2026/april-2026",
+      "source_type": "official",
+      "confidence": 0.95,
+      "supporting_snippet": "The Bank of England’s Monetary Policy Committee is responsible for making decisions about Bank Rate.",
+      "entities": [
+        "Bank of England",
+        "Monetary Policy Committee",
+        "Bank Rate"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Bank Rate was maintained at 3.75% in April 2026.",
+      "date": "2026-04-30",
+      "source_url": "https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/2026/april-2026",
+      "source_type": "official",
+      "confidence": 0.95,
+      "supporting_snippet": "Title: Bank Rate maintained at 3.75% - April 2026 Monetary Policy Summary and Minutes",
+      "entities": [
+        "Bank Rate"
+      ],
+      "numbers": [
+        "3.75",
+        "2026"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "OECD maintains dataflows for reporting and dissemination of global SDG indicators.",
+      "date": "2026-05-23",
+      "source_url": "https://www.oecd.org",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "Reporting and dissemination dataflow for non-harmonized global SDG indicators reported by countries. Reporting and dissemination dataflow for harmonized global SDG indicators.",
+      "entities": [
+        "OECD",
+        "SDG indicators"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    }
+  ]
+}

@@ -7,6 +7,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+/// @deprecated AgentFlow vault execution now uses third-party provider vault integrations.
+/// This contract is kept only for historical testnet deployments and should not be used by backend code.
 contract AgentFlowVault is ERC4626, Ownable {
     using SafeERC20 for IERC20;
 

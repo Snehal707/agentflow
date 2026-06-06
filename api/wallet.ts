@@ -20,10 +20,11 @@ import { ARC } from '../lib/arc-config';
 import { getDailyLimit } from '../lib/ratelimit';
 import { transferToGateway } from '../lib/circleWallet';
 import {
-  fetchGatewayBalancesForDepositors,
   fetchGatewayBalanceForAddress,
   getOrCreateGatewayFundingWallet,
 } from '../lib/gateway-balance';
+import { getArcUnifiedBalanceForDepositors } from '../lib/arc-app-kit';
+import { executionGuardMiddleware } from '../lib/execution-guard';
 
 const router = Router();
 const ARC_USDC = '0x3600000000000000000000000000000000000000';
@@ -40,6 +41,39 @@ const ERC20_BALANCE_ABI = [
     outputs: [{ name: '', type: 'uint256' }],
   },
 ] as const;
+
+type ExecutionSummaryRouteResponse = {
+  walletAddress: string;
+  userAgentWalletAddress: string;
+  userAgentWalletId: string;
+  gatewayFundingAddress?: string;
+  explorerUrl: string;
+  balances: {
+    nativeUsdcGas: { raw: string; formatted: string };
+    usdc: { raw: string; formatted: string };
+    eurc: { raw: string; formatted: string };
+    vaultShares: { raw: string; formatted: string };
+    gatewayUsdc: { raw: string; formatted: string; total: string };
+  };
+  fundingStatus: {
+    needsGasFunding: boolean;
+    needsUsdcFunding: boolean;
+    needsEurcFunding: boolean;
+    needsVaultShares: boolean;
+  };
+  holdings: Array<{
+    contractAddress: string | null;
+    symbol: string;
+    balanceFormatted: string;
+  }>;
+};
+
+const EXECUTION_SUMMARY_CACHE_TTL_MS = 30_000;
+const executionSummaryCache = new Map<
+  string,
+  { response: ExecutionSummaryRouteResponse; fetchedAt: number }
+>();
+const executionSummaryInflight = new Map<string, Promise<ExecutionSummaryRouteResponse>>();
 
 function uniqueAddresses(addresses: Array<string | undefined | null>): `0x${string}`[] {
   const seen = new Set<string>();
@@ -140,8 +174,8 @@ async function readArcWithFallback<T>(
 }
 
 /**
- * When every Arc RPC fails, throw instead of returning 0n — so `/api/wallet/execution`
- * does not return HTTP 200 with fake “empty wallet” balances (the root cause of “always zero” UIs).
+ * When every Arc RPC fails, throw instead of returning 0n, so wallet UIs do not
+ * show fake “empty wallet” balances.
  */
 async function readArcOrThrow<T>(
   label: string,
@@ -244,167 +278,6 @@ router.post('/create', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/deposit-gateway', authMiddleware, async (req, res) => {
-  try {
-    const auth = (req as any).auth as JWTPayload | undefined;
-    if (!auth?.walletAddress) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    const amountRaw = req.body?.amount;
-    if (amountRaw === undefined || amountRaw === null || String(amountRaw).trim() === '') {
-      return res.status(400).json({ error: 'amount required' });
-    }
-    const amount = String(amountRaw).trim();
-    try {
-      parseUnits(amount, 6);
-    } catch {
-      return res.status(400).json({ error: 'Invalid amount' });
-    }
-
-    const wallet = await getOrCreateUserAgentWallet(auth.walletAddress);
-    const result = await transferToGateway({
-      walletId: wallet.wallet_id,
-      walletAddress: wallet.address,
-      maxAmountUsdc: amount,
-    });
-    if (result.depositState === 'COMPLETE') {
-      return res.json({ ok: true, ...result });
-    }
-    return res.status(400).json({
-      ok: false,
-      error: result.errorDetails || result.errorReason || result.status || 'Gateway deposit did not complete',
-      ...result,
-    });
-  } catch (e) {
-    return res.status(500).json({
-      error: e instanceof Error ? e.message : 'Gateway deposit failed',
-    });
-  }
-});
-
-router.get('/all-balances', authMiddleware, async (req, res) => {
-  try {
-    const auth = (req as any).auth as JWTPayload | undefined;
-    if (!auth?.walletAddress) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const wallet = await getOrCreateUserAgentWallet(auth.walletAddress);
-    const eoa = getAddress(auth.walletAddress) as `0x${string}`;
-    const dcw = getAddress(wallet.address) as `0x${string}`;
-
-    /** Sum Gateway USDC for EOA and DCW — on-chain `deposit` is credited to `msg.sender`. */
-    const gatewayDepositors = uniqueAddresses([eoa, dcw]);
-
-    const [eoaBal, eoaNativeBal, dcwBal, dcwNativeBal, gatewayBals] = await Promise.all([
-      readTokenBalanceStrict(ARC_USDC as `0x${string}`, eoa, 'EOA USDC'),
-      readNativeUsdcBalanceStrict(eoa),
-      readTokenBalanceStrict(ARC_USDC as `0x${string}`, dcw, 'DCW USDC'),
-      readNativeUsdcBalanceStrict(dcw),
-      fetchGatewayBalancesForDepositors(gatewayDepositors),
-    ]);
-
-    const gNum = Number(gatewayBals.available);
-    const usdc = Number.isFinite(gNum) ? gNum : 0;
-
-    return res.json({
-      eoa: {
-        address: auth.walletAddress,
-        usdc: formatUnits(eoaBal, 6),
-        nativeUsdc: formatUnits(eoaNativeBal, 18),
-      },
-      dcw: {
-        address: wallet.address,
-        usdc: formatUnits(dcwBal, 6),
-        nativeUsdc: formatUnits(dcwNativeBal, 18),
-      },
-      gateway: {
-        address: wallet.address,
-        usdc: usdc.toFixed(6),
-        queriedDepositors: gatewayDepositors,
-      },
-    });
-  } catch (e) {
-    const failure = walletReadFailure(e, 'Failed to fetch balances');
-    return res.status(failure.status).json({ error: failure.error });
-  }
-});
-
-router.get('/execution', authMiddleware, async (req, res) => {
-  try {
-    const auth = (req as any).auth as JWTPayload | undefined;
-    if (!auth?.walletAddress) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const wallet = await getOrCreateUserAgentWallet(auth.walletAddress);
-    const executionWalletAddress = getAddress(wallet.address);
-    const eoa = getAddress(auth.walletAddress) as `0x${string}`;
-    const vaultAddress = ARC.vaultContract?.trim();
-    /** Gateway credits the caller — include EOA + DCW so EOA- and agent-funded deposits both count. */
-    const gatewayDepositors = uniqueAddresses([eoa, executionWalletAddress]);
-
-    const [nativeGasRaw, usdcRaw, eurcRaw, vaultSharesRaw, holdings, gatewayBalance] = await Promise.all([
-      readNativeUsdcBalanceStrict(executionWalletAddress as `0x${string}`),
-      readTokenBalanceStrict(ARC_USDC as `0x${string}`, executionWalletAddress as `0x${string}`, 'DCW USDC'),
-      readTokenBalanceStrict(ARC_EURC as `0x${string}`, executionWalletAddress as `0x${string}`, 'DCW EURC'),
-      vaultAddress
-        ? readTokenBalanceStrict(
-            vaultAddress as `0x${string}`,
-            executionWalletAddress as `0x${string}`,
-            'vault shares',
-          )
-        : Promise.resolve(0n),
-      getArcRpcHoldings(executionWalletAddress).catch(() => []),
-      /** Do not swallow Gateway API errors as 0 — that made the UI show “empty” balances on network failure. */
-      fetchGatewayBalancesForDepositors(gatewayDepositors),
-    ]);
-
-    return res.json({
-      walletAddress: auth.walletAddress,
-      userAgentWalletAddress: executionWalletAddress,
-      userAgentWalletId: wallet.wallet_id,
-      gatewayFundingAddress: executionWalletAddress,
-      gatewayDepositorAddress: executionWalletAddress,
-      gatewayQueriedDepositors: gatewayDepositors,
-      explorerUrl: `https://testnet.arcscan.app/address/${executionWalletAddress}`,
-      balances: {
-        nativeUsdcGas: {
-          raw: nativeGasRaw.toString(),
-          formatted: formatUnits(nativeGasRaw, 18),
-        },
-        usdc: {
-          raw: usdcRaw.toString(),
-          formatted: formatUnits(usdcRaw, 6),
-        },
-        eurc: {
-          raw: eurcRaw.toString(),
-          formatted: formatUnits(eurcRaw, 6),
-        },
-        vaultShares: {
-          raw: vaultSharesRaw.toString(),
-          formatted: formatUnits(vaultSharesRaw, 6),
-        },
-        gatewayUsdc: {
-          raw: gatewayBalance.available,
-          formatted: gatewayBalance.available,
-          total: gatewayBalance.total,
-        },
-      },
-      fundingStatus: {
-        needsGasFunding: nativeGasRaw < parseUnits('0.02', 18),
-        needsUsdcFunding: usdcRaw === 0n,
-        needsEurcFunding: eurcRaw === 0n,
-        needsVaultShares: vaultSharesRaw === 0n,
-      },
-      holdings,
-    });
-  } catch (error: any) {
-    const failure = walletReadFailure(error, 'Execution wallet fetch failed');
-    return res.status(failure.status).json({ error: failure.error });
-  }
-});
-
 router.get('/usage', authMiddleware, async (req, res) => {
   try {
     const auth = (req as any).auth as JWTPayload | undefined;
@@ -483,35 +356,7 @@ function holdingsIncludeUsdc(holdings: unknown[]): boolean {
   return false;
 }
 
-router.get('/balance', authMiddleware, async (req, res) => {
-  try {
-    const auth = (req as any).auth as JWTPayload | undefined;
-    if (!auth?.walletAddress) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const wallet = await getOrCreateUserAgentWallet(auth.walletAddress);
-    const executionAddr = getAddress(wallet.address as `0x${string}`);
-    let holdings: unknown[];
-    try {
-      holdings = await getArcRpcHoldings(wallet.address);
-    } catch {
-      holdings = [await arcUsdcBalanceRow(executionAddr)];
-    }
-    if (!holdingsIncludeUsdc(holdings)) {
-      holdings = [...holdings, await arcUsdcBalanceRow(executionAddr)];
-    }
-    return res.json({
-      walletAddress: auth.walletAddress,
-      userAgentWalletAddress: wallet.address,
-      holdings,
-    });
-  } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'wallet balance failed' });
-  }
-});
-
-router.post('/withdraw', authMiddleware, async (req, res) => {
+router.post('/withdraw', authMiddleware, executionGuardMiddleware, async (req, res) => {
   try {
     const auth = (req as any).auth as JWTPayload | undefined;
     if (!auth?.walletAddress) {
@@ -709,16 +554,6 @@ async function getArcRpcHoldings(address: string): Promise<unknown[]> {
       decimals: 6,
       usdPrice: 1,
     }),
-    ARC.vaultContract && isAddress(ARC.vaultContract)
-      ? readErc20BalanceRow({
-          client,
-          walletAddress,
-          contractAddress: ARC.vaultContract,
-          symbol: 'VAULT',
-          name: 'Vault Shares',
-          decimals: 6,
-        })
-      : Promise.resolve(null),
   ]);
 
   rows.push(...tokenRows.filter((row): row is Record<string, unknown> => Boolean(row)));
@@ -759,8 +594,27 @@ const GATEWAY_EIP712_TYPES = {
 const GATEWAY_MAX_UINT256 = ((1n << 256n) - 1n).toString();
 const GATEWAY_DEFAULT_MAX_FEE = parseUnits('2.01', 6).toString();
 const MIN_GATEWAY_MINT_GAS_USDC = parseUnits('0.05', 18);
+const UNIFIED_BALANCE_CACHE_TTL_MS = 15_000;
+const UNIFIED_BALANCE_CACHE_STALE_MS = 2 * 60_000;
 
-router.get('/gateway/balance', authMiddleware, async (req, res) => {
+type UnifiedBalanceRouteResponse = {
+  configured: boolean;
+  token: string;
+  currency: string;
+  confirmed: string;
+  pending: string;
+  breakdown: unknown[];
+  queriedDepositors: `0x${string}`[];
+  walletAddress: `0x${string}`;
+};
+
+const unifiedBalanceCache = new Map<
+  string,
+  { response: UnifiedBalanceRouteResponse; fetchedAt: number }
+>();
+const unifiedBalanceInflight = new Map<string, Promise<UnifiedBalanceRouteResponse>>();
+
+router.get('/unified-balance', authMiddleware, async (req, res) => {
   try {
     const auth = (req as any).auth as JWTPayload | undefined;
     if (!auth?.walletAddress) {
@@ -771,38 +625,245 @@ router.get('/gateway/balance', authMiddleware, async (req, res) => {
     const executionAddress = getAddress(executionWallet.address) as `0x${string}`;
     const eoa = getAddress(auth.walletAddress) as `0x${string}`;
     const queriedDepositors = uniqueAddresses([eoa, executionAddress]);
-    const balance = await fetchGatewayBalancesForDepositors(queriedDepositors);
+    const cacheKey = queriedDepositors.map((value) => value.toLowerCase()).sort().join(',');
+    const cached = unifiedBalanceCache.get(cacheKey);
+    const now = Date.now();
+    if (cached && now - cached.fetchedAt <= UNIFIED_BALANCE_CACHE_TTL_MS) {
+      return res.json(cached.response);
+    }
 
-    return res.json({
-      balance: balance.available,
-      currency: 'USDC',
-      walletAddress: executionAddress,
-      queriedDepositors,
+    const inflight = unifiedBalanceInflight.get(cacheKey);
+    const responsePromise =
+      inflight ??
+      (async () => {
+        const balance = await getArcUnifiedBalanceForDepositors(queriedDepositors);
+        const response: UnifiedBalanceRouteResponse = {
+          ...balance,
+          currency: 'USDC',
+          walletAddress: executionAddress,
+          queriedDepositors,
+        };
+        unifiedBalanceCache.set(cacheKey, {
+          response,
+          fetchedAt: Date.now(),
+        });
+        return response;
+      })();
+
+    if (!inflight) {
+      unifiedBalanceInflight.set(cacheKey, responsePromise);
+    }
+
+    const response = await responsePromise.finally(() => {
+      if (!inflight) {
+        unifiedBalanceInflight.delete(cacheKey);
+      }
     });
+
+    return res.json(response);
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'gateway balance failed' });
+    try {
+      const auth = (req as any).auth as JWTPayload | undefined;
+      if (auth?.walletAddress && isAddress(auth.walletAddress)) {
+        const executionWallet = await getOrCreateUserAgentWallet(auth.walletAddress);
+        const executionAddress = getAddress(executionWallet.address) as `0x${string}`;
+        const eoa = getAddress(auth.walletAddress) as `0x${string}`;
+        const cacheKey = uniqueAddresses([eoa, executionAddress])
+          .map((value) => value.toLowerCase())
+          .sort()
+          .join(',');
+        const cached = unifiedBalanceCache.get(cacheKey);
+        if (cached && Date.now() - cached.fetchedAt <= UNIFIED_BALANCE_CACHE_STALE_MS) {
+          return res.json(cached.response);
+        }
+      }
+    } catch {
+      // Ignore cache fallback failures and return the standard degraded payload below.
+    }
+    return res.status(200).json({
+      configured: false,
+      token: 'USDC',
+      currency: 'USDC',
+      confirmed: '0',
+      pending: '0',
+      breakdown: [],
+      queriedDepositors: [],
+      error: error?.message ?? 'Unified Balance read unavailable',
+    });
   }
 });
 
-router.post('/gateway/deposit', authMiddleware, async (req, res) => {
+router.get('/execution-summary', authMiddleware, async (req, res) => {
   try {
     const auth = (req as any).auth as JWTPayload | undefined;
     if (!auth?.walletAddress) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const executionWallet = await getOrCreateUserAgentWallet(auth.walletAddress);
+    const executionAddress = getAddress(executionWallet.address) as `0x${string}`;
+    const eoa = getAddress(auth.walletAddress) as `0x${string}`;
+    const queriedDepositors = uniqueAddresses([eoa, executionAddress]);
+    const cacheKey = executionAddress.toLowerCase();
+    const cached = executionSummaryCache.get(cacheKey);
+    const now = Date.now();
+    if (cached && now - cached.fetchedAt <= EXECUTION_SUMMARY_CACHE_TTL_MS) {
+      return res.json(cached.response);
+    }
+
+    const inflight = executionSummaryInflight.get(cacheKey);
+    const responsePromise =
+      inflight ??
+      (async () => {
+        const [nativeUsdcGasRaw, usdcRaw, eurcRaw, unifiedBalance] = await Promise.all([
+          readArcOrThrow('execution native balance', (client) =>
+            client.getBalance({ address: executionAddress }),
+          ),
+          readArcOrThrow('execution usdc balance', (client) =>
+            client.readContract({
+              address: ARC_USDC as `0x${string}`,
+              abi: ERC20_BALANCE_ABI,
+              functionName: 'balanceOf',
+              args: [executionAddress],
+            }) as Promise<bigint>,
+          ),
+          readArcOrThrow('execution eurc balance', (client) =>
+            client.readContract({
+              address: ARC_EURC as `0x${string}`,
+              abi: ERC20_BALANCE_ABI,
+              functionName: 'balanceOf',
+              args: [executionAddress],
+            }) as Promise<bigint>,
+          ),
+          getArcUnifiedBalanceForDepositors(queriedDepositors),
+        ]);
+
+        const nativeUsdcGasFormatted = formatUnits(nativeUsdcGasRaw, 18);
+        const usdcFormatted = formatUnits(usdcRaw, 6);
+        const eurcFormatted = formatUnits(eurcRaw, 6);
+
+        const response: ExecutionSummaryRouteResponse = {
+          walletAddress: executionAddress,
+          userAgentWalletAddress: executionAddress,
+          userAgentWalletId: executionWallet.wallet_id,
+          gatewayFundingAddress: queriedDepositors[0],
+          explorerUrl: `https://testnet.arcscan.app/address/${executionAddress}`,
+          balances: {
+            nativeUsdcGas: {
+              raw: nativeUsdcGasRaw.toString(),
+              formatted: nativeUsdcGasFormatted,
+            },
+            usdc: {
+              raw: usdcRaw.toString(),
+              formatted: usdcFormatted,
+            },
+            eurc: {
+              raw: eurcRaw.toString(),
+              formatted: eurcFormatted,
+            },
+            vaultShares: {
+              raw: '0',
+              formatted: '0',
+            },
+            gatewayUsdc: {
+              raw: unifiedBalance.confirmed,
+              formatted: unifiedBalance.confirmed,
+              total: unifiedBalance.confirmed,
+            },
+          },
+          fundingStatus: {
+            needsGasFunding: Number(nativeUsdcGasFormatted || '0') < 0.05,
+            needsUsdcFunding: Number(usdcFormatted || '0') <= 0,
+            needsEurcFunding: Number(eurcFormatted || '0') <= 0,
+            needsVaultShares: true,
+          },
+          holdings: [
+            {
+              contractAddress: null,
+              symbol: 'USDC',
+              balanceFormatted: nativeUsdcGasFormatted,
+            },
+            {
+              contractAddress: ARC_USDC,
+              symbol: 'USDC',
+              balanceFormatted: usdcFormatted,
+            },
+            {
+              contractAddress: ARC_EURC,
+              symbol: 'EURC',
+              balanceFormatted: eurcFormatted,
+            },
+          ],
+        };
+
+        executionSummaryCache.set(cacheKey, {
+          response,
+          fetchedAt: Date.now(),
+        });
+        return response;
+      })();
+
+    if (!inflight) {
+      executionSummaryInflight.set(cacheKey, responsePromise);
+    }
+
+    const response = await responsePromise.finally(() => {
+      if (!inflight) {
+        executionSummaryInflight.delete(cacheKey);
+      }
+    });
+
+    return res.json(response);
+  } catch (error) {
+    const failure = walletReadFailure(error, 'Execution wallet summary failed');
+    return res.status(failure.status).json({ error: failure.error });
+  }
+});
+
+router.post('/gateway/deposit', authMiddleware, executionGuardMiddleware, async (req, res) => {
+  try {
+    const auth = (req as any).auth as JWTPayload | undefined;
+    if (!auth?.walletAddress) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const amountRaw = req.body?.amount;
+    if (amountRaw === undefined || amountRaw === null || String(amountRaw).trim() === '') {
+      const wallet = await getOrCreateUserAgentWallet(auth.walletAddress);
+      return res.json({
+        depositAddress: wallet.address,
+        network: 'ARC-TESTNET',
+        instructions: 'Send USDC to this Agent Wallet on Arc Testnet, then deposit from Agent Wallet to Gateway.',
+      });
+    }
+
+    const amount = String(amountRaw).trim();
+    try {
+      parseUnits(amount, 6);
+    } catch {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+
     const wallet = await getOrCreateUserAgentWallet(auth.walletAddress);
-    return res.json({
-      depositAddress: wallet.address,
-      network: 'ARC-TESTNET',
-      instructions: 'Send USDC to this Agent Wallet on Arc Testnet, then deposit from Agent Wallet to Gateway.',
+    const result = await transferToGateway({
+      walletId: wallet.wallet_id,
+      walletAddress: wallet.address,
+      maxAmountUsdc: amount,
+    });
+    if (result.depositState === 'COMPLETE') {
+      return res.json({ ok: true, ...result });
+    }
+    return res.status(400).json({
+      ok: false,
+      error: result.errorDetails || result.errorReason || result.status || 'Gateway deposit did not complete',
+      ...result,
     });
   } catch (error: any) {
     return res.status(500).json({ error: error?.message ?? 'gateway deposit info failed' });
   }
 });
 
-router.post('/gateway/withdraw', authMiddleware, async (req, res) => {
+router.post('/gateway/withdraw', authMiddleware, executionGuardMiddleware, async (req, res) => {
   try {
     const auth = (req as any).auth as JWTPayload | undefined;
     if (!auth?.walletAddress) {
@@ -841,7 +902,7 @@ router.post('/gateway/withdraw', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/gateway/to-execution', authMiddleware, async (req, res) => {
+router.post('/gateway/to-execution', authMiddleware, executionGuardMiddleware, async (req, res) => {
   try {
     const auth = (req as any).auth as JWTPayload | undefined;
     if (!auth?.walletAddress) {

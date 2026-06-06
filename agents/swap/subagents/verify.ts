@@ -1,4 +1,4 @@
-import { createPublicClient, defineChain, getAddress, http, parseAbiItem } from 'viem';
+import { createPublicClient, defineChain, getAddress, http, parseAbiItem, zeroAddress } from 'viem';
 import { ARC } from '../../../lib/arc-config';
 
 const DEFAULT_USDC = '0x3600000000000000000000000000000000000000';
@@ -24,13 +24,22 @@ export interface VerifyTransferInput {
 
 export async function verifyTokenTransfer(
   input: VerifyTransferInput,
-): Promise<{ txHash: `0x${string}` }> {
+): Promise<{ txHash: `0x${string}`; valueRaw?: bigint }> {
   const recipient = getAddress(input.recipient);
   const timeoutMs = input.timeoutMs ?? 30_000;
   const lookbackBlocks = input.lookbackBlocks ?? 20n;
   const tokenAddress = getAddress(
     (input.tokenAddress?.trim() || process.env.ARC_USDC_ADDRESS?.trim() || DEFAULT_USDC) as `0x${string}`,
   ) as `0x${string}`;
+  if (
+    tokenAddress === getAddress(DEFAULT_USDC as `0x${string}`) ||
+    tokenAddress === zeroAddress
+  ) {
+    if (!input.txHash) {
+      throw new Error('[swap/verify] Native-output verification requires a transaction hash');
+    }
+    return { txHash: input.txHash };
+  }
 
   const client = createPublicClient({
     chain,
@@ -79,7 +88,10 @@ export async function verifyTokenTransfer(
     });
 
     if (matched?.transactionHash) {
-      return { txHash: matched.transactionHash as `0x${string}` };
+      return {
+        txHash: matched.transactionHash as `0x${string}`,
+        valueRaw: matched.args.value as bigint | undefined,
+      };
     }
 
     if (!input.txHash) {
@@ -96,7 +108,7 @@ export async function verifyTokenTransfer(
 
 export async function verifyUsdcTransfer(
   input: Omit<VerifyTransferInput, 'tokenAddress'>,
-): Promise<{ txHash: `0x${string}` }> {
+): Promise<{ txHash: `0x${string}`; valueRaw?: bigint }> {
   return verifyTokenTransfer({
     ...input,
     tokenAddress: DEFAULT_USDC,

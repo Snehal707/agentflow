@@ -1,0 +1,151 @@
+{
+  "name": "bitcoin-price-and-drivers",
+  "source_fixture": "bitcoin-price-and-drivers",
+  "captured_at": "2026-05-23T19:41:29.176Z",
+  "captured_runtime_version": "0.1.0",
+  "capture_notes": "initial_capture",
+  "capture_config": {
+    "claim_batch_concurrency": 1,
+    "claim_batch_timeout_ms": 45000
+  },
+  "claims_count": 8,
+  "extraction_latency_ms": 21456,
+  "claims": [
+    {
+      "claim": "CFTC Commitments of Traders report for Bitcoin Cash perpetual futures on Coinbase shows an open interest of 1,839 contracts as of May 19, 2026.",
+      "date": "2026-05-19",
+      "source_url": "https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "Open interest: 1839",
+      "entities": [
+        "CFTC",
+        "Coinbase",
+        "Bitcoin Cash",
+        "Commitments of Traders"
+      ],
+      "numbers": [
+        "2026-05-19",
+        "1839"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "The same CFTC report shows 1,468 non-commercial long positions and 762 non-commercial short positions for Bitcoin Cash futures.",
+      "date": "2026-05-19",
+      "source_url": "https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "Non-commercial long: 1468 Non-commercial short: 762",
+      "entities": [
+        "CFTC",
+        "Coinbase",
+        "Bitcoin Cash",
+        "Commitments of Traders"
+      ],
+      "numbers": [
+        "2026-05-19",
+        "1468",
+        "762"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "CoinGecko lists Bitcoin (BTC) as the #1 ranked cryptocurrency as of May 2026.",
+      "date": "2026-05-19",
+      "source_url": "https://www.coingecko.com",
+      "source_type": "news",
+      "confidence": 0.9,
+      "supporting_snippet": "Rank: 1",
+      "entities": [
+        "CoinGecko",
+        "Bitcoin",
+        "BTC"
+      ],
+      "numbers": [
+        "1"
+      ],
+      "stance": "neutral"
+    },
+    {
+      "claim": "The last price for Bitcoin (BTCUSDT) on Binance is 75465.67 USD.",
+      "date": "",
+      "source_url": "https://api.binance.com",
+      "source_type": "official",
+      "confidence": 0.95,
+      "supporting_snippet": "Last price: 75465.67000000",
+      "entities": [
+        "Binance",
+        "Bitcoin"
+      ],
+      "numbers": [
+        "75465.67"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "The current spot price for Bitcoin (BTC/USD) on Coinbase is 75380.04 USD.",
+      "date": "",
+      "source_url": "https://www.coinbase.com",
+      "source_type": "official",
+      "confidence": 0.95,
+      "supporting_snippet": "Spot price: 75380.035 USD",
+      "entities": [
+        "Coinbase",
+        "Bitcoin"
+      ],
+      "numbers": [
+        "75380.04"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "The Deribit perpetual futures contract for Bitcoin (BTC-PERPETUAL) is currently trading at 75364 USD.",
+      "date": "",
+      "source_url": "https://www.deribit.com",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "Last: 75364 Bid/ask: 75368 / 75368.5",
+      "entities": [
+        "Deribit",
+        "Bitcoin"
+      ],
+      "numbers": [
+        "75364"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Tether (USDT) is a stablecoin pegged to the US dollar, with a current circulating supply of approximately 189.47 billion USD.",
+      "date": "",
+      "source_url": "https://stablecoins.llama.fi",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "Tether USDT\\nSymbol: USDT Peg type: peggedUSD Peg mechanism: fiat-backed Price: 0.9988222122731325 Circulating pegged USD: 189466175908.3349",
+      "entities": [
+        "Tether",
+        "USDT"
+      ],
+      "numbers": [
+        "189.47"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "USD Coin (USDC) is a stablecoin pegged to the US dollar and backed by fiat, with a circulating supply of approximately 76.56 billion USD.",
+      "date": "",
+      "source_url": "https://stablecoins.llama.fi",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "USD Coin USDC\\nSymbol: USDC Peg type: peggedUSD Peg mechanism: fiat-backed Price: 0.9997036619655146 Circulating pegged USD: 76559459445.79544",
+      "entities": [
+        "USD Coin",
+        "USDC"
+      ],
+      "numbers": [
+        "76.56"
+      ],
+      "stance": "confirms"
+    }
+  ]
+}

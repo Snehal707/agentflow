@@ -8,7 +8,7 @@ export type StoreAgent = {
   reputationScore: number;
   status: string;
   available: boolean;
-  source: "system" | "marketplace";
+  source: "system" | "published";
   arcHandle: string | null;
   devWallet: string | null;
   tokenId: string | null;
@@ -366,12 +366,22 @@ export async function fetchPayRequests(
 export async function postPayApprove(
   authHeaders: Record<string, string>,
   requestId: string,
-): Promise<{ txHash: string; explorerLink: string }> {
+): Promise<{
+  accepted?: boolean;
+  status?: string;
+  txHash?: string;
+  explorerLink?: string;
+}> {
   const response = await fetch(`/api/pay/approve/${encodeURIComponent(requestId)}`, {
     method: "POST",
     headers: authHeaders,
   });
-  return readJson<{ txHash: string; explorerLink: string }>(
+  return readJson<{
+    accepted?: boolean;
+    status?: string;
+    txHash?: string;
+    explorerLink?: string;
+  }>(
     response,
     "AgentPay approve failed",
   );
@@ -453,6 +463,7 @@ export async function exportAgentPayWorkbook(
 
 /** Arc Testnet native USDC (from backend `api/wallet.ts`). */
 const ARC_USDC_CONTRACT = "0x3600000000000000000000000000000000000000";
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL?.trim() || "http://localhost:4000";
 
 export type WalletBalanceHolding = {
   contractAddress?: string | null;
@@ -470,11 +481,42 @@ export type WalletBalanceResponse = {
 export async function fetchWalletBalance(
   authHeaders: Record<string, string>,
 ): Promise<WalletBalanceResponse> {
-  const response = await fetchWithTimeout("/api/wallet/balance", {
+  const response = await fetchWithTimeout("/api/wallet/execution-summary", {
     headers: authHeaders,
     cache: "no-store",
   });
-  return readJson<WalletBalanceResponse>(response, "Wallet balance failed");
+  const json = await readJson<{
+    walletAddress?: string;
+    userAgentWalletAddress?: string;
+    balances?: {
+      nativeUsdcGas?: { formatted?: string };
+      usdc?: { formatted?: string };
+      eurc?: { formatted?: string };
+    };
+  }>(response, "Wallet balance failed");
+
+  const executionWalletAddress = json.walletAddress ?? "";
+  return {
+    walletAddress: executionWalletAddress,
+    userAgentWalletAddress: json.userAgentWalletAddress ?? executionWalletAddress,
+    holdings: [
+      {
+        contractAddress: null,
+        symbol: "USDC",
+        balanceFormatted: json.balances?.nativeUsdcGas?.formatted ?? "0",
+      },
+      {
+        contractAddress: ARC_USDC_CONTRACT,
+        symbol: "USDC",
+        balanceFormatted: json.balances?.usdc?.formatted ?? "0",
+      },
+      {
+        contractAddress: "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a",
+        symbol: "EURC",
+        balanceFormatted: json.balances?.eurc?.formatted ?? "0",
+      },
+    ],
+  };
 }
 
 /** Prefer USDC by symbol; fallback to known Arc USDC contract (case-insensitive). */
@@ -562,159 +604,289 @@ export async function putArcNameDcw(
   return readJson<{ txHash: string }>(response, "Update DCW failed");
 }
 
-export type EconomyAgentSpec = {
-  slug: string;
-  name: string;
-  category: string;
-  priceUsdc: number;
-};
-
-export type EconomyAgentRollup = {
-  earned: number;
-  spent: number;
-  tasks: number;
-};
-
-export type EconomyTransaction = {
-  id: string;
-  from_wallet: string;
-  to_wallet: string;
-  amount: number;
-  arc_tx_id: string | null;
-  agent_slug: string | null;
-  invoice_id: string | null;
-  action_type: string | null;
-  status: string | null;
-  created_at: string;
-  remark: string | null;
-  payment_rail?: string | null;
-  buyer_agent?: string | null;
-  seller_agent?: string | null;
-  request_id?: string | null;
-  gateway_transfer_id?: string | null;
-};
-
-export type EconomyStats = {
-  today: {
-    settlements: number;
-    tasks: number;
-    usdc: string;
-    a2a_payments: number;
-    arc_gas_paid: string;
-    arc_gas_attribution?: "batcher_onchain" | "direct_onchain" | "placeholder" | "none";
-    arc_gas_buyer_onchain_usd?: string;
-    arc_gas_batcher_attributed_usd?: string;
-    arc_gas_attributed_tx_count?: number;
-    arc_gas_attributed_transfer_count?: number;
-    net_margin: string;
-  };
-  all_time: {
-    settlements: number;
-    tasks: number;
-    usdc: string;
-    a2a_payments: number;
-  };
-  agent_specs: EconomyAgentSpec[];
-  agent_earnings: Record<string, EconomyAgentRollup>;
-  a2a_chains: Record<string, number>;
-  hourly_activity: Record<string, number[]>;
-  gateway_balances: Record<string, number>;
-  treasury: {
-    total_dcw: string;
-    total_gateway: string;
-    agents_needing_topup: number;
-    agents: Array<{
-      slug: string;
-      dcw: string;
-      gateway: string;
-      status: "low" | "ok";
-    }>;
-  } | null;
-  latest_transactions: EconomyTransaction[];
-  /** Latest ledger rows for `agent_to_agent_payment` (x402 / Gateway). */
-  recent_a2a_payments?: EconomyTransaction[];
-  arc_vs_ethereum: {
-    arc_gas_per_tx: string;
-    ethereum_gas_per_tx: string;
-    savings_multiplier: string;
-    min_viable_payment_arc: string;
-    min_viable_payment_eth: string;
-  };
-};
-
-export type EconomyBenchmarkResult = {
-  total_txs: number;
-  total_usdc: string;
-  gas_paid: string;
-  margin: string;
-  results: Array<{
-    tx: number;
-    amount: string;
-    agent: string;
-    txHash?: string;
-    status: "success" | "failed";
-    error?: string;
+export type SemanticMemoryMetricsReport = {
+  file: string;
+  totalEvents: number;
+  snapshots: Array<{
+    bucketStart: string;
+    granularity: string;
+    totalEvents: number;
+    writesCount: number;
+    retrievalsCount: number;
+    profileIntentMismatchCount: number;
+    zeroResultRecallLikeCount: number;
+    averageReturnedCount: number;
   }>;
-  agents_covered: string[];
-  flows_completed: string[];
-  arc_tx_ids: string[];
-  breakdown: {
-    x402_payments: number;
-    a2a_payments: number;
+  history: {
+    snapshotCoverage: {
+      count: number;
+      oldestBucketStart: string | null;
+      newestBucketStart: string | null;
+      granularity: string | null;
+    };
+    windows: {
+      last24h: {
+        bucketCount: number;
+        writesCount: number;
+        retrievalsCount: number;
+        profileIntentMismatchCount: number;
+        zeroResultRecallLikeCount: number;
+        averageReturnedCount: number;
+      };
+      previous24h: {
+        bucketCount: number;
+        writesCount: number;
+        retrievalsCount: number;
+        profileIntentMismatchCount: number;
+        zeroResultRecallLikeCount: number;
+        averageReturnedCount: number;
+      };
+      last7d: {
+        bucketCount: number;
+        writesCount: number;
+        retrievalsCount: number;
+        profileIntentMismatchCount: number;
+        zeroResultRecallLikeCount: number;
+        averageReturnedCount: number;
+      };
+      previous7d: {
+        bucketCount: number;
+        writesCount: number;
+        retrievalsCount: number;
+        profileIntentMismatchCount: number;
+        zeroResultRecallLikeCount: number;
+        averageReturnedCount: number;
+      };
+    };
+    deltas: {
+      writes24h: number | null;
+      retrievals24h: number | null;
+      mismatches24h: number | null;
+      recallMisses24h: number | null;
+      writes7d: number | null;
+      retrievals7d: number | null;
+      mismatches7d: number | null;
+      recallMisses7d: number | null;
+    };
   };
-  arc_vs_eth: {
-    arc_cost: string;
-    eth_cost: string;
-    savings: string;
+  health: {
+    overall: "healthy" | "watch" | "degraded";
+    snapshotFreshness: "healthy" | "watch" | "degraded";
+    retrievalQuality: "healthy" | "watch" | "degraded";
+    storageReliability: "healthy" | "watch" | "degraded";
+    currentRetrievalQuality: "healthy" | "watch" | "degraded";
+    historicalRetrievalDrift: "healthy" | "watch" | "degraded";
+    currentProfileMismatchRate: number;
+    currentRecallMissRate: number;
+    historicalProfileMismatchRate: number;
+    historicalRecallMissRate: number;
+    notes: string[];
   };
-  execution_wallet?: string;
+  trends: {
+    hourly: Array<{
+      hour: string;
+      writes: number;
+      retrievals: number;
+      profileIntentMismatches: number;
+      zeroResultRecallLike: number;
+    }>;
+  };
+  writes: {
+    count: number;
+    destinationBreakdown: Record<string, number>;
+    byType: Array<{ key: string; count: number }>;
+    byCategory: Array<{ key: string; count: number }>;
+    topWallets: Array<{ key: string; count: number }>;
+  };
+  retrievals: {
+    count: number;
+    sourceBreakdown: Record<string, number>;
+    averageReturnedCount: number;
+    topReturnedTypes: Array<{ key: string; count: number }>;
+    topReturnedCategories: Array<{ key: string; count: number }>;
+    zeroResultQueries: Array<{ query: string; returned: number; wallet: string }>;
+    profileIntentMismatchCount: number;
+    zeroResultRecallLikeCount: number;
+  };
 };
 
-export type EconomyBenchmarkJobStatus = {
-  jobId: string;
-  status: "queued" | "running" | "complete" | "failed";
+export type SemanticMemoryReviewLabel =
+  | "correct"
+  | "needs_profile"
+  | "needs_episodic"
+  | "needs_routing"
+  | "needs_clarification"
+  | "ignore";
+
+export type SemanticMemoryReviewCase = {
+  id: string;
+  kind: "profile_mismatch" | "routing_mismatch" | "recall_zero_result";
+  at: string;
+  firstSeenAt: string;
   walletAddress: string;
-  startedAt: string;
-  updatedAt: string;
-  completedAt: string | null;
-  progress: {
-    completed: number;
-    total: number;
-    successful: number;
-    failed: number;
-    currentAgent: string | null;
-  };
-  result: EconomyBenchmarkResult | null;
-  error: string | null;
+  query: string;
+  sessionId?: string;
+  source: "db" | "local_fallback";
+  returnedCount: number;
+  topTypes: string[];
+  topCategories: string[];
+  expectedMemoryType: "profile" | "routing_example" | "episodic_or_session";
+  observedTopType: string | null;
+  occurrenceCount: number;
+  recommendedLabel: "needs_profile" | "needs_episodic" | "needs_routing" | "needs_clarification";
+  recommendationReason: string;
+  reviewLabel: SemanticMemoryReviewLabel | null;
+  reviewNote: string | null;
 };
 
-export async function fetchEconomyStats(): Promise<EconomyStats> {
-  const response = await fetch("/api/economy", {
+export type ConversationReviewLabel =
+  | "correct"
+  | "wrong_intent"
+  | "needs_clarification"
+  | "should_use_tool"
+  | "bad_fallback"
+  | "infra_failure"
+  | "ignore";
+
+export type ConversationReviewCase = {
+  id: string;
+  kind:
+    | "wrong_intent"
+    | "bad_fallback"
+    | "infra_failure"
+    | "missed_clarification"
+    | "tool_should_have_been_used";
+  at: string;
+  firstSeenAt: string;
+  source: "brain_event" | "telegram_routing";
+  channel: "web" | "telegram";
+  walletAddress: string | null;
+  sessionId: string | null;
+  query: string;
+  observedIntent: string | null;
+  observedLayer: string | null;
+  observedPolicy: string | null;
+  reason: string | null;
+  responseSummary: string | null;
+  occurrenceCount: number;
+  recommendedLabel: Exclude<ConversationReviewLabel, "correct" | "ignore">;
+  recommendationReason: string;
+  reviewLabel: ConversationReviewLabel | null;
+  reviewNote: string | null;
+};
+
+export async function fetchSemanticMemoryMetrics(
+  authHeaders: Record<string, string>,
+): Promise<SemanticMemoryMetricsReport> {
+  const response = await fetch("/api/internal/memory/metrics", {
+    headers: authHeaders,
     cache: "no-store",
   });
-  return readJson<EconomyStats>(response, "Economy stats failed");
+  return readJson<SemanticMemoryMetricsReport>(response, "Memory metrics failed");
 }
 
-export async function startEconomyBenchmark(
+export async function fetchSemanticMemoryReviewCases(
   authHeaders: Record<string, string>,
-): Promise<EconomyBenchmarkJobStatus> {
-  const response = await fetch("/api/economy", {
-    method: "POST",
-    headers: authHeaders,
-  });
-  return readJson<EconomyBenchmarkJobStatus>(response, "Economy benchmark failed");
-}
-
-export async function fetchEconomyBenchmarkStatus(
-  authHeaders: Record<string, string>,
-  jobId: string,
-): Promise<EconomyBenchmarkJobStatus> {
-  const response = await fetch(`/api/economy/benchmark/${encodeURIComponent(jobId)}`, {
+  options?: { limit?: number },
+): Promise<SemanticMemoryReviewCase[]> {
+  const limit = options?.limit ?? 20;
+  const response = await fetch(`/api/internal/memory/review-cases?limit=${encodeURIComponent(String(limit))}`, {
     headers: authHeaders,
     cache: "no-store",
   });
-  return readJson<EconomyBenchmarkJobStatus>(
+  const json = await readJson<{ cases: SemanticMemoryReviewCase[] }>(
     response,
-    "Economy benchmark status failed",
+    "Memory review cases failed",
   );
+  return Array.isArray(json.cases) ? json.cases : [];
+}
+
+export async function patchSemanticMemoryReviewCase(
+  authHeaders: Record<string, string>,
+  caseId: string,
+  body: { label: SemanticMemoryReviewLabel; note?: string | null },
+): Promise<{ ok: boolean }> {
+  const response = await fetch(`/api/internal/memory/review-cases/${encodeURIComponent(caseId)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders,
+    },
+    body: JSON.stringify(body),
+  });
+  return readJson<{ ok: boolean }>(response, "Memory review update failed");
+}
+
+export async function exportSemanticMemoryReviewDataset(
+  authHeaders: Record<string, string>,
+  options?: { labeledOnly?: boolean; limit?: number },
+): Promise<Blob> {
+  const limit = options?.limit ?? 200;
+  const labeledOnly = options?.labeledOnly ?? true;
+  const query = new URLSearchParams({
+    limit: String(limit),
+    labeledOnly: labeledOnly ? "1" : "0",
+  });
+  const response = await fetch(`/api/internal/memory/review-cases/export?${query.toString()}`, {
+    headers: authHeaders,
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new ClientApiError(response.status, err.error || "Memory review export failed");
+  }
+  return response.blob();
+}
+
+export async function fetchConversationReviewCases(
+  authHeaders: Record<string, string>,
+  options?: { limit?: number },
+): Promise<ConversationReviewCase[]> {
+  const limit = options?.limit ?? 24;
+  const response = await fetch(`/api/internal/review/cases?limit=${encodeURIComponent(String(limit))}`, {
+    headers: authHeaders,
+    cache: "no-store",
+  });
+  const json = await readJson<{ cases: ConversationReviewCase[] }>(
+    response,
+    "Conversation review cases failed",
+  );
+  return Array.isArray(json.cases) ? json.cases : [];
+}
+
+export async function patchConversationReviewCase(
+  authHeaders: Record<string, string>,
+  caseId: string,
+  body: { label: ConversationReviewLabel; note?: string | null },
+): Promise<{ ok: boolean }> {
+  const response = await fetch(`/api/internal/review/cases/${encodeURIComponent(caseId)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders,
+    },
+    body: JSON.stringify(body),
+  });
+  return readJson<{ ok: boolean }>(response, "Conversation review update failed");
+}
+
+export async function exportConversationReviewDataset(
+  authHeaders: Record<string, string>,
+  options?: { labeledOnly?: boolean; limit?: number },
+): Promise<Blob> {
+  const limit = options?.limit ?? 200;
+  const labeledOnly = options?.labeledOnly ?? true;
+  const query = new URLSearchParams({
+    limit: String(limit),
+    labeledOnly: labeledOnly ? "1" : "0",
+  });
+  const response = await fetch(`/api/internal/review/cases/export?${query.toString()}`, {
+    headers: authHeaders,
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new ClientApiError(response.status, err.error || "Conversation review export failed");
+  }
+  return response.blob();
 }

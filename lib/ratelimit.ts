@@ -19,7 +19,7 @@ function readPositiveNullableNumberEnv(name: string): number | null {
 }
 
 export function getDailyLimit(): number {
-  return readPositiveIntEnv('PAY_PER_TASK_DAILY_LIMIT', 50);
+  return readPositiveIntEnv('PAY_PER_TASK_DAILY_LIMIT', 200);
 }
 
 export function getMinuteLimit(): number {

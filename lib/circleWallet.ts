@@ -5,6 +5,10 @@ import { getWalletForUser, setWalletForUser } from './walletStore';
 
 dotenv.config();
 
+function isAgentflowCircleDebug(): boolean {
+  return process.env.AGENTFLOW_CIRCLE_DEBUG?.trim().toLowerCase() === 'true';
+}
+
 const ARC_CHAIN_ID = 5042002;
 const ARC_TESTNET_BLOCKCHAIN = 'ARC-TESTNET';
 const ARC_RPC_URL = resolveArcRpcUrl();
@@ -146,10 +150,12 @@ async function estimateFeeReserveRaw(
         ? paddedEstimate
         : MIN_DEPOSIT_FEE_RESERVE_RAW;
 
-    // eslint-disable-next-line no-console
-    console.log(
-      `[CircleWallet] ${label} fee estimate=${feeString ?? 'n/a'} reserveRaw=${reserveRaw.toString()}`,
-    );
+    if (isAgentflowCircleDebug()) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[CircleWallet] ${label} fee estimate=${feeString ?? 'n/a'} reserveRaw=${reserveRaw.toString()}`,
+      );
+    }
 
     return reserveRaw;
   } catch (err: any) {
@@ -183,8 +189,10 @@ export async function getDCWClient(): Promise<any> {
         environment: 'sandbox',
       });
 
-      // eslint-disable-next-line no-console
-      console.log('[CircleWallet] DCW client methods:', Object.keys(client as any));
+      if (isAgentflowCircleDebug()) {
+        // eslint-disable-next-line no-console
+        console.log('[CircleWallet] DCW client methods:', Object.keys(client as any));
+      }
 
       return client;
     })();
@@ -225,8 +233,10 @@ export async function createUserWallet(userLabel: string): Promise<{
     ],
   });
 
-  // eslint-disable-next-line no-console
-  console.log('[CircleWallet] createWallets response:', response.data);
+  if (isAgentflowCircleDebug()) {
+    // eslint-disable-next-line no-console
+    console.log('[CircleWallet] createWallets response:', response.data);
+  }
 
   const wallet = response.data?.wallets?.[0];
   if (!wallet?.id || !wallet?.address) {
@@ -320,7 +330,7 @@ async function findRemoteCircleWalletForUser(userAddress: string): Promise<{
     console.warn(
       `[CircleWallet] Found ${candidates.length} wallets for ${normalized}; selecting ${selected.address} with gatewayBalance=${selected.gatewayBalance}.`,
     );
-  } else {
+  } else if (isAgentflowCircleDebug()) {
     // eslint-disable-next-line no-console
     console.log(
       `[CircleWallet] Recovered existing Circle wallet ${selected.address} for ${normalized} from Circle.`,
@@ -405,15 +415,24 @@ export async function signTypedDataWithCircleWallet(
 ): Promise<string> {
   const dcwClient = await getDCWClient();
 
-  // eslint-disable-next-line no-console
-  console.log(
-    '[CircleWallet] data sent to signTypedData:',
-    JSON.stringify(
-      typedData,
-      (_key, value) => (typeof value === 'bigint' ? value.toString() : value),
-      2,
-    ),
-  );
+  if (isAgentflowCircleDebug()) {
+    const domain = typedData.domain as Record<string, unknown> | undefined;
+    const message = typedData.message as Record<string, unknown> | undefined;
+    // eslint-disable-next-line no-console
+    console.log(
+      '[CircleWallet] signTypedData (sanitized, no types/nonce/signature):',
+      JSON.stringify({
+        primaryType: typedData.primaryType,
+        chainId: domain?.chainId,
+        verifyingContract: domain?.verifyingContract,
+        from: typeof message?.from === 'string' ? message.from : undefined,
+        to: typeof message?.to === 'string' ? message.to : undefined,
+        value: typeof message?.value === 'string' ? message.value : undefined,
+        validAfter: message?.validAfter,
+        validBefore: message?.validBefore,
+      }),
+    );
+  }
 
   const response = await dcwClient.signTypedData({
     walletId,
@@ -446,8 +465,10 @@ async function waitForTransactionCompletion(
     return { id: undefined, state: undefined };
   }
 
-  // eslint-disable-next-line no-console
-  console.log(`[CircleWallet] Waiting for ${label} tx ${id} to complete...`);
+  if (isAgentflowCircleDebug()) {
+    // eslint-disable-next-line no-console
+    console.log(`[CircleWallet] Waiting for ${label} tx ${id} to complete...`);
+  }
 
   let lastTransaction: any;
 
@@ -457,8 +478,10 @@ async function waitForTransactionCompletion(
     lastTransaction = tx;
     const state = tx?.state as string | undefined;
 
-    // eslint-disable-next-line no-console
-    console.log(`[CircleWallet] ${label} tx poll #${attempt + 1}: state=${state}`);
+    if (isAgentflowCircleDebug()) {
+      // eslint-disable-next-line no-console
+      console.log(`[CircleWallet] ${label} tx poll #${attempt + 1}: state=${state}`);
+    }
 
     if (!state || state === 'COMPLETE' || state === 'FAILED' || state === 'ERROR') {
       return {
@@ -551,10 +574,12 @@ export async function transferToGateway(params: {
     }
   }
 
-  // eslint-disable-next-line no-console
-  console.log(
-    `[CircleWallet] On-chain wallet USDC balance before funding: ${fullBalanceRaw.toString()} (${rawUSDCToNumber(fullBalanceRaw)} USDC), targetMaxRaw=${targetMaxRaw.toString()}`,
-  );
+  if (isAgentflowCircleDebug()) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[CircleWallet] On-chain wallet USDC balance before funding: ${fullBalanceRaw.toString()} (${rawUSDCToNumber(fullBalanceRaw)} USDC), targetMaxRaw=${targetMaxRaw.toString()}`,
+    );
+  }
 
   if (targetMaxRaw <= 0n) {
     return {
@@ -570,10 +595,12 @@ export async function transferToGateway(params: {
     GATEWAY_CONTRACT_ADDRESS,
   );
 
-  // eslint-disable-next-line no-console
-  console.log(
-    `[CircleWallet] Current Gateway allowance: ${currentAllowanceRaw.toString()} raw units`,
-  );
+  if (isAgentflowCircleDebug()) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[CircleWallet] Current Gateway allowance: ${currentAllowanceRaw.toString()} raw units`,
+    );
+  }
 
   // Step 1: approve Gateway contract to spend USDC
   let approvalResult:
@@ -600,11 +627,13 @@ export async function transferToGateway(params: {
         },
       } as any);
 
-      // eslint-disable-next-line no-console
-      console.log(
-        '[CircleWallet] Full approval response:',
-        JSON.stringify(approvalRes?.data, null, 2),
-      );
+      if (isAgentflowCircleDebug()) {
+        // eslint-disable-next-line no-console
+        console.log(
+          '[CircleWallet] Full approval response:',
+          JSON.stringify(approvalRes?.data, null, 2),
+        );
+      }
 
       approvalTx = approvalRes.data?.transaction ?? approvalRes.data;
     } catch (err: any) {
@@ -662,10 +691,12 @@ export async function transferToGateway(params: {
       ? baseForDeposit - depositFeeReserveRaw
       : 0n;
 
-  // eslint-disable-next-line no-console
-  console.log(
-    `[CircleWallet] Post-approval balance=${postApprovalBalanceRaw.toString()} targetMaxRaw=${targetMaxRaw.toString()} baseForDeposit=${baseForDeposit.toString()} reserve=${depositFeeReserveRaw.toString()} depositAmount=${depositAmountRaw.toString()}`,
-  );
+  if (isAgentflowCircleDebug()) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[CircleWallet] Post-approval balance=${postApprovalBalanceRaw.toString()} targetMaxRaw=${targetMaxRaw.toString()} baseForDeposit=${baseForDeposit.toString()} reserve=${depositFeeReserveRaw.toString()} depositAmount=${depositAmountRaw.toString()}`,
+    );
+  }
 
   if (depositAmountRaw <= 0n) {
     return {
@@ -696,11 +727,13 @@ export async function transferToGateway(params: {
       },
     } as any);
 
-    // eslint-disable-next-line no-console
-    console.log(
-      '[CircleWallet] Deposit response:',
-      JSON.stringify(depositRes?.data, null, 2),
-    );
+    if (isAgentflowCircleDebug()) {
+      // eslint-disable-next-line no-console
+      console.log(
+        '[CircleWallet] Deposit response:',
+        JSON.stringify(depositRes?.data, null, 2),
+      );
+    }
 
     depositTx = depositRes.data?.transaction ?? depositRes.data;
   } catch (err: any) {

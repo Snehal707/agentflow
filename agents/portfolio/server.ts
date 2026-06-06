@@ -119,9 +119,6 @@ app.post(
   try {
     const requestedWallet = String(req.body?.walletAddress || auth.walletAddress);
     const executionTarget = String(req.body?.executionTarget || '').toUpperCase();
-    const isBenchmark =
-      req.body?.benchmark === true ||
-      String(req.body?.benchmark ?? req.query?.benchmark ?? '').trim().toLowerCase() === 'true';
     if (!isAddress(requestedWallet)) {
       return res.status(400).json({ error: 'walletAddress must be a valid EVM address' });
     }
@@ -139,16 +136,6 @@ app.post(
     } else if (!allowedWallets.has(normalizedRequestedWallet.toLowerCase())) {
       return res.status(400).json({
         error: `walletAddress must match your connected EOA (${normalizedAuthWallet}) or your execution wallet (${normalizedExecutionWallet})`,
-      });
-    }
-
-    if (isBenchmark) {
-      console.log('[benchmark] portfolio short-circuit');
-      return res.json({
-        ok: true,
-        benchmark: true,
-        agent: 'portfolio',
-        result: 'Benchmark mode - payment logged',
       });
     }
 

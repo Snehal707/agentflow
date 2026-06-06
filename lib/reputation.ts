@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { createPublicClient, defineChain, getAddress, http, parseAbiItem } from 'viem';
 import { adminDb } from '../db/client';
 import { ARC } from './arc-config';
@@ -20,6 +21,32 @@ export async function recordReputation(
   tag: string,
   validatorWallet: string,
 ): Promise<{ success: boolean; txHash?: string }> {
+  const result = await submitReputationFeedback({
+    agentId,
+    score,
+    tag,
+    validatorWallet,
+  });
+
+  if (result.success) {
+    const agentAddress = await resolveAgentAddressById(agentId);
+    await upsertReputationCache(agentAddress, score);
+  }
+
+  return result;
+}
+
+export async function submitReputationFeedback(input: {
+  agentId: string;
+  score: number;
+  tag: string;
+  validatorWallet: string;
+  tag2?: string;
+  endpoint?: string;
+  feedbackURI?: string;
+  feedbackHash?: `0x${string}`;
+}): Promise<{ success: boolean; txHash?: string }> {
+  const { agentId, score, tag, validatorWallet } = input;
   const validatorAddress = normalizeAddress(validatorWallet);
   const { data: validatorRow, error: validatorErr } = await adminDb
     .from('wallets')
@@ -35,7 +62,15 @@ export async function recordReputation(
     throw new Error('[reputation] Validator wallet not found in Supabase');
   }
 
-  const tx = await tryGiveFeedback(validatorRow.wallet_id, agentId, score, tag);
+  const tx = await tryGiveFeedback(validatorRow.wallet_id, {
+    agentId,
+    score,
+    tag1: tag,
+    tag2: input.tag2 ?? '',
+    endpoint: input.endpoint ?? '',
+    feedbackURI: input.feedbackURI ?? '',
+    feedbackHash: input.feedbackHash,
+  });
   const txId = extractTransactionId(tx);
   if (!txId) {
     throw new Error('[reputation] giveFeedback did not return transaction id');
@@ -46,8 +81,6 @@ export async function recordReputation(
     return { success: false, txHash: result.txHash };
   }
 
-  const agentAddress = await resolveAgentAddressById(agentId);
-  await upsertReputationCache(agentAddress, score);
   return { success: true, txHash: result.txHash };
 }
 
@@ -129,37 +162,44 @@ export function calculateScore(agentSlug: string, executionResult: ExecutionResu
 
 async function tryGiveFeedback(
   validatorWalletId: string,
-  agentId: string,
-  score: number,
-  tag: string,
+  input: {
+    agentId: string;
+    score: number;
+    tag1: string;
+    tag2: string;
+    endpoint: string;
+    feedbackURI: string;
+    feedbackHash?: `0x${string}`;
+  },
 ): Promise<unknown> {
-  const agentNumeric = Number(agentId);
-  const scoreInt = Math.trunc(score);
-  const signatures = [
-    { sig: 'giveFeedback(uint256,int256,string)', args: [String(agentNumeric), String(scoreInt), tag] },
-    { sig: 'giveFeedback(uint256,int256)', args: [String(agentNumeric), String(scoreInt)] },
-    { sig: 'giveFeedback(uint256,uint256,string)', args: [String(agentNumeric), String(Math.max(scoreInt, 0)), tag] },
-    { sig: 'giveFeedback(uint256,uint256)', args: [String(agentNumeric), String(Math.max(scoreInt, 0))] },
-  ] as const;
-
-  let lastError: unknown;
-  for (const candidate of signatures) {
-    try {
-      return await executeTransaction({
-        walletId: validatorWalletId,
-        contractAddress: ARC.reputationRegistry,
-        abiFunctionSignature: candidate.sig,
-        abiParameters: candidate.args as unknown as string[],
-        feeLevel: 'HIGH',
-      });
-    } catch (err) {
-      lastError = err;
-    }
+  const agentNumeric = Number(input.agentId);
+  const scoreInt = Math.trunc(input.score);
+  if (!Number.isFinite(agentNumeric) || agentNumeric < 0) {
+    throw new Error(`[reputation] invalid ERC-8004 agent id: ${input.agentId}`);
   }
+  const feedbackHash = input.feedbackHash ?? buildReputationFeedbackHash({
+    agentId: String(agentNumeric),
+    score: String(scoreInt),
+    tag: input.tag1,
+  });
 
-  throw new Error(
-    `[reputation] Unable to call giveFeedback() with known signatures: ${String(lastError)}`,
-  );
+  return executeTransaction({
+    walletId: validatorWalletId,
+    contractAddress: ARC.reputationRegistry,
+    abiFunctionSignature:
+      'giveFeedback(uint256,int128,uint8,string,string,string,string,bytes32)',
+    abiParameters: [
+      String(agentNumeric),
+      String(scoreInt),
+      '0',
+      input.tag1,
+      input.tag2,
+      input.endpoint,
+      input.feedbackURI,
+      feedbackHash,
+    ],
+    feeLevel: 'HIGH',
+  });
 }
 
 async function fetchScoreFromArc(agentAddress: string): Promise<number | null> {
@@ -250,6 +290,20 @@ function normalizeAddress(address: string): string {
 function toNumber(value: unknown): number | null {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+export function buildReputationFeedbackHash(input: {
+  agentId: string;
+  score: string;
+  tag: string;
+  taskId?: string;
+  requestId?: string;
+  walletAddress?: string;
+}): `0x${string}` {
+  const digest = createHash('sha256')
+    .update(JSON.stringify(input))
+    .digest('hex');
+  return `0x${digest}`;
 }
 
 function isStale(lastUpdated: string | null): boolean {

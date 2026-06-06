@@ -56,15 +56,9 @@ export const ARC = {
     process.env.REPUTATION_REGISTRY?.trim() || DEFAULT_REPUTATION_REGISTRY,
   validationRegistry:
     process.env.VALIDATION_REGISTRY?.trim() || DEFAULT_VALIDATION_REGISTRY,
-  /** Optional until swap contract is deployed. */
   alchemyRpc: process.env.ALCHEMY_ARC_RPC?.trim() ?? '',
   swapContract: process.env.SWAP_CONTRACT_ADDRESS?.trim() ?? '',
   vaultContract: process.env.VAULT_CONTRACT_ADDRESS?.trim() ?? '',
-  /** Circle USYC (Arc Testnet) — see tokenized/usyc/smart-contracts */
-  usycAddress: process.env.USYC_ADDRESS?.trim() ?? '',
-  usycTeller: process.env.USYC_TELLER_ADDRESS?.trim() ?? '',
-  usycOracle: process.env.USYC_ORACLE_ADDRESS?.trim() ?? '',
-  usycEntitlements: process.env.USYC_ENTITLEMENTS_ADDRESS?.trim() ?? '',
 } as const;
 
 export type ArcConfig = typeof ARC;

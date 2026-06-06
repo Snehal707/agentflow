@@ -28,14 +28,22 @@ export function resolveAgentRunUrl(configured: string | undefined, fallback: str
   }
 }
 
+function isAgentflowA2aDebug(): boolean {
+  return process.env.AGENTFLOW_A2A_DEBUG?.trim().toLowerCase() === 'true';
+}
+
 async function payWithA2aX402Log<TResponse>(
   label: string,
   run: () => Promise<PayProtectedResourceServerResult<TResponse>>,
 ): Promise<PayProtectedResourceServerResult<TResponse>> {
-  console.log(`[a2a] x402 start (${label})`);
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] x402 start (${label})`);
+  }
   try {
     const out = await run();
-    console.log(`[a2a] x402 success (${label}) httpStatus=${out.status}`);
+    if (isAgentflowA2aDebug()) {
+      console.log(`[a2a] x402 success (${label}) httpStatus=${out.status}`);
+    }
     return out;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -80,11 +88,13 @@ export async function runPortfolioFollowupAfterToolWithPayment(input: {
   paymentEntry?: A2aFollowupPaymentEntry;
 }> {
   const ua = getAddress(input.userWalletAddress as `0x${string}`);
-  console.log(`[a2a] ${input.buyerAgentSlug}→portfolio hook start`, {
-    trigger: input.trigger,
-    portfolioRunUrl: input.portfolioRunUrl,
-    userWallet: ua,
-  });
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] ${input.buyerAgentSlug}→portfolio hook start`, {
+      trigger: input.trigger,
+      portfolioRunUrl: input.portfolioRunUrl,
+      userWallet: ua,
+    });
+  }
 
   if (!(await isAgentHealthy('portfolio'))) {
     console.warn(
@@ -95,11 +105,13 @@ export async function runPortfolioFollowupAfterToolWithPayment(input: {
 
   const buyer = await loadAgentOwnerWallet(input.buyerAgentSlug);
   const portfolioOwner = await loadAgentOwnerWallet('portfolio');
-  console.log(`[a2a] ${input.buyerAgentSlug}→portfolio payer`, {
-    payer: buyer.address,
-    circleWalletId: buyer.walletId,
-    portfolioOwner: portfolioOwner.address,
-  });
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] ${input.buyerAgentSlug}→portfolio payer`, {
+      payer: buyer.address,
+      circleWalletId: buyer.walletId,
+      portfolioOwner: portfolioOwner.address,
+    });
+  }
   const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
 
   const x402Label = `${input.buyerAgentSlug}→portfolio:${input.trigger}`;
@@ -125,7 +137,9 @@ export async function runPortfolioFollowupAfterToolWithPayment(input: {
     }),
   );
 
-  console.log(`[a2a] ${input.buyerAgentSlug}→portfolio ledger insert starting (${input.trigger})`);
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] ${input.buyerAgentSlug}→portfolio ledger insert starting (${input.trigger})`);
+  }
   const ledger = await insertAgentToAgentLedger({
     fromWallet: buyer.address,
     toWallet: portfolioOwner.address,
@@ -156,7 +170,9 @@ export async function runPortfolioFollowupAfterToolWithPayment(input: {
     );
     return { data: result.data, paymentEntry };
   }
-  console.log(`[a2a] ${input.buyerAgentSlug} → portfolio x402 complete (${input.trigger})`);
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] ${input.buyerAgentSlug} → portfolio x402 complete (${input.trigger})`);
+  }
   return { data: result.data, paymentEntry };
 }
 
@@ -171,7 +187,9 @@ export async function runResearchFollowupAfterRichContent(input: {
     return null;
   }
   if (!shouldTriggerResearch(input.text)) {
-    console.log(`[a2a] ${input.buyerAgentSlug}: content not research-worthy, skipping`);
+    if (isAgentflowA2aDebug()) {
+      console.log(`[a2a] ${input.buyerAgentSlug}: content not research-worthy, skipping`);
+    }
     return null;
   }
   const sourceType =
@@ -180,10 +198,12 @@ export async function runResearchFollowupAfterRichContent(input: {
   const researchOwner = await loadAgentOwnerWallet('research');
   const task = extractResearchQuery(input.text, sourceType);
   const x402Label = `${input.buyerAgentSlug}→research:rich_content`;
-  console.log(`[a2a] ${input.buyerAgentSlug}→research hook start`, {
-    researchRunUrl: input.researchRunUrl,
-    payer: buyer.address,
-  });
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] ${input.buyerAgentSlug}→research hook start`, {
+      researchRunUrl: input.researchRunUrl,
+      payer: buyer.address,
+    });
+  }
 
   const result = await payWithA2aX402Log(x402Label, () =>
     payProtectedResourceServer<
@@ -216,7 +236,9 @@ export async function runResearchFollowupAfterRichContent(input: {
     console.warn(`[a2a] ${input.buyerAgentSlug}→research x402 paid but ledger failed:`, ledger.error);
     return result.data;
   }
-  console.log(`[a2a] ${input.buyerAgentSlug} → research x402 complete`);
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] ${input.buyerAgentSlug} → research x402 complete`);
+  }
   return result.data;
 }
 
@@ -228,11 +250,13 @@ export async function runInvoiceVendorResearchFollowup(input: {
   researchRunUrl: string;
   researchPriceLabel: string;
 }): Promise<Record<string, unknown> | null> {
-  console.log(`[a2a] invoice→research hook start`, {
-    vendor: input.vendor,
-    amount: input.amount,
-    researchRunUrl: input.researchRunUrl,
-  });
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] invoice→research hook start`, {
+      vendor: input.vendor,
+      amount: input.amount,
+      researchRunUrl: input.researchRunUrl,
+    });
+  }
 
   if (!(await isAgentHealthy('research'))) {
     console.warn('[a2a] research agent unreachable, skipping invoice→research');
@@ -240,10 +264,12 @@ export async function runInvoiceVendorResearchFollowup(input: {
   }
   const buyer = await loadAgentOwnerWallet('invoice');
   const researchOwner = await loadAgentOwnerWallet('research');
-  console.log(`[a2a] invoice→research payer`, {
-    payer: buyer.address,
-    circleWalletId: buyer.walletId,
-  });
+  if (isAgentflowA2aDebug()) {
+    console.log(`[a2a] invoice→research payer`, {
+      payer: buyer.address,
+      circleWalletId: buyer.walletId,
+    });
+  }
 
   const counterpartyRisk = await assessCounterpartyRisk({
     counterparty: input.vendor,
@@ -297,6 +323,8 @@ export async function runInvoiceVendorResearchFollowup(input: {
     console.warn('[a2a] invoice→research x402 paid but ledger failed:', ledger.error);
     return result.data;
   }
-  console.log('[a2a] invoice → research x402 complete');
+  if (isAgentflowA2aDebug()) {
+    console.log('[a2a] invoice → research x402 complete');
+  }
   return result.data;
 }

@@ -2,8 +2,9 @@ import { resolveArcTokenSymbol } from './swap-symbols';
 
 export interface SwapSanityConfig {
   maxPriceImpactPct: number;
-  stableMinOutRatioBps: bigint;
-  stableMaxOutRatioBps: bigint;
+  defaultStableMinOutRatio: number;
+  defaultStableMaxOutRatio: number;
+  stableBands: Record<string, { min: number; max: number }>;
 }
 
 function parsePositiveNumber(name: string, fallback: number): number {
@@ -13,38 +14,105 @@ function parsePositiveNumber(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-/** Ratio bounds for USDC↔EURC (same decimals); adjustable via env. */
+function stableBandFromEnv(
+  prefix: string,
+  fallbackMin: number,
+  fallbackMax: number,
+): { min: number; max: number } {
+  const min = parsePositiveNumber(`${prefix}_MIN`, fallbackMin);
+  const max = parsePositiveNumber(`${prefix}_MAX`, fallbackMax);
+  if (min >= max) {
+    return { min: fallbackMin, max: fallbackMax };
+  }
+  return { min, max };
+}
+
 export function getSwapSanityConfig(): SwapSanityConfig {
-  const minRatio = parsePositiveNumber('SWAP_STABLE_MIN_OUT_RATIO', 0.92);
-  const maxRatio = parsePositiveNumber('SWAP_STABLE_MAX_OUT_RATIO', 1.08);
-  const minBps = BigInt(Math.round(minRatio * 10_000));
-  const maxBps = BigInt(Math.round(maxRatio * 10_000));
+  const usdcUsdt = stableBandFromEnv('SWAP_SANITY_USDC_USDT', 0.95, 1.05);
+  const usdcDai = stableBandFromEnv('SWAP_SANITY_USDC_DAI', 0.95, 1.05);
+  const usdcEurc = stableBandFromEnv('SWAP_SANITY_USDC_EURC', 0.8, 1.2);
+  const defaultBand = stableBandFromEnv('SWAP_SANITY_DEFAULT', 0.85, 1.15);
+
   return {
     maxPriceImpactPct: parsePositiveNumber('SWAP_MAX_PRICE_IMPACT_PCT', 15),
-    stableMinOutRatioBps: minBps,
-    stableMaxOutRatioBps: maxBps,
+    defaultStableMinOutRatio: defaultBand.min,
+    defaultStableMaxOutRatio: defaultBand.max,
+    stableBands: {
+      'USDC-USDT': usdcUsdt,
+      'USDT-USDC': usdcUsdt,
+      'USDC-DAI': usdcDai,
+      'DAI-USDC': usdcDai,
+      'USDC-EURC': usdcEurc,
+      'EURC-USDC': usdcEurc,
+    },
   };
 }
 
-function isArcStablePair(
-  tokenIn: `0x${string}`,
-  tokenOut: `0x${string}`,
-): boolean {
+function stableSymbolForToken(token: `0x${string}`): string | null {
   const usdc = resolveArcTokenSymbol('USDC');
   const eurc = resolveArcTokenSymbol('EURC');
-  if (!usdc || !eurc) return false;
-  const a = tokenIn.toLowerCase();
-  const b = tokenOut.toLowerCase();
-  const s = new Set([usdc.toLowerCase(), eurc.toLowerCase()]);
-  return s.has(a) && s.has(b);
+  const usdt = resolveArcTokenSymbol('USDT');
+  const dai = resolveArcTokenSymbol('DAI');
+  const normalized = token.toLowerCase();
+
+  if (usdc && normalized === usdc.toLowerCase()) return 'USDC';
+  if (eurc && normalized === eurc.toLowerCase()) return 'EURC';
+  if (usdt && normalized === usdt.toLowerCase()) return 'USDT';
+  if (dai && normalized === dai.toLowerCase()) return 'DAI';
+  return null;
 }
 
-const BPS = 10_000n;
+const NORMALIZED_STABLE_DECIMALS = 6;
+
+function normalizeStableAmount(amountRaw: bigint, decimals: number): bigint {
+  if (decimals === NORMALIZED_STABLE_DECIMALS) return amountRaw;
+  if (decimals < NORMALIZED_STABLE_DECIMALS) {
+    return amountRaw * 10n ** BigInt(NORMALIZED_STABLE_DECIMALS - decimals);
+  }
+  return amountRaw / 10n ** BigInt(decimals - NORMALIZED_STABLE_DECIMALS);
+}
+
+function formatRatio(value: number): string {
+  return value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+export function getStablePairKey(
+  tokenIn: `0x${string}`,
+  tokenOut: `0x${string}`,
+): string | null {
+  const inSym = stableSymbolForToken(tokenIn);
+  const outSym = stableSymbolForToken(tokenOut);
+  if (!inSym || !outSym || inSym === outSym) {
+    return null;
+  }
+  return `${inSym}-${outSym}`;
+}
+
+export function getStableBandForPair(pairKey: string): { min: number; max: number } {
+  const cfg = getSwapSanityConfig();
+  return (
+    cfg.stableBands[pairKey] ?? {
+      min: cfg.defaultStableMinOutRatio,
+      max: cfg.defaultStableMaxOutRatio,
+    }
+  );
+}
+
+export function evaluateStableRateBand(input: {
+  pairKey: string;
+  quotedRate: number;
+}): { ok: true } | { ok: false; min: number; max: number } {
+  const band = getStableBandForPair(input.pairKey);
+  if (input.quotedRate < band.min || input.quotedRate > band.max) {
+    return { ok: false, min: band.min, max: band.max };
+  }
+  return { ok: true };
+}
 
 /**
  * Block obviously unsafe swap quotes before execution (Telegram + HTTP swap agent).
  * - Price impact above SWAP_MAX_PRICE_IMPACT_PCT (default 15).
- * - For Arc USDC↔EURC: implied output/input must stay within stable ratio band (defaults 0.92–1.08).
+ * - For stable/stable pairs: implied output/input must stay within a pair-aware safe band.
  */
 export function evaluateSwapSanity(input: {
   amountInRaw: bigint;
@@ -52,6 +120,9 @@ export function evaluateSwapSanity(input: {
   tokenIn: `0x${string}`;
   tokenOut: `0x${string}`;
   priceImpactPct: number | null;
+  tokenInDecimals?: number;
+  tokenOutDecimals?: number;
+  provider?: string | null;
 }): { ok: true } | { ok: false; reason: string } {
   const cfg = getSwapSanityConfig();
 
@@ -70,23 +141,51 @@ export function evaluateSwapSanity(input: {
     return {
       ok: false,
       reason:
-        'Quoted output is zero — the swap would revert on-chain. Try a smaller amount or check liquidity.',
+        'Quoted output is zero - the swap would revert on-chain. Try a smaller amount or check liquidity.',
     };
   }
 
-  if (isArcStablePair(input.tokenIn, input.tokenOut)) {
-    if (input.amountOutRaw * BPS < input.amountInRaw * cfg.stableMinOutRatioBps) {
+  const pairKey = getStablePairKey(input.tokenIn, input.tokenOut);
+  if (pairKey) {
+    const normalizedAmountIn = normalizeStableAmount(
+      input.amountInRaw,
+      input.tokenInDecimals ?? NORMALIZED_STABLE_DECIMALS,
+    );
+    const normalizedAmountOut = normalizeStableAmount(
+      input.amountOutRaw,
+      input.tokenOutDecimals ?? NORMALIZED_STABLE_DECIMALS,
+    );
+    const quotedRate = Number(normalizedAmountOut) / Number(normalizedAmountIn);
+
+    if (!Number.isFinite(quotedRate) || quotedRate <= 0) {
       return {
         ok: false,
-        reason:
-          'Quoted USDC/EURC rate is too far from parity (likely thin or imbalanced pool). Add liquidity or try a smaller amount.',
+        reason: 'Unable to evaluate quoted stable rate safely.',
       };
     }
-    if (input.amountOutRaw * BPS > input.amountInRaw * cfg.stableMaxOutRatioBps) {
+
+    const rateCheck = evaluateStableRateBand({ pairKey, quotedRate });
+    if (!rateCheck.ok) {
+      console.warn(
+        '[SWAP_SANITY_BLOCKED]',
+        JSON.stringify({
+          pair: pairKey,
+          quotedRate,
+          configuredMin: rateCheck.min,
+          configuredMax: rateCheck.max,
+          provider: input.provider ?? null,
+          amountInRaw: input.amountInRaw.toString(),
+          expectedOutRaw: input.amountOutRaw.toString(),
+          reason: 'rate_band',
+        }),
+      );
       return {
         ok: false,
         reason:
-          'Quoted USDC/EURC rate is outside the safe band. Pool state may be unhealthy — try again later.',
+          `Quoted rate ${formatRatio(quotedRate)} is outside the configured safe range for ` +
+          `${pairKey} (${formatRatio(rateCheck.min)}-${formatRatio(rateCheck.max)}). ` +
+          `This is set conservatively - to override for testnet, contact admin or set env ` +
+          `SWAP_SANITY_${pairKey.replace('-', '_')}_MIN/MAX.`,
       };
     }
   }

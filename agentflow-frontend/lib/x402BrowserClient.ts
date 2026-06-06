@@ -48,6 +48,7 @@ export interface PayProtectedResourceInput<TBody extends JsonRequestBody> {
   headers?: Record<string, string>;
   onAwaitSignature?: () => void;
   signal?: AbortSignal;
+  requestId?: string;
 }
 
 type X402PreflightResponse = {
@@ -276,6 +277,10 @@ function createRequestId(): string {
     return `x402_${crypto.randomUUID()}`;
   }
   return `x402_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
+export function createBrowserX402RequestId(): string {
+  return createRequestId();
 }
 
 function canonicalizeJson(value: unknown): string {
@@ -536,7 +541,7 @@ async function executeProtectedFetch<TBody extends JsonRequestBody>(
   input: PayProtectedResourceInput<TBody>,
 ): Promise<{ response: Response; attemptedPayment: boolean; requestId: string }> {
   const method = input.method ?? 'POST';
-  const requestId = createRequestId();
+  const requestId = input.requestId?.trim() || createRequestId();
   const attempt = await buildX402AttemptContext(input, requestId, method);
   const baseHeaders: Record<string, string> = {
     'Content-Type': 'application/json',

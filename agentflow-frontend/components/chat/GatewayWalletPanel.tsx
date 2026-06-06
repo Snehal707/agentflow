@@ -5,9 +5,12 @@ import { ARC_EXPLORER_URL } from "@/lib/arcChain";
 import {
   fetchGatewayBalance,
   fetchGatewayDepositInfo,
+  fetchUnifiedBalance,
   moveGatewayToExecution,
+  type UnifiedBalanceApiResponse,
   withdrawGatewayUsdc,
 } from "@/lib/liveAgentClient";
+import { emitWalletRefresh, subscribeWalletRefresh } from "@/lib/walletRefresh";
 
 type GatewayWalletPanelProps = {
   walletAddress?: string;
@@ -29,6 +32,13 @@ function formatAmount(value: string, digits = 4): string {
   });
 }
 
+function shortAddress(address: string): string {
+  if (address.length <= 12) {
+    return address;
+  }
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
 export function GatewayWalletPanel({
   walletAddress,
   isConnected,
@@ -43,6 +53,10 @@ export function GatewayWalletPanel({
   const [gatewayWalletAddress, setGatewayWalletAddress] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [unifiedBalance, setUnifiedBalance] =
+    useState<UnifiedBalanceApiResponse | null>(null);
+  const [unifiedBalanceLoading, setUnifiedBalanceLoading] = useState(false);
+  const [unifiedBalanceError, setUnifiedBalanceError] = useState<string | null>(null);
 
   const [depositInfo, setDepositInfo] = useState<{
     depositAddress: string;
@@ -86,15 +100,69 @@ export function GatewayWalletPanel({
     }
   }, [authBearer]);
 
+  const refreshUnifiedBalance = useCallback(async () => {
+    if (!authBearer) {
+      setUnifiedBalance(null);
+      setUnifiedBalanceError(null);
+      return;
+    }
+
+    setUnifiedBalanceLoading(true);
+    setUnifiedBalanceError(null);
+    try {
+      const data = await fetchUnifiedBalance({
+        Authorization: authBearer,
+      });
+      setUnifiedBalance(data);
+      if (!data.configured && data.error) {
+        setUnifiedBalanceError(data.error);
+      }
+    } catch (error) {
+      setUnifiedBalanceError(
+        error instanceof Error ? error.message : "Could not load Unified Balance.",
+      );
+      setUnifiedBalance(null);
+    } finally {
+      setUnifiedBalanceLoading(false);
+    }
+  }, [authBearer]);
+
   useEffect(() => {
     if (!isConnected || !walletAddress || !isAuthenticated || !authBearer) {
       setBalanceUsdc(null);
       setGatewayWalletAddress(null);
+      setUnifiedBalance(null);
+      setUnifiedBalanceError(null);
       return;
     }
 
     void refreshBalance();
-  }, [isConnected, walletAddress, isAuthenticated, authBearer, refreshBalance]);
+    void refreshUnifiedBalance();
+  }, [
+    isConnected,
+    walletAddress,
+    isAuthenticated,
+    authBearer,
+    refreshBalance,
+    refreshUnifiedBalance,
+  ]);
+
+  useEffect(() => {
+    if (!isConnected || !walletAddress || !isAuthenticated || !authBearer) {
+      return;
+    }
+    return subscribeWalletRefresh(() => {
+      void refreshBalance();
+      void refreshUnifiedBalance();
+    });
+  }, [
+    isConnected,
+    walletAddress,
+    isAuthenticated,
+    authBearer,
+    refreshBalance,
+    refreshUnifiedBalance,
+  ]);
 
   const showInitialLoading = isLoading && balanceUsdc === null && !loadError;
 
@@ -150,6 +218,7 @@ export function GatewayWalletPanel({
       setActionState("success");
       setActionMessage(`Withdrew ${result.amount} USDC from Gateway.`);
       await refreshBalance();
+      emitWalletRefresh({ source: "gateway-withdraw", walletAddress: walletAddress ?? null });
     } catch (error) {
       setActionState("error");
       setActionMessage(error instanceof Error ? error.message : "Withdraw failed.");
@@ -173,6 +242,7 @@ export function GatewayWalletPanel({
         `Moved ${result.amount} USDC to execution wallet. New on-chain USDC: ${result.newBalance}.`,
       );
       await refreshBalance();
+      emitWalletRefresh({ source: "gateway-to-execution", walletAddress: walletAddress ?? null });
     } catch (error) {
       setActionState("error");
       setActionMessage(
@@ -257,9 +327,10 @@ export function GatewayWalletPanel({
                 </a>
                 <button
                   type="button"
-                  onClick={() => {
-                    void refreshBalance();
-                  }}
+                onClick={() => {
+                  void refreshBalance();
+                  void refreshUnifiedBalance();
+                }}
                   className="rounded-full border border-white/10 px-3 py-1.5 text-xs text-white/62 transition hover:border-white/18 hover:text-white"
                 >
                   Refresh
@@ -275,6 +346,99 @@ export function GatewayWalletPanel({
             <div className="mt-2 text-lg text-white/88">
               {balanceUsdc !== null ? `${formatAmount(balanceUsdc)} USDC` : "—"}
             </div>
+          </div>
+
+          <div className="rounded-2xl bg-black/20 px-4 py-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[11px] uppercase tracking-[0.18em] text-white/34">
+                  Unified Balance
+                </div>
+                <div className="mt-1 text-xs text-white/42">Arc Testnet USDC</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void refreshUnifiedBalance();
+                }}
+                disabled={unifiedBalanceLoading}
+                className="rounded-full border border-white/10 px-3 py-1.5 text-xs text-white/62 transition hover:border-white/18 hover:text-white disabled:opacity-60"
+              >
+                {unifiedBalanceLoading ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
+
+            {!unifiedBalance?.configured ? (
+              <div className="mt-4 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-3 text-sm text-white/50">
+                Unified Balance is not configured for this AgentFlow server yet.
+                {unifiedBalanceError ? (
+                  <div className="mt-2 text-xs text-white/34">{unifiedBalanceError}</div>
+                ) : null}
+              </div>
+            ) : (
+              <div className="mt-4 space-y-3">
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded-xl border border-white/8 bg-white/[0.03] px-3 py-3">
+                    <div className="text-[10px] uppercase tracking-[0.18em] text-white/34">
+                      Confirmed
+                    </div>
+                    <div className="mt-2 text-base text-white/88">
+                      {formatAmount(unifiedBalance.confirmed)} USDC
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-white/8 bg-white/[0.03] px-3 py-3">
+                    <div className="text-[10px] uppercase tracking-[0.18em] text-white/34">
+                      Pending
+                    </div>
+                    <div className="mt-2 text-base text-white/88">
+                      {formatAmount(unifiedBalance.pending)} USDC
+                    </div>
+                  </div>
+                </div>
+
+                {unifiedBalance.breakdown.length > 0 ? (
+                  <div className="space-y-2">
+                    {unifiedBalance.breakdown.map((source) => (
+                      <div
+                        key={source.depositor}
+                        className="rounded-xl border border-white/8 bg-black/20 px-3 py-3"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="font-mono text-xs text-white/58">
+                            {shortAddress(source.depositor)}
+                          </div>
+                          <div className="text-xs text-white/72">
+                            {formatAmount(source.totalConfirmed)} USDC
+                          </div>
+                        </div>
+                        {source.chains.length > 0 ? (
+                          <div className="mt-2 space-y-1">
+                            {source.chains.map((chain) => (
+                              <div
+                                key={`${source.depositor}-${chain.chain}`}
+                                className="flex items-center justify-between gap-3 text-xs text-white/42"
+                              >
+                                <span>{chain.chain}</span>
+                                <span>
+                                  {formatAmount(chain.confirmed)} confirmed
+                                  {Number(chain.pending) > 0
+                                    ? `, ${formatAmount(chain.pending)} pending`
+                                    : ""}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-white/8 bg-white/[0.03] px-3 py-3 text-sm text-white/50">
+                    No Unified Balance sources returned for this wallet.
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="rounded-2xl bg-black/20 px-4 py-4">

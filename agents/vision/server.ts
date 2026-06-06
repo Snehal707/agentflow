@@ -52,6 +52,77 @@ function classifyVisionScore(result: {
   return 90;
 }
 
+function formatVisionResearchFollowup(payload: Record<string, unknown>): string {
+  const task = typeof payload.task === 'string' ? payload.task.trim() : '';
+  const report = sanitizeVisionResearchReport(payload);
+  return [
+    'A2A complete: Vision Agent -> Research Agent',
+    task ? `Task: ${task}` : '',
+    report ? ['', report].join('\n') : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function sanitizeVisionResearchReport(payload: Record<string, unknown>): string {
+  const raw = typeof payload.result === 'string' ? payload.result.trim() : '';
+  const visible = stripTrailingStructuredResearchJson(raw).trim();
+  if (visible) return visible;
+
+  const structured =
+    payload.structured && typeof payload.structured === 'object'
+      ? (payload.structured as Record<string, unknown>)
+      : null;
+  if (!structured) return raw && !looksLikeStructuredResearchJson(raw) ? raw : '';
+
+  const summary =
+    typeof structured.executive_summary === 'string'
+      ? structured.executive_summary.trim()
+      : typeof structured.summary === 'string'
+        ? structured.summary.trim()
+        : '';
+  const facts = Array.isArray(structured.facts)
+    ? structured.facts
+        .map((fact) =>
+          fact && typeof fact === 'object'
+            ? String((fact as Record<string, unknown>).claim ?? '').trim()
+            : String(fact ?? '').trim(),
+        )
+        .filter(Boolean)
+        .slice(0, 4)
+    : [];
+  return [summary, facts.length ? facts.map((fact) => `- ${fact}`).join('\n') : '']
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+}
+
+function stripTrailingStructuredResearchJson(text: string): string {
+  if (!text) return '';
+  const candidates = ['{ "topic"', '{"topic"', '{\n  "topic"', '{\r\n  "topic"', '{ "executive_summary"', '{"executive_summary"'];
+  for (const candidate of candidates) {
+    const index = text.indexOf(candidate);
+    if (index >= 0 && looksLikeStructuredResearchJson(text.slice(index))) {
+      return text.slice(0, index);
+    }
+  }
+  return text;
+}
+
+function looksLikeStructuredResearchJson(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{')) return false;
+  if (!/"(?:topic|scope|executive_summary|facts|recent_developments|metrics|sources)"\s*:/.test(trimmed)) {
+    return false;
+  }
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return trimmed.length > 500 && /"facts"\s*:\s*\[/.test(trimmed);
+  }
+}
+
 async function recordVisionReputation(score: number): Promise<void> {
   try {
     const { ownerWallet, validatorWallet } = await getOrCreateAgentWallets('vision');
@@ -190,15 +261,6 @@ app.post(
   async (req: Request, res: Response) => {
     const auth = (req as any).auth as JWTPayload;
     try {
-      if (req.body?.benchmark === true) {
-        console.log('[benchmark] vision short-circuit');
-        return res.json({
-          ok: true,
-          benchmark: true,
-          agent: 'vision',
-          result: 'Benchmark mode - payment logged',
-        });
-      }
       const prompt =
         typeof req.body?.prompt === 'string' && req.body.prompt.trim()
           ? req.body.prompt.trim()
@@ -241,16 +303,12 @@ app.post(
             researchPriceLabel,
           });
           if (researchPayload) {
-            const task = typeof researchPayload.task === 'string' ? researchPayload.task.trim() : '';
-            const report = typeof researchPayload.result === 'string' ? researchPayload.result.trim() : '';
             answer = [
               answer,
               '',
               '---',
               '',
-              'A2A complete: Vision Agent -> Research Agent',
-              task ? `Task: ${task}` : '',
-              report ? ['', report].join('\n') : '',
+              formatVisionResearchFollowup(researchPayload),
             ].filter(Boolean).join('\n');
           }
         } catch (e) {

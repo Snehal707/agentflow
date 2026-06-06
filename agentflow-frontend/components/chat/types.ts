@@ -38,6 +38,14 @@ export type ChatTraceEntry =
 export type LiveChatMessage = {
   id: string;
   role: "user" | "assistant";
+  eventId?: string;
+  feedback?: "positive" | "negative";
+  agentRating?: {
+    stars?: number;
+    status?: "pending" | "confirmed" | "failed";
+    error?: string;
+    reputationTx?: string | null;
+  };
   title?: string;
   content: string;
   attachment?: ChatAttachment;
@@ -62,6 +70,12 @@ export type LiveChatMessage = {
       settlementTxHash?: string | null;
     }>;
   };
+  ratingMeta?: {
+    taskId: string;
+    requestId: string;
+    agentSlug: string;
+    settlementRef: string;
+  };
   confirmation?: {
     required: boolean;
     action: "swap" | "vault" | "bridge" | "execute" | "schedule" | "split" | "invoice" | "batch";
@@ -69,6 +83,15 @@ export type LiveChatMessage = {
     confirmLabel?: string;
     choices?: Array<{ id: string; label: string; confirmId: string }>;
   };
+  quickActionGroups?: Array<{
+    title?: string;
+    actions: Array<{
+      label: string;
+      prompt: string;
+      actionId?: string;
+      tone?: "primary" | "secondary";
+    }>;
+  }>;
   paymentLink?: {
     handle: string;
     displayHandle: string;

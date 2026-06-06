@@ -85,15 +85,6 @@ app.post(
   },
   async (req: Request, res: Response) => {
     try {
-      if (req.body?.benchmark === true) {
-        console.log('[benchmark] invoice short-circuit');
-        return res.json({
-          ok: true,
-          benchmark: true,
-          agent: 'invoice',
-          result: 'Benchmark mode - payment logged',
-        });
-      }
       const auth = (req as any).auth as JWTPayload;
       const businessWallet = auth.walletAddress;
       const channel = String(req.body?.channel ?? 'json').toLowerCase();
@@ -162,15 +153,6 @@ app.post(
   paidInternalOrAuthMiddleware,
   async (req: Request, res: Response) => {
     try {
-      if (req.body?.benchmark === true) {
-        console.log('[benchmark] invoice short-circuit');
-        return res.json({
-          ok: true,
-          benchmark: true,
-          agent: 'invoice',
-          result: 'Benchmark mode - payment logged',
-        });
-      }
       const auth = (req as any).auth as JWTPayload;
       const businessWallet = auth.walletAddress;
       const payerWalletAddress = req.body?.payerWalletAddress

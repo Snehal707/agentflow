@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { pathToFileURL } from 'url';
 import { adminDb } from '../db/client';
 import { buildInvoiceDigestPdf } from '../lib/digest-pdf';
 import { sendDigestEmail } from '../lib/resend-digest';
@@ -102,7 +103,7 @@ async function main(): Promise<void> {
   await runMonthlyDigest();
 }
 
-if (require.main === module) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
     console.error('[monthly-digest] failed:', err);
     process.exit(1);

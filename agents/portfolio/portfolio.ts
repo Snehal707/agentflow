@@ -11,6 +11,9 @@ import {
 import { arcTestnet } from 'viem/chains';
 import { fetchGatewayBalancesForDepositors } from '../../lib/gateway-balance';
 import { formatPortfolioSnapshotRecordsForChat } from '../../lib/format-portfolio-chat';
+import { getUserPositionsAcrossProviders } from '../../lib/predmarket/router';
+import type { UserMarketPosition } from '../../lib/predmarket/types';
+import { getProviderPosition, listAllVaults } from '../../lib/vault/router';
 
 const ARC_USDC = getAddress('0x3600000000000000000000000000000000000000');
 const ARC_EURC = getAddress('0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a');
@@ -49,54 +52,6 @@ const ERC20_ABI = [
     stateMutability: 'view',
     inputs: [],
     outputs: [{ type: 'string' }],
-  },
-] as const;
-
-const VAULT_ABI = [
-  {
-    type: 'function',
-    name: 'asset',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ type: 'address' }],
-  },
-  {
-    type: 'function',
-    name: 'convertToAssets',
-    stateMutability: 'view',
-    inputs: [{ name: 'shares', type: 'uint256' }],
-    outputs: [{ type: 'uint256' }],
-  },
-] as const;
-
-const SWAP_ABI = [
-  {
-    type: 'function',
-    name: 'owner',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ type: 'address' }],
-  },
-  {
-    type: 'function',
-    name: 'reserveUsdc',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ type: 'uint256' }],
-  },
-  {
-    type: 'function',
-    name: 'reservePair',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ type: 'uint256' }],
-  },
-  {
-    type: 'function',
-    name: 'pairToken',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ type: 'address' }],
   },
 ] as const;
 
@@ -189,7 +144,7 @@ export type PortfolioHolding = {
 
 export type PortfolioPosition = {
   id: string;
-  kind: 'swap_liquidity' | 'gateway_position';
+  kind: 'swap_liquidity' | 'gateway_position' | 'prediction_market';
   name: string;
   protocol: string;
   amountFormatted: string;
@@ -197,6 +152,10 @@ export type PortfolioPosition = {
   costBasisUsd: number | null;
   pnlUsd: number | null;
   notes: string[];
+  marketAddress?: string;
+  stage?: string;
+  canRedeem?: boolean;
+  canRefund?: boolean;
 };
 
 export type PortfolioRecentTransaction = {
@@ -265,6 +224,50 @@ type TokenBalanceRead = {
   usdValue: number | null;
   notes: string[];
 };
+
+function inferVaultHoldingMeta(symbol: string, name: string): {
+  isVaultShare: boolean;
+  impliedUsdPrice: number | null;
+  note: string | null;
+} {
+  const upperSymbol = symbol.trim().toUpperCase();
+  const lowerName = name.trim().toLowerCase();
+  const isVaultShare =
+    upperSymbol.startsWith('AFV') ||
+    upperSymbol.startsWith('APV') ||
+    upperSymbol.startsWith('LUNE') ||
+    lowerName.includes('vault');
+
+  if (!isVaultShare) {
+    return { isVaultShare: false, impliedUsdPrice: null, note: null };
+  }
+
+  if (upperSymbol.includes('USDC') || lowerName.includes('usdc')) {
+    return {
+      isVaultShare: true,
+      impliedUsdPrice: 1,
+      note: 'Vault share valued from USDC-denominated vault balance.',
+    };
+  }
+  if (upperSymbol.includes('EURC') || lowerName.includes('eurc')) {
+    return {
+      isVaultShare: true,
+      impliedUsdPrice: 1,
+      note: 'Vault share valued from EURC-denominated vault balance.',
+    };
+  }
+  return {
+    isVaultShare: true,
+    impliedUsdPrice: null,
+    note: 'Vault share detected, but no stable-value hint was available.',
+  };
+}
+
+function isLegacyAgentFlowVault(symbol: string, name: string): boolean {
+  const upperSymbol = symbol.trim().toUpperCase();
+  const lowerName = name.trim().toLowerCase();
+  return upperSymbol.startsWith('AFV') || upperSymbol.startsWith('APV') || lowerName.includes('agentflow vault');
+}
 
 type TokenPriceMap = Record<string, number | null>;
 
@@ -346,6 +349,8 @@ export async function buildPortfolioSnapshot(
     gatewayBalance,
     positionCosts,
   });
+  const predictionMarketPositions = await buildPredictionMarketPortfolioPositions(normalizedWallet);
+  positions.push(...predictionMarketPositions);
 
   const currentValueUsd = roundUsd(
     holdings.reduce((sum, item) => sum + (item.usdValue ?? 0), 0) +
@@ -662,6 +667,86 @@ function requireAlchemyRpc(): string {
   return value;
 }
 
+function hasPredictionMarketShares(position: UserMarketPosition): boolean {
+  return position.outcomes.some((outcome) => {
+    try {
+      return BigInt(outcome.sharesRaw || '0') > 0n;
+    } catch {
+      return Number(outcome.sharesFormatted || 0) > 0;
+    }
+  });
+}
+
+function hasPredictionMarketNetDeposit(position: UserMarketPosition): boolean {
+  try {
+    return BigInt(position.netDepositedRaw || '0') > 0n;
+  } catch {
+    return Number(position.netDepositedFormatted || 0) > 0;
+  }
+}
+
+function formatPredictionMarketOutcomeSummary(position: UserMarketPosition): string {
+  const outcomes = position.outcomes
+    .filter((outcome) => {
+      try {
+        return BigInt(outcome.sharesRaw || '0') > 0n;
+      } catch {
+        return Number(outcome.sharesFormatted || 0) > 0;
+      }
+    })
+    .map((outcome) => `${outcome.sharesFormatted} ${outcome.label}`)
+    .join(' | ');
+  const netDeposit = Number(position.netDepositedFormatted || 0);
+  const depositLabel = Number.isFinite(netDeposit) && netDeposit > 0
+    ? `net deposit ${netDeposit.toFixed(2)} USDC`
+    : '';
+  return [outcomes, depositLabel].filter(Boolean).join('; ') || 'position detected';
+}
+
+async function buildPredictionMarketPortfolioPositions(
+  walletAddress: string,
+): Promise<PortfolioPosition[]> {
+  try {
+    const positions = await getUserPositionsAcrossProviders(getAddress(walletAddress) as `0x${string}`);
+    return positions
+      .filter((position) => {
+        const actionable = position.canRedeem || position.canRefund;
+        const active = position.stage === 'active';
+        return (active || actionable) && (hasPredictionMarketShares(position) || hasPredictionMarketNetDeposit(position) || actionable);
+      })
+      .map((position) => {
+        const netDeposit = Number(position.netDepositedFormatted || 0);
+        const status = position.canRedeem
+          ? 'Redeemable now'
+          : position.canRefund
+            ? 'Refundable now'
+            : `Stage: ${position.stage}`;
+        return {
+          id: `predmarket:${position.provider}:${position.market.address}`,
+          kind: 'prediction_market',
+          name: position.market.title || 'Prediction market position',
+          protocol: position.provider || 'predmarket',
+          amountFormatted: formatPredictionMarketOutcomeSummary(position),
+          usdValue: null,
+          costBasisUsd: Number.isFinite(netDeposit) ? roundUsd(netDeposit) : null,
+          pnlUsd: null,
+          notes: [
+            status,
+            `Address: ${position.market.address}`,
+            'Prediction market shares are shown only when active, redeemable, or refundable.',
+          ],
+          marketAddress: position.market.address,
+          stage: position.stage,
+          canRedeem: position.canRedeem,
+          canRefund: position.canRefund,
+        } satisfies PortfolioPosition;
+      });
+  } catch (error) {
+    console.warn('[portfolio] prediction market positions unavailable:', toMessage(error));
+    return [];
+  }
+}
+
 async function checkArcDataAvailability(rpcUrl: string): Promise<ArcDataDiagnostics> {
   try {
     const response = await fetch(rpcUrl, {
@@ -705,10 +790,6 @@ async function buildTokenPriceMap(
       addresses.add(getAddress(item.token.address_hash));
     }
   }
-  if (ARC.vaultContract && isAddress(ARC.vaultContract)) {
-    addresses.add(getAddress(ARC.vaultContract));
-  }
-
   const result: TokenPriceMap = {};
   for (const address of addresses) {
     if (address === ARC_USDC || address === ARC_EURC) {
@@ -718,27 +799,21 @@ async function buildTokenPriceMap(
     result[address] = null;
   }
 
-  try {
-    const payload = Array.from(addresses).map((address) => ({ contractAddress: address }));
-    const priceResult = (await alchemyRpc('alchemy_getTokenPrices', [payload])) as {
-      data?: Array<{ address?: string; prices?: Array<{ value?: string | null }> }>;
-    };
-    for (const entry of priceResult.data ?? []) {
-      const address = entry.address && isAddress(entry.address) ? getAddress(entry.address) : null;
-      if (!address) {
-        continue;
-      }
-      const priceString = entry.prices?.[0]?.value;
-      const price = Number(priceString);
-      if (Number.isFinite(price)) {
-        result[address] = price;
-      }
+  for (const item of explorerBalances) {
+    const address = isAddress(item.token.address_hash)
+      ? getAddress(item.token.address_hash)
+      : null;
+    if (!address || address === ARC_USDC || address === ARC_EURC) {
+      continue;
     }
-  } catch {
-    // Arc Testnet Alchemy often disables enhanced price methods. Stable fallbacks are enough here.
+    const price = Number(item.token.exchange_rate);
+    if (Number.isFinite(price) && price > 0) {
+      result[address] = price;
+    }
   }
 
-  // Keep native and stable assumptions explicit even when Alchemy doesn't price Arc assets.
+  // Keep native and stable assumptions explicit; Arc Testnet does not support
+  // Alchemy enhanced token pricing methods on the Arc RPC endpoint.
   result[ARC_USDC] = 1;
   result[ARC_EURC] = 1;
 
@@ -755,10 +830,10 @@ async function buildHoldings(params: {
 }): Promise<PortfolioHolding[]> {
   const { client, walletAddress, explorerBalances, priceMap } = params;
   const candidates = new Set<string>([ARC_USDC, ARC_EURC]);
-
-  if (ARC.vaultContract && isAddress(ARC.vaultContract)) {
-    candidates.add(getAddress(ARC.vaultContract));
-  }
+  const knownVaults = await listAllVaults();
+  const knownVaultByAddress = new Map(
+    knownVaults.map((vault) => [getAddress(vault.address), vault] as const),
+  );
 
   for (const item of explorerBalances) {
     if (isAddress(item.token.address_hash)) {
@@ -793,6 +868,45 @@ async function buildHoldings(params: {
       continue;
     }
 
+    if (isLegacyAgentFlowVault(token.symbol, token.name)) {
+      continue;
+    }
+
+    const vaultMeta = inferVaultHoldingMeta(token.symbol, token.name);
+    const knownVault = knownVaultByAddress.get(token.address);
+    let displayBalanceFormatted = token.formattedBalance;
+    let displayUsdPrice = vaultMeta.impliedUsdPrice ?? token.usdPrice;
+    let displayUsdValue =
+      vaultMeta.impliedUsdPrice !== null
+        ? roundUsd(Number(token.formattedBalance) * vaultMeta.impliedUsdPrice)
+        : token.usdValue;
+    const extraNotes: string[] = [];
+
+    if (knownVault) {
+      try {
+        const providerPosition = await getProviderPosition(
+          knownVault.provider,
+          walletAddress,
+          knownVault.address,
+        );
+        displayBalanceFormatted = providerPosition.underlyingValueFormatted;
+        if (
+          providerPosition.underlyingSymbol === 'USDC' ||
+          providerPosition.underlyingSymbol === 'EURC'
+        ) {
+          displayUsdPrice = 1;
+          displayUsdValue = roundUsd(Number(providerPosition.underlyingValueFormatted));
+        }
+        extraNotes.push(
+          `Vault balance shown as underlying ${providerPosition.underlyingSymbol} value from provider position.`,
+        );
+      } catch (error) {
+        extraNotes.push(
+          `Vault underlying read failed; using raw token balance instead (${toMessage(error)}).`,
+        );
+      }
+    }
+
     if (token.address === ARC_USDC && nativeBalance > 0n) {
       const tokenBalanceFormatted = Number(token.formattedBalance);
       if (roughlyEqual(tokenBalanceFormatted, nativeBalanceFormatted, 0.000001)) {
@@ -804,46 +918,18 @@ async function buildHoldings(params: {
       }
     }
 
-    const isVaultShare =
-      ARC.vaultContract &&
-      isAddress(ARC.vaultContract) &&
-      getAddress(ARC.vaultContract) === token.address;
-
-    if (isVaultShare) {
-      const converted = await readVaultShareValue(client, token.address, token.rawBalance);
-      const underlyingValueUsd = roundUsd(Number(formatUnits(converted.assets, 6)));
-      holdings.push({
-        id: token.address,
-        kind: 'vault_share',
-        symbol: token.symbol,
-        name: token.name,
-        address: token.address,
-        balanceRaw: token.rawBalance.toString(),
-        balanceFormatted: token.formattedBalance,
-        usdPrice:
-          Number(token.formattedBalance) > 0 ? roundUsd(underlyingValueUsd / Number(token.formattedBalance)) : 1,
-        usdValue: underlyingValueUsd,
-        source: 'ALCHEMY_ARC_RPC eth_call + vault convertToAssets()',
-        notes: [
-          `Underlying asset: ${converted.asset}`,
-          `Valued via convertToAssets(${token.rawBalance.toString()}).`,
-        ],
-      });
-      continue;
-    }
-
     holdings.push({
       id: token.address,
-      kind: 'erc20',
+      kind: vaultMeta.isVaultShare ? 'vault_share' : 'erc20',
       symbol: token.symbol,
       name: token.name,
       address: token.address,
       balanceRaw: token.rawBalance.toString(),
-      balanceFormatted: token.formattedBalance,
-      usdPrice: token.usdPrice,
-      usdValue: token.usdValue,
+      balanceFormatted: displayBalanceFormatted,
+      usdPrice: displayUsdPrice,
+      usdValue: displayUsdValue,
       source: 'ALCHEMY_ARC_RPC eth_call',
-      notes: token.notes,
+      notes: [...token.notes, vaultMeta.note, ...extraNotes].filter((note): note is string => Boolean(note)),
     });
   }
 
@@ -860,11 +946,6 @@ async function buildPositions(params: {
 }): Promise<PortfolioPosition[]> {
   const { client, walletAddress, priceMap, gatewayBalance, positionCosts } = params;
   const positions: PortfolioPosition[] = [];
-
-  const swapPosition = await readSwapLiquidityPosition(client, walletAddress, priceMap, positionCosts);
-  if (swapPosition) {
-    positions.push(swapPosition);
-  }
 
   const gatewayPosition = buildGatewayPosition(gatewayBalance, positionCosts.gatewayBasisUsd);
   if (gatewayPosition) {
@@ -936,95 +1017,6 @@ async function readTokenBalance(
   }
 }
 
-async function readVaultShareValue(
-  client: ReturnType<typeof createPublicClient>,
-  vaultAddress: Address,
-  shareBalance: bigint,
-): Promise<{ asset: string; assets: bigint }> {
-  const [asset, assets] = await Promise.all([
-    client.readContract({
-      address: vaultAddress,
-      abi: VAULT_ABI,
-      functionName: 'asset',
-    }) as Promise<Address>,
-    client.readContract({
-      address: vaultAddress,
-      abi: VAULT_ABI,
-      functionName: 'convertToAssets',
-      args: [shareBalance],
-    }) as Promise<bigint>,
-  ]);
-
-  return {
-    asset,
-    assets,
-  };
-}
-
-async function readSwapLiquidityPosition(
-  client: ReturnType<typeof createPublicClient>,
-  walletAddress: Address,
-  priceMap: TokenPriceMap,
-  positionCosts: PositionCostSummary,
-): Promise<PortfolioPosition | null> {
-  if (!ARC.swapContract || !isAddress(ARC.swapContract)) {
-    return null;
-  }
-
-  const swapAddress = getAddress(ARC.swapContract);
-  try {
-    const [owner, reserveUsdc, reservePair, pairToken] = await Promise.all([
-      client.readContract({
-        address: swapAddress,
-        abi: SWAP_ABI,
-        functionName: 'owner',
-      }) as Promise<Address>,
-      client.readContract({
-        address: swapAddress,
-        abi: SWAP_ABI,
-        functionName: 'reserveUsdc',
-      }) as Promise<bigint>,
-      client.readContract({
-        address: swapAddress,
-        abi: SWAP_ABI,
-        functionName: 'reservePair',
-      }) as Promise<bigint>,
-      client.readContract({
-        address: swapAddress,
-        abi: SWAP_ABI,
-        functionName: 'pairToken',
-      }) as Promise<Address>,
-    ]);
-
-    if (getAddress(owner) !== walletAddress) {
-      return null;
-    }
-
-    const pairBalance = Number(formatUnits(reservePair, 6));
-    const usdcBalance = Number(formatUnits(reserveUsdc, 6));
-    const pairPrice = priceMap[getAddress(pairToken)] ?? 1;
-    const usdValue = roundUsd(usdcBalance + pairBalance * pairPrice);
-    const costBasisUsd = roundUsd(positionCosts.swapBasisUsd);
-
-    return {
-      id: `swap:${swapAddress}`,
-      kind: 'swap_liquidity',
-      name: 'AgentFlow Swap Liquidity',
-      protocol: 'AgentFlow Swap',
-      amountFormatted: `${formatNumber(usdcBalance)} USDC + ${formatNumber(pairBalance)} pair`,
-      usdValue,
-      costBasisUsd,
-      pnlUsd: roundUsd(usdValue - costBasisUsd),
-      notes: [
-        `Owner-controlled pool at ${swapAddress}.`,
-        `Reserves: ${formatNumber(usdcBalance)} USDC and ${formatNumber(pairBalance)} pair token.`,
-      ],
-    };
-  } catch {
-    return null;
-  }
-}
-
 function buildGatewayPosition(
   gatewayBalance: GatewayBalanceResult,
   gatewayBasisUsd: number,
@@ -1060,11 +1052,6 @@ function calculatePositionCostBasis(
   let vaultBasisUsd = 0;
   let swapBasisUsd = 0;
   let gatewayBasisUsd = 0;
-  const swapAddress =
-    ARC.swapContract && isAddress(ARC.swapContract) ? getAddress(ARC.swapContract) : null;
-  const vaultAddress =
-    ARC.vaultContract && isAddress(ARC.vaultContract) ? getAddress(ARC.vaultContract) : null;
-
   for (const item of transferHistory) {
     const tokenAddress = normalizeExplorerAddress(item.token.address_hash);
     if (!tokenAddress || (tokenAddress !== ARC_USDC && tokenAddress !== ARC_EURC)) {
@@ -1074,24 +1061,6 @@ function calculatePositionCostBasis(
     const amountUsd = Number(formatUnits(BigInt(item.total.value), Number(item.total.decimals)));
     const fromAddress = normalizeExplorerAddress(item.from.hash);
     const toAddress = normalizeExplorerAddress(item.to.hash);
-
-    if (vaultAddress) {
-      if (fromAddress === walletAddress && toAddress === vaultAddress && tokenAddress === ARC_USDC) {
-        vaultBasisUsd += amountUsd;
-      }
-      if (fromAddress === vaultAddress && toAddress === walletAddress && tokenAddress === ARC_USDC) {
-        vaultBasisUsd -= amountUsd;
-      }
-    }
-
-    if (swapAddress) {
-      if (fromAddress === walletAddress && toAddress === swapAddress) {
-        swapBasisUsd += amountUsd;
-      }
-      if (fromAddress === swapAddress && toAddress === walletAddress) {
-        swapBasisUsd -= amountUsd;
-      }
-    }
 
     if (toAddress && KNOWN_GATEWAY_WALLETS.has(toAddress) && fromAddress === walletAddress) {
       gatewayBasisUsd += amountUsd;
@@ -1217,25 +1186,6 @@ async function resolveGatewayBalance(
           : 'Gateway balance API unavailable and no active Gateway position was inferred from transfer history.',
     };
   }
-}
-
-async function alchemyRpc(method: string, params: unknown[]): Promise<unknown> {
-  const response = await fetch(requireAlchemyRpc(), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method,
-      params,
-    }),
-  });
-
-  const json = (await response.json()) as { result?: unknown; error?: { message?: string } };
-  if (!response.ok || json.error) {
-    throw new Error(json.error?.message ?? `Alchemy RPC ${method} failed (${response.status})`);
-  }
-  return json.result;
 }
 
 function mapTransaction(item: ExplorerTransactionItem): PortfolioRecentTransaction {

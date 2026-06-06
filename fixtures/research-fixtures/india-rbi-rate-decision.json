@@ -1,0 +1,181 @@
+{
+  "name": "india-rbi-rate-decision",
+  "captured_at": "2026-05-23T17:11:00.904Z",
+  "task": "India RBI rate decision impact",
+  "brief": {
+    "query": "India RBI rate decision impact",
+    "intent": "Analyze the effects of RBI's monetary policy decisions on India's economy and financial markets",
+    "scope": "broad",
+    "time_sensitivity": "recent",
+    "required_freshness_days": 30,
+    "geography": [
+      "India"
+    ],
+    "domains_priority": [
+      "economics",
+      "finance",
+      "monetary policy",
+      "macroeconomics"
+    ],
+    "domains_avoid": [
+      "rss",
+      "news.google.com",
+      "cryptocurrency",
+      "blockchain",
+      "non-RBI banking"
+    ],
+    "preferred_source_types": [
+      "official RBI publications",
+      "central bank references",
+      "economic analysis",
+      "reputable financial news",
+      "academic research"
+    ],
+    "must_answer": [
+      "How do recent RBI rate changes affect inflation trends?",
+      "What is the impact of rate decisions on India's GDP growth projections?",
+      "How are currency markets reacting to the monetary policy shifts?",
+      "What adjustments are commercial banks making following the rate announcements?",
+      "How does the RBI justify its rate decisions in terms of economic goals?"
+    ],
+    "avoid_drift": [
+      "individual bank marketing materials",
+      "unrelated regional economic news",
+      "speculative forex trading advice",
+      "non-RBI policy discussions"
+    ],
+    "minimum_source_diversity": 3,
+    "sub_questions": [
+      "What was the magnitude and direction of the latest rate change?",
+      "How do current rates compare to historical RBI monetary policy trends?",
+      "Which economic indicators (inflation, GDP, unemployment) does the RBI prioritize in its decisions?",
+      "What forward guidance does the RBI provide about future policy direction?",
+      "How do India's rate decisions compare to other emerging market central banks?",
+      "What tools besides interest rates does the RBI use for monetary policy implementation?",
+      "How are government bond yields reacting to the rate environment?"
+    ],
+    "evaluation_rubric": "Evaluate based on: authority of sources (central bank > news > academic), recency of data (within 30 days), direct relevance to RBI policy decisions and their impacts, balanced analysis of both inflation control and growth promotion aspects"
+  },
+  "queries": [
+    "India RBI rate decision impact",
+    "India RBI rate decision impact overview 2026",
+    "India RBI rate decision impact latest developments 2026",
+    "India RBI rate decision impact statistics data report",
+    "India RBI rate decision impact risks challenges analysis",
+    "India RBI rate decision impact official data report",
+    "India RBI rate decision impact Reuters 2026",
+    "India RBI rate decision impact BBC 2026",
+    "India RBI rate decision impact Wikipedia background",
+    "India RBI rate decision impact academic research overview",
+    "India RBI rate decision impact How do recent RBI rate changes affect inflation trends",
+    "How do recent RBI rate changes affect inflation trends 2026",
+    "India RBI rate decision impact What is the impact of rate decisions on India's GDP growth projections",
+    "What is the impact of rate decisions on India's GDP growth projections 2026",
+    "India RBI rate decision impact How are currency markets reacting to the monetary policy shifts",
+    "How are currency markets reacting to the monetary policy shifts 2026",
+    "India RBI rate decision impact What adjustments are commercial banks making following the rate announcements",
+    "What adjustments are commercial banks making following the rate announcements 2026",
+    "India RBI rate decision impact How does the RBI justify its rate decisions in terms of economic goals",
+    "How does the RBI justify its rate decisions in terms of economic goals 2026",
+    "What was the magnitude and direction of the latest rate change",
+    "latest What was the magnitude and direction of the latest rate change 2026",
+    "official What was the magnitude and direction of the latest rate change report site:.gov OR site:.org",
+    "What was the magnitude and direction of the latest rate change statistics data numbers",
+    "criticism concerns What was the magnitude and direction of the latest rate change",
+    "How do current rates compare to historical RBI monetary policy trends",
+    "latest How do current rates compare to historical RBI monetary policy trends 2026",
+    "official How do current rates compare to historical RBI monetary policy trends report site:.gov OR site:.org",
+    "How do current rates compare to historical RBI monetary policy trends statistics data numbers",
+    "criticism concerns How do current rates compare to historical RBI monetary policy trends",
+    "Which economic indicators inflation GDP unemployment does the RBI prioritize in its decisions",
+    "latest Which economic indicators inflation GDP unemployment does the RBI prioritize in its decisions 2026",
+    "official Which economic indicators inflation GDP unemployment does the RBI prioritize in its decisions report site:.gov OR site:.org",
+    "Which economic indicators inflation GDP unemployment does the RBI prioritize in its decisions statistics data numbers",
+    "criticism concerns Which economic indicators inflation GDP unemployment does the RBI prioritize in its decisions",
+    "What forward guidance does the RBI provide about future policy direction",
+    "latest What forward guidance does the RBI provide about future policy direction 2026",
+    "official What forward guidance does the RBI provide about future policy direction report site:.gov OR site:.org",
+    "What forward guidance does the RBI provide about future policy direction statistics data numbers",
+    "criticism concerns What forward guidance does the RBI provide about future policy direction",
+    "How do India's rate decisions compare to other emerging market central banks",
+    "latest How do India's rate decisions compare to other emerging market central banks 2026",
+    "official How do India's rate decisions compare to other emerging market central banks report site:.gov OR site:.org",
+    "How do India's rate decisions compare to other emerging market central banks statistics data numbers",
+    "criticism concerns How do India's rate decisions compare to other emerging market central banks",
+    "What tools besides interest rates does the RBI use for monetary policy implementation",
+    "latest What tools besides interest rates does the RBI use for monetary policy implementation 2026",
+    "official What tools besides interest rates does the RBI use for monetary policy implementation report site:.gov OR site:.org",
+    "What tools besides interest rates does the RBI use for monetary policy implementation statistics data numbers",
+    "criticism concerns What tools besides interest rates does the RBI use for monetary policy implementation",
+    "How are government bond yields reacting to the rate environment",
+    "latest How are government bond yields reacting to the rate environment 2026",
+    "official How are government bond yields reacting to the rate environment report site:.gov OR site:.org",
+    "How are government bond yields reacting to the rate environment statistics data numbers",
+    "criticism concerns How are government bond yields reacting to the rate environment",
+    "What was the magnitude and direction of the latest rate change? site:www.rbi.org.in",
+    "How do current rates compare to historical RBI monetary policy trends? site:www.rbi.org.in",
+    "What was the magnitude and direction of the latest rate change? site:kalshi.com",
+    "How do current rates compare to historical RBI monetary policy trends? site:kalshi.com",
+    "What was the magnitude and direction of the latest rate change? site:www.reutersagency.com",
+    "How do current rates compare to historical RBI monetary policy trends? site:www.reutersagency.com"
+  ],
+  "sources": [
+    {
+      "url": "https://www.federalreserve.gov/newsevents/pressreleases/other20260522a.htm",
+      "title": "Federal Reserve",
+      "date": "5/22/2026 4:15:00 PM",
+      "snippet": "Title: Kevin Warsh takes oath of office as chairman and a member of the Board of Governors of the Federal Reserve System, and the Federal Open Market Committee unanimously selects Warsh as its chairman\nURL: https://www.federalreserve.gov/newsevents/pressreleases/other20260522a.htm\nDate: 5/22/2026 4:15:00 PM\nType: Other Announcements Date: 5/22/2026 4:15:00 PM Kevin Warsh takes oath of office as chairman and a member of the Board of Governors of the Federal Reserve System, and the Federal Open Market Committee unanimously selects Warsh as its chairman\n\n---\n\nTitle: Agencies publish resolution plan feedback letters for certain domestic and foreign banking organizations\nURL: https://www.federalreserve.gov/newsevents/pressreleases/bcreg20260522a.htm\nDate: 5/22/2026 4:00:00 PM\nType: Banking and Consumer Regulatory Policy Date: 5/22/2026 4:00:00 PM Agencies publish resolution plan feedback letters for certain domestic and foreign banking organizations\n\n---\n\nTitle: Federal Reserve Board issues enforcement action with former employee of Commerce Bank\nURL: https://www.federalreserve.gov/newsevents/pressreleases/enforcement20260521a.htm\nDate: 5/21/2026 11:00:00 AM\nType: Enforcement Actions Date: 5/21/2026 11:00:00 AM Federal Reserve Board issues enforcement action with former employee of Commerce Bank",
+      "domain": "www.federalreserve.gov",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.livemint.com/news/us-news/12-million-indian-americans-their-families-in-limbo-us-lawmakers-slam-new-green-card-policy-11779547316159.html",
+      "title": "Mint",
+      "date": "2026-05-23T15:25:59.000Z",
+      "snippet": "Title: ‘1.2 million Indian Americans, their families in limbo’: US lawmakers slam new green card policy\nURL: https://www.livemint.com/news/us-news/12-million-indian-americans-their-families-in-limbo-us-lawmakers-slam-new-green-card-policy-11779547316159.html\nDate: 2026-05-23T15:25:59.000Z\nUS lawmakers and immigration advocates criticise the Trump administration's new green card policy that requires applicants to apply from their home countries, calling it reckless and harmful.\n\n---\n\nTitle: Thailand ends 60-day visa-free stay for Indians and others: What it means for travelers with existing permission?\nURL: https://www.livemint.com/news/trends/thailand-visa-news-tourist-visa-free-stay-for-indians-ends-11779550734027.html\nDate: 2026-05-23T16:13:51.000Z\nThe government said the earlier 60-day exemption had originally been introduced to revive tourism and strengthen economic recovery after the pandemic.\n\n---\n\nTitle: Delhi Gymkhana Club falls under ‘highly sensitive &amp; strategic area’, says Centre, asked to hand over premises by June 5\nURL: https://www.livemint.com/news/india/delhi-gymkhana-club-falls-under-highly-sensitive-strategic-area-says-centre-asked-to-hand-over-premises-june-5-11779524428808.html\nDate: 2026-05-23T09:41:58.000Z\nThe central govt has ordered the takeover of the Delhi Gymkhana Club premises for public and national interest, citing its strategic location essential for defense infrastructure and security. The govt issued the directive for land originally leased to the club for social &amp; sporting activities.",
+      "domain": "www.livemint.com",
+      "reliability": "medium"
+    },
+    {
+      "url": "https://www.rbi.org.in",
+      "title": "RBI",
+      "date": "",
+      "snippet": "Title: RBI\nURL: https://www.rbi.org.in\nSkip to main content 10:40:52 PM Saturday, May 23, 2026 \"Increase Letter Spacing\") \"Increase Font Size\") Selected \"Regular Font Size\") \"Decrease Font Size\") \"Apply Dark Theme\") Selected \"Apply Normal Theme\") \"Apply Grey Theme\") Change Language हिंदी Home-Reserve Bank of India ========================== PREAMBLE -------- “to regulate the issue of Bank notes and keeping of reserves with a view to securing monetary stability in India and generally to operate the currency and credit system of the country to its advantage; to have a modern monetary policy framework to meet the challenge of an increasingly complex economy, to maintain price stability while keeping in mind the objective of growth.”",
+      "domain": "www.rbi.org.in",
+      "reliability": "high"
+    },
+    {
+      "url": "https://fred.stlouisfed.org",
+      "title": "FRED",
+      "date": "",
+      "snippet": "Title: Interest Rates: Long-Term Government Bond Yields: 10-Year: Main (Including Benchmark) for India\nURL: https://fred.stlouisfed.org\nSeries: INDIRLTLT01STM Interest Rates: Long-Term Government Bond Yields: 10-Year: Main (Including Benchmark) for India Observation range: 2011-12-01 to 2026-03-01 Frequency: Monthly Units: Percent OECD Data Filters: REF AREA: IND MEASURE: IRLT UNIT MEASURE: PA ACTIVITY: Z ADJUSTMENT: Z TRANSFORMATION: Z FREQ: M All OECD data should be cited as follows: OECD (year), (dataset name), (data source) DOI or https://data-explorer.oecd.org/ (https://data-explorer.oecd.org/). (accessed on (date)).\n\n---\n\nTitle: Real Broad Effective Exchange Rate for India\nURL: https://fred.stlouisfed.org\nSeries: RBINBIS Real Broad Effective Exchange Rate for India Observation range: 1994-01-01 to 2026-04-01 Frequency: Monthly Units: Index 2020=100 Real effective exchange rates are calculated as weighted averages of bilateral exchange rates adjusted by relative consumer prices. Copyright, 2016, Bank for International Settlements (BIS). Terms and conditions of use are available at http://www.bis.org/terms conditions.htm Copyright and Permissions.\n\n---\n\nTitle: Interest Rates: Long-Term Government Bond Yields: 10-Year: Main (Including Benchmark) for India\nURL: https://fred.stlouisfed.org\nSeries: INDIRLTLT01STQ Interest Rates: Long-Term Government Bond Yields: 10-Year: Main (Including Benchmark) for India Observation range: 2012-01-01 to 2026-01-01 Frequency: Quarterly Units: Percent OECD Data Filters: REF AREA: IND MEASURE: IRLT UNIT MEASURE: PA ACTIVITY: Z ADJUSTMENT: Z TRANSFORMATION: Z FREQ: Q All OECD data should be cited as follows: OECD (year), (dataset name), (data source) DOI or https://data-explorer.oecd.org/ (https://data-explorer.oecd.org/). (accessed on (date)).",
+      "domain": "fred.stlouisfed.org",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.imf.org",
+      "title": "IMF",
+      "date": "",
+      "snippet": "Title: IMF NGDP_RPCH\nURL: https://www.imf.org\nSDN 2031: 4.5 AFG 2025: 3 ALB 2031: 3.2 DZA 2031: 2.6 AND 2031: 1.5",
+      "domain": "www.imf.org",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.oecd.org",
+      "title": "OECD",
+      "date": "",
+      "snippet": "URL: https://www.oecd.org\nIDREF1567 false 2026-05-23T09:18:56.2661884+02:00 NonProductionDataflow true Air Emissions Accounts Air Emissions Accounts NonProductionDataflow true SDG Country Global Dataflow Reporting and dissemination dataflow for non-harmonized global SDG indicators reported by countries. NonProductionDataflow true SDG Harmonized Global Dataflow Reporting and dissemination dataflow for harmonized global SDG indicators. NonProductionDataflow true REF AREA,TERRITORIAL LEVEL LAYOUT ROW TIME PERIOD LAYOUT COLUMN MEASURE LAYOUT ROW SECTION OBS STATUS=A,FREQ=A,UNIT MULT=0 NOT DISPLAYED REF AREA=BEL+BE001F+BE002F+BE003F+BE004F+NLD+NL001F+NL002F+NL003F+NL004F,UNIT MEASURE=D Y,MEASURE=HOT DAYS PROJ,TIME PERIOD ",
+      "domain": "www.oecd.org",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/2026/april-2026",
+      "title": "Bank of England",
+      "date": "2026-04-30T11:00:00.000Z",
+      "snippet": "Title: Bank Rate maintained at 3.75% - April 2026 Monetary Policy Summary and Minutes\nURL: https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/2026/april-2026\nDate: 2026-04-30T11:00:00.000Z\nThe Bank of England’s Monetary Policy Committee is responsible for making decisions about Bank Rate.\n\n---\n\nTitle: Bank Rate maintained at 3.75% - March 2026 Monetary Policy Summary and Minutes\nURL: https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/2026/march-2026\nDate: 2026-03-19T12:00:00.000Z\nThe Bank of England’s Monetary Policy Committee is responsible for making decisions about Bank Rate.\n\n---\n\nTitle: Bank Rate maintained at 3.75% - February 2026 Monetary Policy Summary and Minutes\nURL: https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/2026/february-2026\nDate: 2026-02-05T12:00:00.000Z\nThe Bank of England’s Monetary Policy Committee is responsible for making decisions about Bank Rate.",
+      "domain": "www.bankofengland.co.uk",
+      "reliability": "high"
+    }
+  ],
+  "captured_runtime_version": "0.1.0"
+}

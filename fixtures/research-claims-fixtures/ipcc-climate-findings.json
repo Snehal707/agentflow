@@ -1,0 +1,66 @@
+{
+  "name": "ipcc-climate-findings",
+  "source_fixture": "ipcc-climate-findings",
+  "captured_at": "2026-05-23T19:43:10.247Z",
+  "captured_runtime_version": "0.1.0",
+  "capture_notes": "initial_capture",
+  "capture_config": {
+    "claim_batch_concurrency": 1,
+    "claim_batch_timeout_ms": 45000
+  },
+  "claims_count": 3,
+  "extraction_latency_ms": 8246,
+  "claims": [
+    {
+      "claim": "The IPCC Working Group II is meeting in Nassau, Bahamas to draft the next IPCC assessment report on climate impacts, adaptation and vulnerabilities.",
+      "date": "2026-05-18",
+      "source_url": "https://www.ipcc.ch/2026/05/18/pr-wgii-ar7-lamii-nassau/",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "Over 200 authors from the IPCC's Working Group II gather in the Bahamas to work on the draft of the next scientific report assessing climate impacts, adaptation and vulnerabilities. This is the second time authors are meeting to advance work on the report, also known as the Second Lead Author Meeting. Taking place from 18 to 22 May 2026.",
+      "entities": [
+        "IPCC",
+        "Working Group II",
+        "Bahamas"
+      ],
+      "numbers": [
+        "200",
+        "18 to 22 May 2026"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "The U.S. agricultural sector's total greenhouse gas emissions were 362.3 MtCO2e in 1990.",
+      "date": "",
+      "source_url": "https://www.climatewatchdata.org",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "Over 200 authors from the IPCC's Working Group II gather in the Bahamas to work on the draft of the next scientific report assessing climate impacts, adaptation and vulnerabilities. This is the second time authors are meeting to advance work on the report, also known as the Second Lead Author Meeting. Taking place from 18 to 22 May 2026.",
+      "entities": [
+        "Climate Watch",
+        "United States",
+        "agriculture"
+      ],
+      "numbers": [
+        "1990",
+        "362.3 MtCO2e"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "The COAPEC program is examining the variability of Earth's climate with a focus on ocean-atmosphere coupling's impact on European climate.",
+      "date": "",
+      "source_url": "https://earthdata.nasa.gov",
+      "source_type": "official",
+      "confidence": 0.8,
+      "supporting_snippet": "COAPEC is a NERC thematic programme designed to examine the variability of the Earth's climate. The goal of COAPEC is to determine the impact on climate, especially European climate, of the coupling between the Atlantic Ocean and the atmosphere.",
+      "entities": [
+        "COAPEC",
+        "NERC",
+        "European climate"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    }
+  ]
+}

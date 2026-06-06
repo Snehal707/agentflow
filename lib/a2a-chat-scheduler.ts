@@ -70,17 +70,6 @@ export function scheduleChatToolPostA2a(input: {
           });
           return;
         }
-
-        if (pendingTool === 'bridge_usdc' && /Bridged/i.test(result) && /USDC to Arc/i.test(result)) {
-          await runPortfolioFollowupAfterTool({
-            buyerAgentSlug: 'bridge',
-            userWalletAddress,
-            portfolioRunUrl,
-            portfolioPriceLabel,
-            trigger: 'post_bridge',
-            details: result,
-          });
-        }
       } catch (e) {
         console.warn('[a2a] chat tool post hooks failed:', e instanceof Error ? e.message : e);
       }

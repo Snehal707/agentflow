@@ -30,6 +30,24 @@ export const clientDb: SupabaseClient = createClient(
   },
 );
 
+export function createUserScopedDbFromJwt(jwt: string): SupabaseClient {
+  const token = jwt.trim();
+  if (!token) {
+    throw new Error('[db/client] user-scoped Supabase client requires a JWT');
+  }
+  return createClient(supabaseUrl, supabasePublishableKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+    global: {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  });
+}
+
 function requireEnv(name: string): string {
   const v = process.env[name]?.trim();
   if (!v) {

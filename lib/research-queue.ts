@@ -4,8 +4,15 @@ import { sendTelegramText } from './telegram-notify';
 
 export const QUEUE_KEY = 'research:queue';
 export const PROCESSING_KEY = 'research:processing';
-export const MAX_CONCURRENT = 3;
+export const MAX_CONCURRENT = Math.max(
+  1,
+  Number.parseInt(process.env.RESEARCH_MAX_CONCURRENT || '10', 10) || 10,
+);
+export const ACTIVE_PIPELINE_COUNT_KEY = 'research:active:pipeline_count';
 const JOB_TTL = 1800; // 30 minutes
+const PROCESSING_HEARTBEAT_PREFIX = 'research:processing:heartbeat:';
+const PROCESSING_HEARTBEAT_TTL_SECONDS = 900; // long enough for fast + deep reports, short enough to self-heal after crashes
+const PROCESSING_JOB_STALE_MS = 30 * 60 * 1000;
 
 const JOB_KEY_PREFIX = 'research:job:';
 
@@ -43,6 +50,8 @@ export interface ResearchJob {
   status: 'queued' | 'processing' | 'done' | 'failed';
   position?: number;
   result?: string;
+  reportPayload?: Record<string, unknown> | null;
+  receipt?: Record<string, unknown> | null;
   error?: string;
 }
 
@@ -52,6 +61,7 @@ function jobKey(jobId: string): string {
 
 export async function tryAcquireResearchSlot(token: string): Promise<boolean> {
   const redis = getRedis();
+  await cleanupStaleProcessingSlots();
   const n = (await redis.eval(
     ACQUIRE_SLOT_LUA,
     1,
@@ -59,12 +69,23 @@ export async function tryAcquireResearchSlot(token: string): Promise<boolean> {
     String(MAX_CONCURRENT),
     token,
   )) as number;
+  if (n === 1) {
+    await redis.set(
+      `${PROCESSING_HEARTBEAT_PREFIX}${token}`,
+      String(Date.now()),
+      'EX',
+      PROCESSING_HEARTBEAT_TTL_SECONDS,
+    );
+  }
   return n === 1;
 }
 
 export async function releaseResearchSlot(token: string): Promise<void> {
   const redis = getRedis();
-  await redis.srem(PROCESSING_KEY, token);
+  await Promise.all([
+    redis.srem(PROCESSING_KEY, token),
+    redis.del(`${PROCESSING_HEARTBEAT_PREFIX}${token}`),
+  ]);
 }
 
 export async function enqueueResearch(
@@ -72,7 +93,7 @@ export async function enqueueResearch(
 ): Promise<{ jobId: string; position: number }> {
   const redis = getRedis();
   const jobId = `research-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
-  const reasoningMode = job.reasoningMode ?? (job.mode === 'deep' ? 'deep' : 'fast');
+  const reasoningMode = 'fast';
   const fullJob: ResearchJob = {
     ...job,
     reasoningMode,
@@ -102,13 +123,72 @@ export async function getJobStatus(jobId: string): Promise<ResearchJob | null> {
 export async function getQueueStats(): Promise<{
   queued: number;
   processing: number;
+  activePipelines: number;
 }> {
   const redis = getRedis();
-  const [queued, processing] = await Promise.all([
+  await cleanupStaleProcessingSlots();
+  const [queued, processing, activePipelinesRaw] = await Promise.all([
     redis.llen(QUEUE_KEY),
     redis.scard(PROCESSING_KEY),
+    redis.get(ACTIVE_PIPELINE_COUNT_KEY),
   ]);
-  return { queued, processing };
+  const activePipelines = Math.max(0, Number.parseInt(activePipelinesRaw || '0', 10) || 0);
+  return { queued, processing, activePipelines };
+}
+
+export async function beginResearchPipelineRun(): Promise<void> {
+  const redis = getRedis();
+  await redis.incr(ACTIVE_PIPELINE_COUNT_KEY);
+  await redis.expire(ACTIVE_PIPELINE_COUNT_KEY, PROCESSING_HEARTBEAT_TTL_SECONDS);
+}
+
+export async function endResearchPipelineRun(): Promise<void> {
+  const redis = getRedis();
+  const remaining = (await redis.decr(ACTIVE_PIPELINE_COUNT_KEY)) as number;
+  if (remaining <= 0) {
+    await redis.del(ACTIVE_PIPELINE_COUNT_KEY);
+  } else {
+    await redis.expire(ACTIVE_PIPELINE_COUNT_KEY, PROCESSING_HEARTBEAT_TTL_SECONDS);
+  }
+}
+
+export async function cleanupStaleProcessingSlots(): Promise<number> {
+  const redis = getRedis();
+  const members = await redis.smembers(PROCESSING_KEY);
+  if (members.length === 0) return 0;
+
+  let removed = 0;
+  const now = Date.now();
+  for (const token of members) {
+    let stale = false;
+    if (token.startsWith('sync:')) {
+      const heartbeat = await redis.get(`${PROCESSING_HEARTBEAT_PREFIX}${token}`);
+      stale = !heartbeat;
+    } else if (token.startsWith('research-')) {
+      const raw = await redis.get(jobKey(token));
+      if (!raw) {
+        stale = true;
+      } else {
+        try {
+          const job = JSON.parse(raw) as ResearchJob;
+          stale =
+            job.status !== 'processing' ||
+            (Number.isFinite(job.createdAt) && now - job.createdAt > PROCESSING_JOB_STALE_MS);
+        } catch {
+          stale = true;
+        }
+      }
+    }
+
+    if (stale) {
+      await redis.srem(PROCESSING_KEY, token);
+      removed += 1;
+    }
+  }
+  if (removed > 0) {
+    console.warn(`[research-queue] cleaned ${removed} stale processing slot(s)`);
+  }
+  return removed;
 }
 
 async function updateJobStatus(jobId: string, updates: Partial<ResearchJob>): Promise<void> {
@@ -135,7 +215,12 @@ function publicBaseUrl(): string {
  */
 async function consumeResearchPipelineSse(
   body: ReadableStream<Uint8Array> | null,
-): Promise<{ report: string; error?: string }> {
+): Promise<{
+  report: string;
+  reportPayload?: Record<string, unknown> | null;
+  receipt?: Record<string, unknown> | null;
+  error?: string;
+}> {
   if (!body) {
     return { report: '', error: 'Empty response body' };
   }
@@ -143,11 +228,16 @@ async function consumeResearchPipelineSse(
   const decoder = new TextDecoder();
   let buffer = '';
   let report = '';
+  let reportPayload: Record<string, unknown> | null = null;
+  let receipt: Record<string, unknown> | null = null;
   let pipelineErr = '';
 
   const applyParsed = (parsed: Record<string, unknown>) => {
     if (parsed.type === 'report' && typeof parsed.markdown === 'string') {
       report = parsed.markdown;
+      reportPayload = parsed;
+    } else if (parsed.type === 'receipt') {
+      receipt = parsed;
     } else if (parsed.type === 'error' && typeof parsed.message === 'string') {
       pipelineErr = parsed.message;
     }
@@ -199,15 +289,20 @@ async function consumeResearchPipelineSse(
   if (!report) {
     return { report: '', error: 'Pipeline finished without a report payload' };
   }
-  return { report };
+  return { report, reportPayload, receipt };
 }
 
-export async function runResearchPipelineHttp(job: ResearchJob): Promise<{ report: string; error?: string }> {
+export async function runResearchPipelineHttp(job: ResearchJob): Promise<{
+  report: string;
+  reportPayload?: Record<string, unknown> | null;
+  receipt?: Record<string, unknown> | null;
+  error?: string;
+}> {
   const wallet = job.walletAddress?.trim();
   if (!wallet || !isAddress(wallet)) {
     return { report: '', error: 'Invalid walletAddress for research pipeline' };
   }
-  const reasoningMode = job.reasoningMode ?? (job.mode === 'deep' ? 'deep' : 'fast');
+  const reasoningMode = 'fast';
   const res = await fetch(`${publicBaseUrl()}/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -215,7 +310,7 @@ export async function runResearchPipelineHttp(job: ResearchJob): Promise<{ repor
       task: job.query,
       userAddress: getAddress(wallet as `0x${string}`),
       reasoningMode,
-      deepResearch: reasoningMode === 'deep',
+      deepResearch: false,
     }),
   });
 
@@ -261,6 +356,7 @@ async function notifyResearchCompleteTelegram(walletAddress: string, query: stri
 
 export async function processResearchQueue(): Promise<void> {
   const redis = getRedis();
+  await cleanupStaleProcessingSlots();
 
   const raw = await redis.eval(
     DEQUEUE_AND_RESERVE_LUA,
@@ -287,7 +383,7 @@ export async function processResearchQueue(): Promise<void> {
   console.log(`[research-queue] processing ${job.id}: "${job.query.slice(0, 120)}"`);
 
   try {
-    const { report, error } = await runResearchPipelineHttp(job);
+    const { report, reportPayload, receipt, error } = await runResearchPipelineHttp(job);
     if (error) {
       throw new Error(error);
     }
@@ -295,6 +391,8 @@ export async function processResearchQueue(): Promise<void> {
     await updateJobStatus(job.id, {
       status: 'done',
       result: report,
+      reportPayload: reportPayload ?? null,
+      receipt: receipt ?? null,
     });
 
     await notifyResearchCompleteTelegram(job.walletAddress, job.query, report);

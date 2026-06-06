@@ -11,6 +11,7 @@ import { executeUserPaidAgentViaX402, SWAP_AGENT_PRICE_LABEL, SWAP_RUN_URL } fro
 import { runPortfolioFollowupAfterTool } from '../a2a-followups';
 import { PORTFOLIO_AGENT_PRICE_LABEL, PORTFOLIO_AGENT_RUN_URL } from '../agentRunConfig';
 import { buildGatewayLowMessage, isLikelyGatewayOrBalanceError } from '../telegramPaymentHints';
+import { executeGuardCheck } from '../execution-guard';
 import {
   arcscanTxViewUrl,
   formatNanopaymentRequestLine,
@@ -122,7 +123,7 @@ export async function executeTelegramSwapDirect(input: {
 
   await adminDb.from('transactions').insert({
     from_wallet: p.walletAddress,
-    to_wallet: ARC.swapContract || p.tokenOut,
+    to_wallet: p.tokenOut,
     amount: p.amount,
     arc_tx_id: txHash,
     agent_slug: 'swap',
@@ -194,10 +195,24 @@ export async function executeTelegramSwap(input: {
 }): Promise<TelegramSwapResult> {
   const p = input.payload;
   const wallet = getAddress(p.walletAddress) as `0x${string}`;
+  const guard = await executeGuardCheck({
+    walletAddress: wallet,
+    amount: p.amount,
+    recipients: [],
+    idempotencyKey: `telegram:swap:${wallet}:${p.tokenIn}:${p.tokenOut}:${p.amount}`,
+    route: 'telegram:swap',
+    requireConfirmation: true,
+    logReason: 'telegram_blocked',
+    logContext: { telegramAction: 'swap' },
+  });
+  if (!guard.allowed) {
+    throw new Error(guard.message);
+  }
 
-  const x402Label = (msg: string) => void input.onStatus?.(msg);
-  const requiredFeeUsd = Number(String(SWAP_AGENT_PRICE_LABEL).replace(/^\$/, '')) || 0;
-  // Best-effort: if x402 path fails, always try direct. Avoid double-execution when HTTP reports success+txHash.
+  try {
+    const x402Label = (msg: string) => void input.onStatus?.(msg);
+    const requiredFeeUsd = Number(String(SWAP_AGENT_PRICE_LABEL).replace(/^\$/, '')) || 0;
+    // Best-effort: if x402 path fails, always try direct. Avoid double-execution when HTTP reports success+txHash.
 
   try {
     const paid = await executeUserPaidAgentViaX402<SwapRunResponse>({
@@ -210,6 +225,9 @@ export async function executeTelegramSwap(input: {
         tokenPair: { tokenIn: p.tokenIn, tokenOut: p.tokenOut },
         amount: p.amount,
         slippage: p.requestedSlippage,
+        confirmed: true,
+        fromSym: p.fromSym,
+        toSym: p.toSym,
       },
     });
     const data = paid.data;
@@ -245,9 +263,19 @@ export async function executeTelegramSwap(input: {
       scheduleTelegramSwapPortfolioA2A(p.walletAddress, line, 'x402');
       return result;
     }
+    console.warn('[telegram/swap] paid agent returned no executable tx', {
+      requestId: paid.requestId,
+      success: data?.success,
+      txHash: data?.txHash,
+      error: data?.error,
+    });
     x402Label('⚠️ Agent returned no success — retrying via your Agent Wallet…');
   } catch (e) {
     const errMsg = e instanceof Error ? e.message : String(e);
+    console.warn('[telegram/swap] x402 agent route failed, falling back to DCW', {
+      requestId: `telegram_swap_${wallet}`,
+      error: errMsg,
+    });
     if (isLikelyGatewayOrBalanceError(errMsg)) {
       const hint = buildGatewayLowMessage(0, requiredFeeUsd);
       x402Label(hint);
@@ -274,12 +302,14 @@ export async function executeTelegramSwap(input: {
     `Tx: ${shortHash(direct.txHash)}`,
     arcscanTxViewUrl(direct.txHash),
     '',
-    'Executed via Agent Wallet',
-    'Fund Gateway at agentflow.one/funds',
-    'to enable nanopayments',
+    'Executed via Agent Wallet fallback',
+    'x402 agent route did not complete for this run.',
   ].join('\n');
   scheduleTelegramSwapPortfolioA2A(p.walletAddress, summary, 'dcw');
   return direct;
+  } finally {
+    await guard.release();
+  }
 }
 
 function formatTelegramTokenAmount(value: string): string {

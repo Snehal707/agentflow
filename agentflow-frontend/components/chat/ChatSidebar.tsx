@@ -9,14 +9,13 @@ import { navItems, type ChatHistoryItem } from "@/lib/appData";
 import { sidebarWidthClass } from "@/lib/useSidebarPreference";
 
 const navIconMap: Record<string, string> = {
-  "/chat": "space_dashboard",
+  "/chat": "forum",
   "/pay": "payments",
   "/funds": "account_balance_wallet",
   "/portfolio": "pie_chart",
-  "/vault": "savings",
   "/agents": "storefront",
-  "/economy": "monitoring",
-  "/settings": "send",
+  "/memory": "neurology",
+  "/telegram": "send",
 };
 
 type ChatSidebarProps = {

@@ -121,16 +121,6 @@ app.post(
       return res.status(400).json({ action: 'error', message: 'payments array is required' });
     }
 
-    if (req.body?.benchmark === true) {
-      console.log('[benchmark] batch short-circuit');
-      return res.json({
-        ok: true,
-        benchmark: true,
-        agent: 'batch',
-        result: 'Benchmark mode - payment logged',
-      });
-    }
-
     try {
       const result = await previewBatch({ sessionId, walletAddress, payments });
       return res.json(result);

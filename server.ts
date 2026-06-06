@@ -3,7 +3,7 @@ import express, { NextFunction, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { createPublicClient, formatUnits, getAddress, http, isAddress, type Address } from 'viem';
+import { getAddress, isAddress, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
   BatchFacilitatorClient,
@@ -11,7 +11,6 @@ import {
   isBatchPayment,
 } from '@circlefin/x402-batching/server';
 import {
-  callHermesDeep,
   callHermesFast,
 } from './lib/hermes';
 import {
@@ -21,16 +20,56 @@ import {
   type BrainMessageMeta,
 } from './lib/agent-brain';
 import {
+  answerModeRequiresFinancialContext,
+  buildFinancialAdvisoryScopeReply,
+  classifyAnswerMode,
+  isFinancialAdvisoryScopeMessage,
+} from './lib/answer-mode';
+import {
+  classifyIntent,
+  IntentRouterParseError,
+  IntentRouterRequestError,
+  IntentRouterSchemaError,
+  IntentRouterTimeoutError,
+} from './lib/intent-router';
+import { dispatchIntent } from './lib/intent-router/dispatcher';
+import { AgentFlowDomain, AgentFlowIntentName, type AgentFlowIntent } from './lib/intent-router/types';
+import { validateIntent, type ValidationResult } from './lib/intent-router/validator';
+import {
+  logBrainEvent,
+  updateBrainEvent,
+  type BrainEventOutcome,
+  type BrainToolTelemetry,
+} from './lib/brain-telemetry';
+import {
   appendRecentExecutionEntries,
   clearPendingAction,
   executeTool,
   loadPendingAction,
   takeRecentExecutionMeta,
 } from './lib/tool-executor';
-import { fetchLiveData } from './lib/live-data';
-import { inferResearchReasoningMode } from './lib/researchMode';
+import { detectForecastingIntent, fetchLiveData, shouldGatherCurrentEvents } from './lib/live-data';
+import { detectPortfolioImpactIntent, stripPortfolioImpactPhrasing } from './lib/portfolio-impact-intent';
+import { classifyPortfolioRequestMode } from './lib/portfolio-request-intent';
+import { extractAgentpayRemark } from './lib/agentpay-remark';
 import {
+  isAmbiguousPredictionMarketIntent,
+  isPredictionMarketBrowseIntent,
+  looksLikePredictionMarketResearch,
+} from './lib/prediction-market-intent';
+import { isSwapExecutionIntent, looksLikeSwapResearch } from './lib/swap-intent';
+import { isVaultDiscoveryIntent } from './lib/vault-discovery-intent';
+import { isBridgeExecutionIntent, looksLikeBridgeResearch } from './lib/bridge-intent';
+import { analyzeCapabilityAwareRouting } from './lib/capability-aware-routing';
+import { detectProtocolQueryShape } from './lib/protocol-query-shape';
+import { inferResearchReasoningMode } from './lib/researchMode';
+import { isCreatorAudienceMetricTask } from './lib/source-policy';
+import { isExplicitResearchRequest } from './lib/research-request-intent';
+import { hasExplicitResearchReportRequest } from './lib/research-routing-precedence';
+import {
+  beginResearchPipelineRun,
   enqueueResearch,
+  endResearchPipelineRun,
   getJobStatus,
   getQueueStats,
   processResearchQueue,
@@ -55,6 +94,11 @@ import {
   buildWalletProfileLlmContext,
 } from './lib/chatPersona';
 import {
+  buildSemanticMemoryContext,
+  rememberSemanticMemory,
+} from './lib/semantic-memory';
+import { buildSemanticContinuationContext } from './lib/semantic-continuation';
+import {
   buildAnalystModelInput,
   buildWriterModelInput,
 } from './lib/reportInputs';
@@ -62,7 +106,17 @@ import { finalizeReportMarkdown } from './lib/reportPipeline';
 import { setWalletForUser } from './lib/walletStore';
 import { payProtectedResourceServer } from './lib/x402ServerClient';
 import { insertAgentToAgentLedger } from './lib/a2a-ledger';
-import { fetchAttributedArcBatcherGas } from './lib/arcBatcherGas';
+import { buildSemanticMemoryMetricsReport } from './lib/semantic-memory-metrics';
+import {
+  buildSemanticMemoryReviewCases,
+  buildSemanticMemoryReviewDataset,
+  saveSemanticMemoryReviewLabel,
+} from './lib/semantic-memory-review';
+import {
+  buildConversationReviewCases,
+  buildConversationReviewDataset,
+  saveConversationReviewLabel,
+} from './lib/conversation-review';
 import { getFacilitatorBaseUrl } from './lib/facilitator-url';
 import { scheduleChatToolPostA2a } from './lib/a2a-chat-scheduler';
 import { runInvoiceVendorResearchFollowup, runPortfolioFollowupAfterToolWithPayment } from './lib/a2a-followups';
@@ -80,22 +134,21 @@ import { detectWalletIntent } from './lib/orchestrator';
 import authApiRouter from './api/auth';
 import walletApiRouter from './api/wallet';
 import extensionApiRouter from './api/extension';
-import paymentsApiRouter from './api/payments';
 import businessApiRouter from './api/business';
 import payApiRouter, { fetchPayHistoryForBrain } from './api/pay';
-import marketplaceApiRouter, { CORE_AGENT_SPECS } from './api/marketplace';
+import agentStoreApiRouter from './api/agent-store';
+import agentEconomyLedgerApiRouter from './api/agent-economy-ledger';
 import portfolioApiRouter from './api/portfolio';
 import fundsApiRouter from './api/funds';
 import settingsApiRouter from './api/settings';
-import telegramApiRouter from './api/telegram';
 import emailWebhookRouter from './api/webhooks/email';
 import { authMiddleware, generateJWT, verifyJWT, type JWTPayload } from './lib/auth';
 import { getOrCreateUserAgentWallet } from './lib/dcw';
 import { loadAgentOwnerWallet } from './lib/agent-owner-wallet';
 import { readDailyUsageCap } from './lib/usageCaps';
 import { adminDb, getRedis } from './db/client';
-import { ARC } from './lib/arc-config';
 import { resolvePayee } from './lib/agentpay-payee';
+import { getPreferredAgentpayPaymentLinkHandle } from './lib/agentpay-registry';
 import { getTxStats, incrementTxCount } from './lib/tx-counter';
 import { getTreasuryStats, runTreasuryTopUp } from './lib/agent-treasury';
 import {
@@ -104,15 +157,34 @@ import {
   type CounterpartyRiskAssessment,
 } from './lib/counterparty-risk';
 import {
+  buildCapabilityThreadContext,
+  hasProductRoutingBypassSignals,
+  isNoiseOnlyChatProbe,
+  resolveCapabilityRoutingProbe,
+  shouldHandleAsAgentFlowCapabilityQuestion,
+  type CapabilityThreadContext,
+} from './lib/chatRouting';
+import {
+  formatAgentFlowCapabilityReply as formatSharedAgentFlowCapabilityReply,
+  formatAgentFlowDefinitionReply as formatSharedAgentFlowDefinitionReply,
+  formatAgentFlowHowItWorksReply as formatSharedAgentFlowHowItWorksReply,
+  isExplicitFullCapabilityRequest,
+} from './lib/agentflowProduct';
+import { answerProductQuestion } from './lib/product-rag';
+import { searchRag } from './lib/rag/search';
+import {
   canonicalRedisSessionId,
   clearPendingRedisKeys,
   getFirstPendingRedisValue,
   redisPendingExists,
 } from './lib/chatSessionRedis';
-import { getAgentFlowCircleStackSummary, listSupportedBridgeSourcesDetailed } from './agents/bridge/bridgeKit';
 import { CANONICAL_FUND_IDS } from './lib/funds-defaults';
-import { parseCSVBatch, parseInlineCsvFromMessage } from './lib/csv-batch-parser';
-import { executeUserPaidAgentViaX402 } from './lib/paidAgentX402';
+import { parseBatchPaymentsFromMessage, parseCSVBatch } from './lib/csv-batch-parser';
+import {
+  ensureUserPaidAgentLedger,
+  executeDcwPaidAgentViaX402,
+  executeUserPaidAgentViaX402,
+} from './lib/paidAgentX402';
 import {
   checkHttpHealth,
   deriveHealthUrlFromRunUrl,
@@ -123,6 +195,15 @@ import {
   formatPaidPortfolioAgentChatBody,
   formatPortfolioSnapshotRecordsForChat,
 } from './lib/format-portfolio-chat';
+import {
+  getMarketDetail as getPredmarketDetail,
+  listAllMarkets as listPredmarketMarkets,
+} from './lib/predmarket/router';
+import {
+  BRIDGE_SOURCE_DOMAIN,
+  parseSupportedBridgeSourceChain as detectSupportedBridgeSourceChain,
+  SUPPORTED_BRIDGE_SOURCES as SUPPORTED_BRIDGE_SOURCE_SUMMARY,
+} from './lib/bridge/supportedSources';
 type OrchestratorStep = 'research' | 'analyst' | 'writer';
 
 type ProxyEvent =
@@ -141,58 +222,120 @@ type ProxyEvent =
     }
   | { type: 'error'; message: string; step?: OrchestratorStep; status?: number };
 
-type DcwPaidAgentSlug = 'ascii' | 'swap' | 'vault' | 'portfolio' | 'vision' | 'transcribe';
-
-type EconomyBenchmarkEntry = {
-  tx: number;
-  amount: string;
-  agent: string;
-  txHash?: string;
-  status: 'success' | 'failed';
-  error?: string;
+type PipelineTimingTracePoint = {
+  label: string;
+  at_ms: number;
+  delta_ms: number;
+  meta?: Record<string, unknown>;
 };
 
-type EconomyBenchmarkResult = {
-  total_txs: number;
-  total_usdc: string;
-  gas_paid: string;
-  margin: string;
-  results: EconomyBenchmarkEntry[];
-  agents_covered: string[];
-  flows_completed: string[];
-  arc_tx_ids: string[];
-  breakdown: {
-    x402_payments: number;
-    a2a_payments: number;
-  };
-  arc_vs_eth: {
-    arc_cost: string;
-    eth_cost: string;
-    savings: string;
-  };
-  execution_wallet?: string;
-};
+type DcwPaidAgentSlug = 'swap' | 'vault' | 'portfolio' | 'vision' | 'transcribe';
 
-type EconomyBenchmarkJob = {
-  jobId: string;
-  walletAddress: Address;
-  status: 'queued' | 'running' | 'complete' | 'failed';
-  startedAt: string;
-  updatedAt: string;
-  completedAt: string | null;
-  progress: {
-    completed: number;
-    total: number;
-    successful: number;
-    failed: number;
-    currentAgent: string | null;
-  };
-  result: EconomyBenchmarkResult | null;
-  error: string | null;
-};
+
+function listSupportedBridgeSourcesDetailed() {
+  return SUPPORTED_BRIDGE_SOURCE_SUMMARY.map((source) => ({
+    ...source,
+    domain: BRIDGE_SOURCE_DOMAIN[source.key],
+  }));
+}
+
+function listSupportedBridgeSourceLabels(): string {
+  return listSupportedBridgeSourcesDetailed().map((source) => source.label).join(', ');
+}
+
+function formatBridgeExecutionReply(): string {
+  return [
+    'Bridge to Arc starts from your connected wallet on the source chain.',
+    '',
+    'Pick a supported source chain, review the bridge, approve USDC if needed, and sign the source-chain transaction from that wallet.',
+    'After that, AgentFlow completes the Arc receive step and delivers USDC into your AgentFlow wallet on Arc.',
+  ].join('\n');
+}
+
+function buildBridgeChoiceQuickActionGroups() {
+  return [
+    {
+      title: 'Bridge to Arc',
+      actions: [
+        {
+          label: 'Show my funded chains',
+          prompt: 'which bridge source chains have USDC and gas',
+        },
+      ],
+    },
+  ];
+}
+
+function formatBridgeOverviewReply(): string {
+  return [
+    'Bridge to Arc moves USDC from a supported source chain into your AgentFlow wallet on Arc.',
+    '',
+    'The important choice is the source chain: use a supported chain where your connected wallet already has USDC and enough gas to sign the source-chain transaction.',
+    '',
+    'If you want, I can show the supported chains where this wallet already has USDC so you can pick one quickly.',
+  ].join('\n');
+}
+
+function formatBridgeSourcesReply(): string {
+  return [
+    `Supported bridge source chains: ${listSupportedBridgeSourceLabels()}.`,
+    '',
+    'The best source is usually the supported chain where your connected wallet already has USDC and enough native gas.',
+    'If you want, I can also show the supported chains where this wallet already has USDC so you can choose faster.',
+  ].join('\n');
+}
+
+function isBridgeSpecificChainSelectionPrompt(message: string): boolean {
+  return /\b(?:i\s+(?:already\s+)?have|use|pick|choose)\s+(?:a\s+)?(?:specific\s+)?source\s+chain\b/i.test(
+    message,
+  );
+}
+
+function formatSwapOverviewReply(): string {
+  return [
+    'AgentFlow can quote and swap between USDC and EURC on Arc.',
+    '',
+    'The normal flow is: get a live quote, review it, then reply YES to execute.',
+    'Say "swap 1 USDC to EURC" to get a live quote, or "swap 1 EURC to USDC" for the reverse direction.',
+  ].join('\n');
+}
+
+function formatVaultOverviewReply(): string {
+  return [
+    'AgentFlow currently supports these integrated vault options on Arc:',
+    '- Lunex USDC Vault',
+    '- Lunex EURC Vault',
+    '',
+    'Choose one below and I can help you deposit, or ask for your vault positions if you already have funds there.',
+  ].join('\n');
+}
+
+function getAgentFlowCircleStackSummary(): string {
+  const supported = listSupportedBridgeSourcesDetailed()
+    .map((source) => `- ${source.label} (${source.key}, CCTP domain ${source.domain})`)
+    .join('\n');
+
+  return [
+    'AgentFlow current Circle stack:',
+    '',
+    '- AgentPay for send/request/split/batch/schedule flows.',
+    '- Arc execution wallets and Gateway balance tracking.',
+    '- Swap, provider vault, and prediction market flows executed from user AgentFlow wallets.',
+    '- Native Circle bridge flow with user-EOA signing on the source chain and forwarding into the AgentFlow wallet on Arc.',
+    '',
+    'Supported bridge source chains:',
+    supported,
+  ].join('\n');
+}
 
 const NETWORK_NAME = 'Arc Testnet';
 const CHAIN_ID = 5042002;
+const RESEARCH_TIMING_TRACE = /^(1|true|yes|on)$/i.test(
+  String(process.env.RESEARCH_TIMING_TRACE || '').trim(),
+);
+const isFeatureEnabled = (name: string): boolean =>
+  /^(1|true|yes|on)$/i.test(String(process.env[name] ?? '').trim());
+const fundsFeatureEnabled = () => isFeatureEnabled('AGENTFLOW_FEATURE_FUNDS');
 const ARC_TESTNET_DOMAIN = Number(process.env.GATEWAY_DOMAIN || 26);
 const GATEWAY_API_BASE_URL =
   process.env.GATEWAY_API_BASE_URL || 'https://gateway-api-testnet.circle.com/v1';
@@ -205,77 +348,6 @@ const WRITER_PORT = Number(process.env.WRITER_AGENT_PORT || 3003);
 const VISION_PORT = Number(process.env.VISION_AGENT_PORT || 3016);
 const TRANSCRIBE_PORT = Number(process.env.TRANSCRIBE_AGENT_PORT || 3017);
 const PUBLIC_PORT = Number(process.env.PORT || 4000);
-const ECONOMY_BENCHMARK_TARGET = 60;
-const ECONOMY_BENCHMARK_DELAY_MS = 500;
-const economyBenchmarkJobs = new Map<string, EconomyBenchmarkJob>();
-const ECONOMY_ARC_FALLBACK_GAS_PER_TX_USD = Number.parseFloat(
-  process.env.ECONOMY_ARC_FALLBACK_GAS_PER_TX_USD || '0.000001',
-);
-const ECONOMY_ETHEREUM_GAS_PER_TX_USD = Number.parseFloat(
-  process.env.BENCHMARK_ETHEREUM_GAS_PER_TX_USD || '2.50',
-);
-const ARC_RECEIPT_GAS_CACHE = new Map<
-  string,
-  {
-    gasUsd: number;
-    fetchedAt: number;
-  }
->();
-const ARC_RECEIPT_GAS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const arcPublicClient = createPublicClient({
-  transport: http(ARC.alchemyRpc || ARC.rpc),
-});
-
-const BENCHMARK_RECIPIENT_A = '0x4C37a02d40F3Ce6D4753D5E0622bAF1643DBE65c' as Address;
-const BENCHMARK_RECIPIENT_B = '0xb82AE74138acdcd2045b66984990EED0559Ec769' as Address;
-const BENCHMARK_ARC_USDC = getAddress(
-  process.env.ARC_USDC_ADDRESS?.trim() || '0x3600000000000000000000000000000000000000',
-);
-const BENCHMARK_SWAP_TOKEN_OUT = getAddress(
-  process.env.SWAP_PAIR_TOKEN_ADDRESS?.trim() || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
-);
-
-const BENCHMARK_AGENT_PRICES: Record<string, number> = {
-  research: Number.parseFloat(process.env.RESEARCH_AGENT_PRICE || '0.02'),
-  analyst: Number.parseFloat(process.env.ANALYST_AGENT_PRICE || '0.003'),
-  writer: Number.parseFloat(process.env.WRITER_AGENT_PRICE || '0.008'),
-  swap: Number.parseFloat(process.env.SWAP_AGENT_PRICE || '0.005'),
-  vault: Number.parseFloat(process.env.VAULT_AGENT_PRICE || '0.005'),
-  bridge: Number.parseFloat(process.env.BRIDGE_AGENT_PRICE || '0.005'),
-  portfolio: Number.parseFloat(process.env.PORTFOLIO_AGENT_PRICE || '0.003'),
-  invoice: Number.parseFloat(process.env.INVOICE_AGENT_PRICE || '0.005'),
-  vision: Number.parseFloat(process.env.VISION_AGENT_PRICE || '0.01'),
-  transcribe: Number.parseFloat(process.env.TRANSCRIBE_AGENT_PRICE || '0.008'),
-  schedule: Number.parseFloat(process.env.SCHEDULE_AGENT_PRICE || '0.003'),
-  split: Number.parseFloat(process.env.SPLIT_AGENT_PRICE || '0.003'),
-  batch: Number.parseFloat(process.env.BATCH_AGENT_PRICE || '0.003'),
-  ascii: Number.parseFloat(process.env.ASCII_AGENT_PRICE || '0.001'),
-};
-
-type BenchmarkTxKind = 'x402_payment' | 'a2a_payment';
-
-type BenchmarkFlowDefinition = {
-  name: string;
-  runs: number;
-  run: (ctx: BenchmarkRunContext, runIndex: number) => Promise<BenchmarkFlowRunResult>;
-};
-
-type BenchmarkFlowRunResult = {
-  entries: EconomyBenchmarkEntry[];
-  x402Count: number;
-  a2aCount: number;
-  totalUsdc: number;
-  coveredAgents: string[];
-  arcTxIds: string[];
-};
-
-type BenchmarkRunContext = {
-  jobId: string;
-  userWallet: Address;
-  internalKey: string;
-  healthFailures: Set<string>;
-  flowExecutions: string[];
-};
 
 /** Split deploy (e.g. Railway): set FACILITATOR_URL or FACILITATOR_PORT; must match agents — see lib/facilitator-url.ts */
 const FACILITATOR_URL = getFacilitatorBaseUrl();
@@ -291,10 +363,6 @@ const WRITER_URL = resolveAgentRunUrl(
   process.env.WRITER_AGENT_URL?.trim(),
   `http://127.0.0.1:${WRITER_PORT}/run`,
 );
-const ASCII_URL = resolveAgentRunUrl(
-  process.env.ASCII_AGENT_URL?.trim(),
-  `http://127.0.0.1:${PUBLIC_PORT}/agent/ascii/run`,
-);
 const SWAP_URL = resolveAgentRunUrl(
   process.env.SWAP_AGENT_URL?.trim(),
   'http://127.0.0.1:3011/run',
@@ -305,7 +373,7 @@ const VAULT_URL = resolveAgentRunUrl(
 );
 const BRIDGE_URL = resolveAgentRunUrl(
   process.env.BRIDGE_AGENT_URL?.trim(),
-  'http://127.0.0.1:3013/run',
+  'http://127.0.0.1:3021/run',
 );
 const PORTFOLIO_URL = resolveAgentRunUrl(
   process.env.PORTFOLIO_AGENT_URL?.trim(),
@@ -328,6 +396,95 @@ const SPLIT_AGENT_BASE_URL =
 const BATCH_PORT = Number(process.env.BATCH_AGENT_PORT || 3020);
 const BATCH_AGENT_BASE_URL =
   process.env.BATCH_AGENT_URL?.trim() || `http://127.0.0.1:${BATCH_PORT}`;
+const INTENT_ROUTER_ENABLED = /^true$/i.test(process.env.INTENT_ROUTER_ENABLED || '');
+const FASTPATH_EXECUTION_CONFIDENCE = Number.parseFloat(
+  process.env.FASTPATH_EXECUTION_CONFIDENCE || '0.86',
+);
+const FASTPATH_EXECUTION_POLICY = {
+  contacts: {
+    [AgentFlowIntentName.ContactsList]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_CONTACTS_LIST || '0.8',
+    ),
+    [AgentFlowIntentName.ContactsCreate]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_CONTACTS_CREATE || '0.84',
+    ),
+    [AgentFlowIntentName.ContactsUpdate]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_CONTACTS_UPDATE || '0.88',
+    ),
+    [AgentFlowIntentName.ContactsDelete]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_CONTACTS_DELETE || '0.9',
+    ),
+  },
+  schedule: {
+    [AgentFlowIntentName.ScheduleCreate]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_SCHEDULE_CREATE || '0.9',
+    ),
+    [AgentFlowIntentName.ScheduleCancel]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_SCHEDULE_CANCEL || '0.9',
+    ),
+    [AgentFlowIntentName.ScheduleList]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_SCHEDULE_LIST || '0.84',
+    ),
+  },
+  agentpay: {
+    [AgentFlowIntentName.AgentpayHistory]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_AGENTPAY_HISTORY || '0.8',
+    ),
+    [AgentFlowIntentName.AgentpayPaymentLink]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_PAYMENT_LINK || '0.88',
+    ),
+  },
+  execution: {
+    [AgentFlowIntentName.BatchExecute]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_BATCH_EXECUTE || '0.92',
+    ),
+    [AgentFlowIntentName.SplitExecute]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_SPLIT_EXECUTE || '0.92',
+    ),
+  },
+  invoices: {
+    [AgentFlowIntentName.InvoiceCreate]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_INVOICE_CREATE || '0.9',
+    ),
+    [AgentFlowIntentName.InvoiceStatus]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_INVOICE_STATUS || '0.84',
+    ),
+  },
+  research: {
+    [AgentFlowIntentName.ResearchReport]: Number.parseFloat(
+      process.env.FASTPATH_CONFIDENCE_RESEARCH_REPORT || '0.93',
+    ),
+  },
+} as const;
+const FASTPATH_EXECUTION_CONFIDENCE_BY_INTENT: Partial<Record<AgentFlowIntentName, number>> = {
+  ...FASTPATH_EXECUTION_POLICY.contacts,
+  ...FASTPATH_EXECUTION_POLICY.schedule,
+  ...FASTPATH_EXECUTION_POLICY.agentpay,
+  ...FASTPATH_EXECUTION_POLICY.execution,
+  ...FASTPATH_EXECUTION_POLICY.invoices,
+  ...FASTPATH_EXECUTION_POLICY.research,
+};
+const STRICT_ROUTER_APPROVAL_INTENTS = new Set<AgentFlowIntentName>([
+  AgentFlowIntentName.ContactsList,
+  AgentFlowIntentName.ContactsCreate,
+  AgentFlowIntentName.ContactsUpdate,
+  AgentFlowIntentName.ContactsDelete,
+  AgentFlowIntentName.ScheduleCreate,
+  AgentFlowIntentName.ScheduleCancel,
+  AgentFlowIntentName.ScheduleList,
+  AgentFlowIntentName.AgentpayHistory,
+  AgentFlowIntentName.AgentpayPaymentLink,
+  AgentFlowIntentName.BatchExecute,
+  AgentFlowIntentName.SplitExecute,
+  AgentFlowIntentName.InvoiceCreate,
+  AgentFlowIntentName.InvoiceStatus,
+  AgentFlowIntentName.ResearchReport,
+]);
+
+function getFastpathExecutionConfidenceThreshold(intent: AgentFlowIntentName): number {
+  const threshold = FASTPATH_EXECUTION_CONFIDENCE_BY_INTENT[intent];
+  return Number.isFinite(threshold) ? Number(threshold) : FASTPATH_EXECUTION_CONFIDENCE;
+}
 const INVOICE_PORT = Number(process.env.INVOICE_AGENT_PORT || 3015);
 const INVOICE_AGENT_BASE_URL =
   process.env.INVOICE_AGENT_URL?.trim() || `http://127.0.0.1:${INVOICE_PORT}`;
@@ -353,6 +510,57 @@ function internalOrAuthMiddleware(req: Request, res: Response, next: NextFunctio
   authMiddleware(req, res, next);
 }
 
+function parseInternalAdminWallets(): Set<string> {
+  return new Set(
+    String(process.env.INTERNAL_ADMIN_WALLETS ?? '')
+      .split(',')
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+function isLoopbackAddress(value: string | undefined): boolean {
+  const normalized = String(value ?? '').trim();
+  return (
+    normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === '::ffff:127.0.0.1' ||
+    normalized === 'localhost'
+  );
+}
+
+function isLocalAdminBypassAllowed(req: Request): boolean {
+  if (!/^true$/i.test(String(process.env.INTERNAL_ADMIN_BYPASS_LOCAL ?? '').trim())) {
+    return false;
+  }
+
+  const forwardedFor = String(req.headers['x-forwarded-for'] ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const remoteIp = req.ip || req.socket.remoteAddress || '';
+
+  return [remoteIp, ...forwardedFor].every((value) => isLoopbackAddress(value));
+}
+
+function adminAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
+  if (isLocalAdminBypassAllowed(req)) {
+    next();
+    return;
+  }
+
+  authMiddleware(req, res, () => {
+    const auth = (req as any).auth as JWTPayload | undefined;
+    const walletAddress = auth?.walletAddress?.trim().toLowerCase();
+    const allowlist = parseInternalAdminWallets();
+    if (!walletAddress || !allowlist.size || !allowlist.has(walletAddress)) {
+      res.status(403).json({ error: 'Admin access required' });
+      return;
+    }
+    next();
+  });
+}
+
 const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS || 80_000);
 const RESEARCH_AGENT_TIMEOUT_MS = Number(
   process.env.RESEARCH_AGENT_TIMEOUT_MS || 140_000,
@@ -363,7 +571,19 @@ const ANALYST_AGENT_TIMEOUT_MS = Number(
 const WRITER_AGENT_TIMEOUT_MS = Number(
   process.env.WRITER_AGENT_TIMEOUT_MS || AGENT_TIMEOUT_MS,
 );
-const LIVE_DATA_TIMEOUT_MS = Number(process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS || 45_000);
+const LIVE_DATA_TIMEOUT_MS_DEFAULT = Number(process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS || 45_000);
+const LIVE_DATA_TIMEOUT_MS_FORECASTING = Number(
+  process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS_FORECASTING || 120_000,
+);
+const LIVE_DATA_TIMEOUT_MS_NICHE_PROTOCOL = Number(
+  process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS_NICHE_PROTOCOL || 90_000,
+);
+const LIVE_DATA_TIMEOUT_MS_CREATOR_AUDIENCE = Number(
+  process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS_CREATOR_AUDIENCE || 90_000,
+);
+const LIVE_DATA_TIMEOUT_MS_CURRENT_EVENTS = Number(
+  process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS_CURRENT_EVENTS || 60_000,
+);
 const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15_000);
 const AGENT_JSON_LIMIT = process.env.AGENT_JSON_LIMIT?.trim() || '20mb';
 
@@ -378,7 +598,6 @@ const pendingEmergencyWithdrawConfirmations = new Map<string, number>();
 const researchPrice = parsePrice(process.env.RESEARCH_AGENT_PRICE, '0.005');
 const analystPrice = parsePrice(process.env.ANALYST_AGENT_PRICE, '0.003');
 const writerPrice = parsePrice(process.env.WRITER_AGENT_PRICE, '0.008');
-const asciiPrice = parsePrice(process.env.ASCII_AGENT_PRICE, '0.001');
 const portfolioPrice = parsePrice(process.env.PORTFOLIO_AGENT_PRICE, '0.015');
 const swapPrice = parsePrice(process.env.SWAP_AGENT_PRICE, '0.010');
 const vaultPrice = parsePrice(process.env.VAULT_AGENT_PRICE, '0.012');
@@ -435,1264 +654,6 @@ function parseAmount(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function isArcTransactionHash(value: unknown): value is `0x${string}` {
-  return typeof value === 'string' && /^0x[a-fA-F0-9]{64}$/.test(value);
-}
-
-function formatUsdMicro(value: number, digits = 8): string {
-  const safe = Number.isFinite(value) ? value : 0;
-  return `$${safe.toFixed(digits)}`;
-}
-
-function formatPercent(value: number, digits = 4): string {
-  const safe = Number.isFinite(value) ? value : 0;
-  return `${safe.toFixed(digits)}%`;
-}
-
-function computeNetMarginPercent(totalUsdc: number, gasPaidUsd: number): number {
-  if (!Number.isFinite(totalUsdc) || totalUsdc <= 0) {
-    return 0;
-  }
-  const retained = Math.max(0, totalUsdc - Math.max(0, gasPaidUsd));
-  return (retained / totalUsdc) * 100;
-}
-
-async function sumCompletedTransactionAmounts(): Promise<number> {
-  const pageSize = 1000;
-  let offset = 0;
-  let total = 0;
-
-  while (true) {
-    const { data, error } = await adminDb
-      .from('transactions')
-      .select('amount')
-      .eq('status', 'complete')
-      .order('created_at', { ascending: true })
-      .order('id', { ascending: true })
-      .range(offset, offset + pageSize - 1);
-
-    if (error) {
-      throw new Error(error.message);
-    }
-
-    if (!data?.length) {
-      break;
-    }
-
-    for (const tx of data) {
-      total += parseAmount(tx.amount);
-    }
-
-    if (data.length < pageSize) {
-      break;
-    }
-
-    offset += pageSize;
-  }
-
-  return total;
-}
-
-function buildArcVsEthereumStats(
-  arcGasPaidUsd: number,
-  txCount: number,
-): {
-  arc_gas_per_tx: string;
-  ethereum_gas_per_tx: string;
-  savings_multiplier: string;
-  min_viable_payment_arc: string;
-  min_viable_payment_eth: string;
-} {
-  const arcPerTx = txCount > 0 ? arcGasPaidUsd / txCount : 0;
-  const ethPerTx =
-    Number.isFinite(ECONOMY_ETHEREUM_GAS_PER_TX_USD) && ECONOMY_ETHEREUM_GAS_PER_TX_USD > 0
-      ? ECONOMY_ETHEREUM_GAS_PER_TX_USD
-      : 2.5;
-  if (arcPerTx <= 0) {
-    return {
-      arc_gas_per_tx: 'Awaiting gas data',
-      ethereum_gas_per_tx: formatUsdMicro(ethPerTx, 2),
-      savings_multiplier: 'n/a',
-      min_viable_payment_arc: 'Awaiting gas data',
-      min_viable_payment_eth: `${formatUsdMicro(ethPerTx, 2)}+`,
-    };
-  }
-
-  const savingsMultiplier =
-    Number.isFinite(ethPerTx) ? ethPerTx / arcPerTx : 0;
-
-  return {
-    arc_gas_per_tx: formatUsdMicro(arcPerTx),
-    ethereum_gas_per_tx: formatUsdMicro(ethPerTx, 2),
-    savings_multiplier:
-      savingsMultiplier > 0
-        ? `${savingsMultiplier.toLocaleString('en-US', { maximumFractionDigits: 0 })}x`
-        : 'n/a',
-    min_viable_payment_arc: formatUsdMicro(arcPerTx),
-    min_viable_payment_eth: `${formatUsdMicro(ethPerTx, 2)}+`,
-  };
-}
-
-function shouldCountFallbackArcGas(tx: {
-  arc_tx_id?: string | null;
-  payment_rail?: string | null;
-  action_type?: string | null;
-}): boolean {
-  if (isArcTransactionHash(tx.arc_tx_id)) {
-    return false;
-  }
-
-  const rail = String(tx.payment_rail || '').toLowerCase();
-  const action = String(tx.action_type || '').toLowerCase();
-  return (
-    rail === 'gateway_batched' ||
-    rail === 'x402/gateway' ||
-    action === 'x402_payment' ||
-    action === 'agent_to_agent_payment'
-  );
-}
-
-async function estimateArcGasPaidUsd(
-  txHashes: Array<string | null | undefined>,
-): Promise<{ totalUsd: number; countedTxs: number }> {
-  const uniqueTxHashes = [...new Set(txHashes.filter(isArcTransactionHash))];
-  if (!uniqueTxHashes.length) {
-    return { totalUsd: 0, countedTxs: 0 };
-  }
-
-  let totalUsd = 0;
-  let countedTxs = 0;
-  const now = Date.now();
-
-  await Promise.all(
-    uniqueTxHashes.map(async (txHash) => {
-      const cached = ARC_RECEIPT_GAS_CACHE.get(txHash);
-      if (cached && now - cached.fetchedAt < ARC_RECEIPT_GAS_CACHE_TTL_MS) {
-        totalUsd += cached.gasUsd;
-        countedTxs += 1;
-        return;
-      }
-
-      try {
-        const receipt = await arcPublicClient.getTransactionReceipt({
-          hash: txHash,
-        });
-        const effectiveGasPrice =
-          'effectiveGasPrice' in receipt && typeof receipt.effectiveGasPrice === 'bigint'
-            ? receipt.effectiveGasPrice
-            : 'gasPrice' in receipt && typeof receipt.gasPrice === 'bigint'
-              ? receipt.gasPrice
-              : null;
-        if (effectiveGasPrice == null) {
-          return;
-        }
-
-        const gasUsd = Number(formatUnits(receipt.gasUsed * effectiveGasPrice, 18));
-        if (!Number.isFinite(gasUsd)) {
-          return;
-        }
-
-        ARC_RECEIPT_GAS_CACHE.set(txHash, {
-          gasUsd,
-          fetchedAt: now,
-        });
-        totalUsd += gasUsd;
-        countedTxs += 1;
-      } catch (error) {
-        console.warn('[economy] receipt gas lookup skipped:', txHash, getErrorMessage(error));
-      }
-    }),
-  );
-
-  return { totalUsd, countedTxs };
-}
-
-function serializeEconomyBenchmarkJob(job: EconomyBenchmarkJob) {
-  return {
-    jobId: job.jobId,
-    status: job.status,
-    walletAddress: job.walletAddress,
-    startedAt: job.startedAt,
-    updatedAt: job.updatedAt,
-    completedAt: job.completedAt,
-    progress: job.progress,
-    result: job.result,
-    error: job.error,
-  };
-}
-
-function updateEconomyBenchmarkJob(
-  jobId: string,
-  updater: (job: EconomyBenchmarkJob) => EconomyBenchmarkJob,
-): EconomyBenchmarkJob | null {
-  const existing = economyBenchmarkJobs.get(jobId);
-  if (!existing) {
-    return null;
-  }
-  const next = updater(existing);
-  economyBenchmarkJobs.set(jobId, next);
-  return next;
-}
-
-function benchmarkAgentPrice(slug: string): number {
-  const value = BENCHMARK_AGENT_PRICES[slug];
-  return Number.isFinite(value) ? value : 0;
-}
-
-function buildBenchmarkAuthHeaders(
-  internalKey: string,
-  walletAddress: Address,
-  paid = false,
-): Record<string, string> {
-  return {
-    'Content-Type': 'application/json',
-    [paid ? 'x-agentflow-paid-internal' : 'x-agentflow-brain-internal']: internalKey,
-    Authorization: `Bearer ${generateJWT(walletAddress)}`,
-  };
-}
-
-function benchmarkProgressTotal(): number {
-  return 60;
-}
-
-async function benchmarkDelay(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ECONOMY_BENCHMARK_DELAY_MS));
-}
-
-function asBenchmarkEntry(
-  tx: number,
-  agent: string,
-  amount: number,
-  status: 'success' | 'failed',
-  options?: { txHash?: string | null; error?: string },
-): EconomyBenchmarkEntry {
-  return {
-    tx,
-    agent,
-    amount: amount.toFixed(3),
-    status,
-    ...(options?.txHash ? { txHash: options.txHash } : {}),
-    ...(options?.error ? { error: options.error } : {}),
-  };
-}
-
-function normalizeBenchmarkArcTxId(value: unknown): string | null {
-  if (typeof value === 'string' && /^0x[a-fA-F0-9]{64}$/.test(value)) {
-    return value;
-  }
-  return null;
-}
-
-function extractBenchmarkArcTxIds(payload: unknown): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-
-  const visit = (value: unknown) => {
-    const txId = normalizeBenchmarkArcTxId(value);
-    if (txId) {
-      if (!seen.has(txId)) {
-        seen.add(txId);
-        out.push(txId);
-      }
-      return;
-    }
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        visit(item);
-      }
-      return;
-    }
-    if (value && typeof value === 'object') {
-      for (const nested of Object.values(value as Record<string, unknown>)) {
-        visit(nested);
-      }
-    }
-  };
-
-  visit(payload);
-  return out;
-}
-
-async function logBenchmarkPayment(
-  agentSlug: string,
-  userWallet: Address,
-  agentPrice: number,
-  requestId: string,
-): Promise<void> {
-  const { data: existing, error: existingError } = await adminDb
-    .from('transactions')
-    .select('id')
-    .eq('action_type', 'x402_payment')
-    .eq('buyer_agent', 'benchmark_user')
-    .eq('seller_agent', agentSlug)
-    .eq('request_id', requestId)
-    .limit(1)
-    .maybeSingle();
-
-  if (existingError) {
-    console.warn(`[benchmark] payment lookup failed for ${agentSlug}:`, existingError.message);
-  }
-  if (existing?.id) {
-    return;
-  }
-
-  const agentWallet = await loadAgentOwnerWallet(agentSlug);
-  const { error } = await adminDb.from('transactions').insert({
-    from_wallet: userWallet,
-    to_wallet: agentWallet.address,
-    amount: agentPrice,
-    action_type: 'x402_payment',
-    payment_rail: 'gateway_batched',
-    remark: `Benchmark x402: ${agentSlug} agent call`,
-    buyer_agent: 'benchmark_user',
-    seller_agent: agentSlug,
-    request_id: requestId,
-    status: 'complete',
-    agent_slug: agentSlug,
-  });
-
-  if (error) {
-    throw new Error(`[benchmark] failed to log x402 payment for ${agentSlug}: ${error.message}`);
-  }
-}
-
-async function logBenchmarkA2APayment(
-  buyerAgent: string,
-  sellerAgent: string,
-  amount: number,
-  requestId: string,
-): Promise<void> {
-  const buyerWallet = await loadAgentOwnerWallet(buyerAgent);
-  const sellerWallet = await loadAgentOwnerWallet(sellerAgent);
-  const result = await insertAgentToAgentLedger({
-    fromWallet: buyerWallet.address,
-    toWallet: sellerWallet.address,
-    amount,
-    remark: `Benchmark A2A: ${buyerAgent} -> ${sellerAgent}`,
-    agentSlug: sellerAgent,
-    buyerAgent,
-    sellerAgent,
-    requestId,
-    context: `benchmark:${buyerAgent}->${sellerAgent}`,
-  });
-
-  if (!result.ok) {
-    throw new Error(`[benchmark] failed to log a2a ${buyerAgent}->${sellerAgent}: ${result.error}`);
-  }
-}
-
-async function benchmarkPostJson<TResponse>(
-  input: {
-    slug: string;
-    url: string;
-    walletAddress: Address;
-    internalKey: string;
-    body: Record<string, unknown>;
-    paid?: boolean;
-  },
-): Promise<TResponse> {
-  const response = await fetch(input.url, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-    headers: buildBenchmarkAuthHeaders(input.internalKey, input.walletAddress, input.paid),
-    body: JSON.stringify({
-      benchmark: true,
-      ...input.body,
-      walletAddress: input.walletAddress,
-    }),
-  });
-
-  const text = await response.text();
-  let parsed: unknown = null;
-  try {
-    parsed = text ? JSON.parse(text) : null;
-  } catch {
-    parsed = text;
-  }
-
-  if (!response.ok) {
-    const errorMessage =
-      parsed && typeof parsed === 'object' && 'error' in (parsed as Record<string, unknown>)
-        ? String((parsed as Record<string, unknown>).error)
-        : typeof parsed === 'string' && parsed.trim()
-          ? parsed.trim()
-          : `HTTP ${response.status}`;
-    throw new Error(`[benchmark:${input.slug}] ${errorMessage}`);
-  }
-
-  return (parsed ?? {}) as TResponse;
-}
-
-async function benchmarkPostSseDone(
-  input: {
-    slug: string;
-    url: string;
-    walletAddress: Address;
-    internalKey: string;
-    body: Record<string, unknown>;
-    paid?: boolean;
-  },
-): Promise<Record<string, unknown>> {
-  const response = await fetch(input.url, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-    headers: buildBenchmarkAuthHeaders(input.internalKey, input.walletAddress, input.paid),
-    body: JSON.stringify({
-      benchmark: true,
-      ...input.body,
-      walletAddress: input.walletAddress,
-    }),
-  });
-
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`[benchmark:${input.slug}] ${raw || `HTTP ${response.status}`}`);
-  }
-
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-    try {
-      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-      return parsed;
-    } catch {
-      // Fall through to SSE parsing.
-    }
-  }
-
-  const events = raw
-    .split('\n\n')
-    .map((chunk) => chunk.trim())
-    .filter(Boolean)
-    .map((chunk) => {
-      const lines = chunk.split('\n');
-      const event = lines.find((line) => line.startsWith('event:'))?.slice('event:'.length).trim();
-      const dataLine = lines.find((line) => line.startsWith('data:'))?.slice('data:'.length).trim();
-      let data: unknown = {};
-      if (dataLine) {
-        try {
-          data = JSON.parse(dataLine);
-        } catch {
-          data = { raw: dataLine };
-        }
-      }
-      return { event, data };
-    });
-
-  const done = events.reverse().find((entry) => entry.event === 'done');
-  if (!done || !done.data || typeof done.data !== 'object') {
-    throw new Error(`[benchmark:${input.slug}] missing done event`);
-  }
-  return done.data as Record<string, unknown>;
-}
-
-function isBenchmarkRateLimitError(error: unknown): boolean {
-  const message = getErrorMessage(error).toLowerCase();
-  return (
-    message.includes('too many requests') ||
-    message.includes('compute units per second capacity') ||
-    message.includes('throughput') ||
-    message.includes('rate limit') ||
-    message.includes('429')
-  );
-}
-
-async function benchmarkRetryDelay(attempt: number): Promise<void> {
-  const delayMs = 1_000 * attempt;
-  await new Promise((resolve) => setTimeout(resolve, delayMs));
-}
-
-async function ensureBenchmarkAgentHealthy(
-  ctx: BenchmarkRunContext,
-  slug: string,
-  customPort?: number,
-): Promise<boolean> {
-  const resolvedPort = customPort ?? AGENT_DEFAULT_PORTS[slug];
-  let healthy = false;
-  if (slug === 'ascii') {
-    const check = await checkHttpHealth(`http://127.0.0.1:${PUBLIC_PORT}/agent/ascii/health`, 2_000);
-    healthy = check.ok;
-  } else if (typeof resolvedPort === 'number') {
-    const check = await checkHttpHealth(`http://127.0.0.1:${resolvedPort}/health`, 2_000);
-    healthy = check.ok;
-  } else {
-    healthy = await isAgentHealthy(slug);
-  }
-
-  if (!healthy) {
-    ctx.healthFailures.add(slug);
-    console.warn(`[benchmark] ${slug} not healthy, skipping`);
-  }
-  return healthy;
-}
-
-function makeTinyVisionAttachment(runIndex: number): Record<string, unknown> {
-  const text = `Benchmark vision payload ${runIndex + 1}`;
-  return {
-    name: `benchmark-${runIndex + 1}.txt`,
-    mimeType: 'text/plain',
-    size: Buffer.byteLength(text),
-    dataUrl: `data:text/plain;base64,${Buffer.from(text, 'utf8').toString('base64')}`,
-  };
-}
-
-function makeTinyAudioPayload(runIndex: number): Record<string, unknown> {
-  const wavBase64 = 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
-  return {
-    name: `benchmark-${runIndex + 1}.wav`,
-    mimeType: 'audio/wav',
-    size: Buffer.from(wavBase64, 'base64').length,
-    dataUrl: `data:audio/wav;base64,${wavBase64}`,
-  };
-}
-
-async function executeBenchmarkAgentCall(
-  ctx: BenchmarkRunContext,
-  txNumber: number,
-  input: {
-    slug: string;
-    amount?: number;
-    body: Record<string, unknown>;
-    url?: string;
-    paid?: boolean;
-    kind?: BenchmarkTxKind;
-    buyerAgent?: string;
-    skipHealthCheck?: boolean;
-    sse?: boolean;
-  },
-): Promise<BenchmarkFlowRunResult> {
-  const slug = input.slug;
-  const agentPrice = input.amount ?? benchmarkAgentPrice(slug);
-  const requestId = `benchmark_${slug}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const paidSlugs = new Set(['swap', 'vault', 'bridge', 'invoice']);
-  const usePaidHeader = input.paid ?? paidSlugs.has(slug);
-  const url = input.url
-    ?? ({
-      research: RESEARCH_URL,
-      analyst: ANALYST_URL,
-      writer: WRITER_URL,
-      swap: SWAP_URL,
-      vault: VAULT_URL,
-      bridge: BRIDGE_URL,
-      portfolio: PORTFOLIO_URL,
-      invoice: `${INVOICE_AGENT_BASE_URL}/run`,
-      vision: VISION_URL,
-      transcribe: TRANSCRIBE_URL,
-      schedule: `${SCHEDULE_AGENT_BASE_URL}/run`,
-      split: `${SPLIT_AGENT_BASE_URL}/run`,
-      batch: `${BATCH_AGENT_BASE_URL}/run`,
-      ascii: ASCII_URL,
-    } as Record<string, string>)[slug];
-
-  if (!url) {
-    return {
-      entries: [asBenchmarkEntry(txNumber, slug, agentPrice, 'failed', { error: 'Missing benchmark URL' })],
-      x402Count: 0,
-      a2aCount: 0,
-      totalUsdc: 0,
-      coveredAgents: [],
-      arcTxIds: [],
-    };
-  }
-
-  if (!input.skipHealthCheck) {
-    const healthy = await ensureBenchmarkAgentHealthy(ctx, slug);
-    if (!healthy) {
-      return {
-        entries: [asBenchmarkEntry(txNumber, slug, agentPrice, 'failed', { error: 'Health check failed' })],
-        x402Count: 0,
-        a2aCount: 0,
-        totalUsdc: 0,
-        coveredAgents: [],
-        arcTxIds: [],
-      };
-    }
-  }
-
-  if (slug === 'portfolio') {
-    if (input.kind === 'a2a_payment') {
-      await logBenchmarkA2APayment(
-        input.buyerAgent || 'benchmark_user',
-        slug,
-        agentPrice,
-        requestId,
-      );
-      return {
-        entries: [asBenchmarkEntry(txNumber, slug, agentPrice, 'success')],
-        x402Count: 0,
-        a2aCount: 1,
-        totalUsdc: agentPrice,
-        coveredAgents: [slug, ...(input.buyerAgent ? [input.buyerAgent] : [])],
-        arcTxIds: [],
-      };
-    }
-
-    await logBenchmarkPayment(slug, ctx.userWallet, agentPrice, requestId);
-    return {
-      entries: [asBenchmarkEntry(txNumber, slug, agentPrice, 'success')],
-      x402Count: 1,
-      a2aCount: 0,
-      totalUsdc: agentPrice,
-      coveredAgents: [slug],
-      arcTxIds: [],
-    };
-  }
-
-  updateEconomyBenchmarkJob(ctx.jobId, (job) => ({
-    ...job,
-    updatedAt: new Date().toISOString(),
-    progress: {
-      ...job.progress,
-      currentAgent: slug,
-    },
-  }));
-
-  try {
-    let payload: Record<string, unknown> | null = null;
-    let lastError: unknown = null;
-    const maxAttempts = 4;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      try {
-        payload = input.sse
-          ? await benchmarkPostSseDone({
-              slug,
-              url,
-              walletAddress: ctx.userWallet,
-              internalKey: ctx.internalKey,
-              body: input.body,
-              paid: usePaidHeader,
-            })
-          : await benchmarkPostJson<Record<string, unknown>>({
-              slug,
-              url,
-              walletAddress: ctx.userWallet,
-              internalKey: ctx.internalKey,
-              body: input.body,
-              paid: usePaidHeader,
-            });
-        break;
-      } catch (error) {
-        lastError = error;
-        if (attempt >= maxAttempts || !isBenchmarkRateLimitError(error)) {
-          throw error;
-        }
-        console.warn(
-          `[benchmark:${slug}] transient rate limit on attempt ${attempt}/${maxAttempts}; retrying`,
-        );
-        await benchmarkRetryDelay(attempt);
-      }
-    }
-
-    if (!payload) {
-      throw lastError instanceof Error ? lastError : new Error('Benchmark payload missing');
-    }
-
-    if (payload.success === false) {
-      const failureReason =
-        typeof payload.reason === 'string'
-          ? payload.reason
-          : typeof payload.error === 'string'
-            ? payload.error
-            : `Benchmark ${slug} call reported failure`;
-      throw new Error(failureReason);
-    }
-
-    if (input.kind === 'a2a_payment') {
-      await logBenchmarkA2APayment(
-        input.buyerAgent || 'benchmark_user',
-        slug,
-        agentPrice,
-        requestId,
-      );
-      return {
-        entries: [asBenchmarkEntry(txNumber, slug, agentPrice, 'success')],
-        x402Count: 0,
-        a2aCount: 1,
-        totalUsdc: agentPrice,
-        coveredAgents: [slug, ...(input.buyerAgent ? [input.buyerAgent] : [])],
-        arcTxIds: extractBenchmarkArcTxIds(payload),
-      };
-    }
-
-    await logBenchmarkPayment(slug, ctx.userWallet, agentPrice, requestId);
-    return {
-      entries: [
-        asBenchmarkEntry(
-          txNumber,
-          slug,
-          agentPrice,
-          'success',
-          { txHash: extractBenchmarkArcTxIds(payload)[0] ?? undefined },
-        ),
-      ],
-      x402Count: 1,
-      a2aCount: 0,
-      totalUsdc: agentPrice,
-      coveredAgents: [slug],
-      arcTxIds: extractBenchmarkArcTxIds(payload),
-    };
-  } catch (error) {
-    return {
-      entries: [asBenchmarkEntry(txNumber, slug, agentPrice, 'failed', { error: getErrorMessage(error) })],
-      x402Count: 0,
-      a2aCount: 0,
-      totalUsdc: 0,
-      coveredAgents: [],
-      arcTxIds: [],
-    };
-  }
-}
-
-async function runBenchmarkFlow(
-  ctx: BenchmarkRunContext,
-  flow: BenchmarkFlowDefinition,
-  runIndex: number,
-): Promise<BenchmarkFlowRunResult> {
-  const result = await flow.run(ctx, runIndex);
-  if (result.entries.every((entry) => entry.status === 'success')) {
-    ctx.flowExecutions.push(`${flow.name} #${runIndex + 1}`);
-  }
-  return result;
-}
-
-function mergeBenchmarkFlowResult(
-  aggregate: BenchmarkFlowRunResult,
-  incoming: BenchmarkFlowRunResult,
-): BenchmarkFlowRunResult {
-  return {
-    entries: [...aggregate.entries, ...incoming.entries],
-    x402Count: aggregate.x402Count + incoming.x402Count,
-    a2aCount: aggregate.a2aCount + incoming.a2aCount,
-    totalUsdc: aggregate.totalUsdc + incoming.totalUsdc,
-    coveredAgents: [...aggregate.coveredAgents, ...incoming.coveredAgents],
-    arcTxIds: [...aggregate.arcTxIds, ...incoming.arcTxIds],
-  };
-}
-
-function buildBenchmarkFlows(): BenchmarkFlowDefinition[] {
-  const researchFlow: BenchmarkFlowDefinition = {
-    name: 'Research pipeline',
-    runs: 7,
-    run: async (ctx, runIndex) => {
-      const txBase = runIndex * 3;
-      let combined: BenchmarkFlowRunResult = {
-        entries: [],
-        x402Count: 0,
-        a2aCount: 0,
-        totalUsdc: 0,
-        coveredAgents: [],
-        arcTxIds: [],
-      };
-
-      const research = await executeBenchmarkAgentCall(ctx, txBase + 1, {
-        slug: 'research',
-        body: { task: `Benchmark run ${runIndex + 1}: Arc Network overview` },
-      });
-      combined = mergeBenchmarkFlowResult(combined, research);
-      await benchmarkDelay();
-
-      const analyst = await executeBenchmarkAgentCall(ctx, txBase + 2, {
-        slug: 'analyst',
-        body: {
-          research: `Benchmark research data ${runIndex + 1}`,
-          task: `Analyze benchmark research run ${runIndex + 1}`,
-        },
-        kind: 'a2a_payment',
-        buyerAgent: 'research',
-      });
-      combined = mergeBenchmarkFlowResult(combined, analyst);
-      await benchmarkDelay();
-
-      const writer = await executeBenchmarkAgentCall(ctx, txBase + 3, {
-        slug: 'writer',
-        body: {
-          analysis: `Benchmark analysis data ${runIndex + 1}`,
-          research: `Benchmark research data ${runIndex + 1}`,
-        },
-        kind: 'a2a_payment',
-        buyerAgent: 'analyst',
-      });
-      return mergeBenchmarkFlowResult(combined, writer);
-    },
-  };
-
-  const visionFlow: BenchmarkFlowDefinition = {
-    name: 'Vision -> Research pipeline',
-    runs: 3,
-    run: async (ctx, runIndex) => {
-      const txBase = 21 + runIndex * 4;
-      let combined: BenchmarkFlowRunResult = {
-        entries: [],
-        x402Count: 0,
-        a2aCount: 0,
-        totalUsdc: 0,
-        coveredAgents: [],
-        arcTxIds: [],
-      };
-
-      const vision = await executeBenchmarkAgentCall(ctx, txBase + 1, {
-        slug: 'vision',
-        body: {
-          prompt: `Describe this benchmark test run ${runIndex + 1}`,
-          attachment: makeTinyVisionAttachment(runIndex),
-        },
-      });
-      combined = mergeBenchmarkFlowResult(combined, vision);
-      await benchmarkDelay();
-
-      const research = await executeBenchmarkAgentCall(ctx, txBase + 2, {
-        slug: 'research',
-        body: { task: `Benchmark follow-up from vision run ${runIndex + 1}` },
-        kind: 'a2a_payment',
-        buyerAgent: 'vision',
-      });
-      combined = mergeBenchmarkFlowResult(combined, research);
-      await benchmarkDelay();
-
-      const analyst = await executeBenchmarkAgentCall(ctx, txBase + 3, {
-        slug: 'analyst',
-        body: { research: `Vision benchmark research ${runIndex + 1}` },
-        kind: 'a2a_payment',
-        buyerAgent: 'research',
-      });
-      combined = mergeBenchmarkFlowResult(combined, analyst);
-      await benchmarkDelay();
-
-      const writer = await executeBenchmarkAgentCall(ctx, txBase + 4, {
-        slug: 'writer',
-        body: { analysis: `Vision benchmark analysis ${runIndex + 1}` },
-        kind: 'a2a_payment',
-        buyerAgent: 'analyst',
-      });
-      return mergeBenchmarkFlowResult(combined, writer);
-    },
-  };
-
-  const swapFlow: BenchmarkFlowDefinition = {
-    name: 'Swap -> Portfolio',
-    runs: 3,
-    run: async (ctx, runIndex) => {
-      const txBase = 33 + runIndex * 2;
-      const swap = await executeBenchmarkAgentCall(ctx, txBase + 1, {
-        slug: 'swap',
-        body: {
-          tokenPair: { tokenIn: BENCHMARK_ARC_USDC, tokenOut: BENCHMARK_SWAP_TOKEN_OUT },
-          amount: 0.1,
-          slippage: 0.5,
-          executionTarget: 'DCW',
-        },
-      });
-      await benchmarkDelay();
-      const portfolio = await executeBenchmarkAgentCall(ctx, txBase + 2, {
-        slug: 'portfolio',
-        body: { trigger: 'benchmark_swap_followup', responseStyle: 'concise_post_action' },
-        kind: 'a2a_payment',
-        buyerAgent: 'swap',
-      });
-      return mergeBenchmarkFlowResult(swap, portfolio);
-    },
-  };
-
-  const vaultFlow: BenchmarkFlowDefinition = {
-    name: 'Vault -> Portfolio',
-    runs: 2,
-    run: async (ctx, runIndex) => {
-      const txBase = 39 + runIndex * 2;
-      const vault = await executeBenchmarkAgentCall(ctx, txBase + 1, {
-        slug: 'vault',
-        body: { action: 'check_apy', executionTarget: 'DCW' },
-      });
-      await benchmarkDelay();
-      const portfolio = await executeBenchmarkAgentCall(ctx, txBase + 2, {
-        slug: 'portfolio',
-        body: { trigger: 'benchmark_vault_followup', responseStyle: 'concise_post_action' },
-        kind: 'a2a_payment',
-        buyerAgent: 'vault',
-      });
-      return mergeBenchmarkFlowResult(vault, portfolio);
-    },
-  };
-
-  const bridgeFlow: BenchmarkFlowDefinition = {
-    name: 'Bridge -> Portfolio',
-    runs: 2,
-    run: async (ctx, runIndex) => {
-      const txBase = 43 + runIndex * 2;
-      const bridge = await executeBenchmarkAgentCall(ctx, txBase + 1, {
-        slug: 'bridge',
-        body: {
-          sourceChain: 'ethereum-sepolia',
-          targetChain: 'arc-testnet',
-          amount: 1,
-        },
-        sse: true,
-      });
-      await benchmarkDelay();
-      const portfolio = await executeBenchmarkAgentCall(ctx, txBase + 2, {
-        slug: 'portfolio',
-        body: { trigger: 'benchmark_bridge_followup', responseStyle: 'concise_post_action' },
-        kind: 'a2a_payment',
-        buyerAgent: 'bridge',
-      });
-      return mergeBenchmarkFlowResult(bridge, portfolio);
-    },
-  };
-
-  const invoiceFlow: BenchmarkFlowDefinition = {
-    name: 'Invoice -> Research',
-    runs: 2,
-    run: async (ctx, runIndex) => {
-      const txBase = 47 + runIndex * 2;
-      const invoice = await executeBenchmarkAgentCall(ctx, txBase + 1, {
-        slug: 'invoice',
-        body: {
-          channel: 'json',
-          invoice: {
-            vendor: 'Benchmark Vendor',
-            vendorEmail: `benchmark-vendor-${runIndex + 1}@example.com`,
-            amount: 50,
-            currency: 'USDC',
-            invoiceNumber: `BM-${runIndex + 1}`,
-            lineItems: [{ description: 'Benchmark invoice', amount: 50 }],
-          },
-          executePayment: false,
-        },
-      });
-      await benchmarkDelay();
-      const research = await executeBenchmarkAgentCall(ctx, txBase + 2, {
-        slug: 'research',
-        body: { task: `Benchmark vendor research ${runIndex + 1}` },
-        kind: 'a2a_payment',
-        buyerAgent: 'invoice',
-      });
-      return mergeBenchmarkFlowResult(invoice, research);
-    },
-  };
-
-  const batchFlow: BenchmarkFlowDefinition = {
-    name: 'Batch -> Portfolio',
-    runs: 1,
-    run: async (ctx) => {
-      const batch = await executeBenchmarkAgentCall(ctx, 52, {
-        slug: 'batch',
-        body: {
-          sessionId: `benchmark_batch_${Date.now()}`,
-          payments: [
-            { to: BENCHMARK_RECIPIENT_A, amount: '0.1', remark: 'Benchmark batch A' },
-            { to: BENCHMARK_RECIPIENT_B, amount: '0.1', remark: 'Benchmark batch B' },
-          ],
-        },
-      });
-      await benchmarkDelay();
-      const portfolio = await executeBenchmarkAgentCall(ctx, 53, {
-        slug: 'portfolio',
-        body: { trigger: 'benchmark_batch_followup', responseStyle: 'concise_post_action' },
-        kind: 'a2a_payment',
-        buyerAgent: 'batch',
-      });
-      return mergeBenchmarkFlowResult(batch, portfolio);
-    },
-  };
-
-  const splitFlow: BenchmarkFlowDefinition = {
-    name: 'Split -> Portfolio',
-    runs: 1,
-    run: async (ctx) => {
-      const split = await executeBenchmarkAgentCall(ctx, 54, {
-        slug: 'split',
-        body: {
-          sessionId: `benchmark_split_${Date.now()}`,
-          recipients: [BENCHMARK_RECIPIENT_A, BENCHMARK_RECIPIENT_B],
-          totalAmount: '0.2',
-          remark: 'Benchmark split',
-        },
-      });
-      await benchmarkDelay();
-      const portfolio = await executeBenchmarkAgentCall(ctx, 55, {
-        slug: 'portfolio',
-        body: { trigger: 'benchmark_split_followup', responseStyle: 'concise_post_action' },
-        kind: 'a2a_payment',
-        buyerAgent: 'split',
-      });
-      return mergeBenchmarkFlowResult(split, portfolio);
-    },
-  };
-
-  const scheduleFlow: BenchmarkFlowDefinition = {
-    name: 'Schedule',
-    runs: 1,
-    run: async (ctx) =>
-      executeBenchmarkAgentCall(ctx, 56, {
-        slug: 'schedule',
-        body: {
-          task: 'List my scheduled payments for benchmark verification',
-        },
-      }),
-  };
-
-  const transcribeFlow: BenchmarkFlowDefinition = {
-    name: 'Transcribe',
-    runs: 1,
-    run: async (ctx) =>
-      executeBenchmarkAgentCall(ctx, 57, {
-        slug: 'transcribe',
-        body: {
-          text: 'benchmark transcription test',
-        },
-      }),
-  };
-
-  const asciiFlow: BenchmarkFlowDefinition = {
-    name: 'ASCII',
-    runs: 1,
-    run: async (ctx) =>
-      executeBenchmarkAgentCall(ctx, 58, {
-        slug: 'ascii',
-        body: { task: 'AgentFlow benchmark' },
-        url: ASCII_URL,
-      }),
-  };
-
-  const extraPortfolioFlow: BenchmarkFlowDefinition = {
-    name: 'Portfolio direct',
-    runs: 2,
-    run: async (ctx, runIndex) =>
-      executeBenchmarkAgentCall(ctx, 59 + runIndex, {
-        slug: 'portfolio',
-        body: {
-          trigger: `benchmark_portfolio_direct_${runIndex + 1}`,
-          responseStyle: 'concise_post_action',
-        },
-      }),
-  };
-
-  return [
-    researchFlow,
-    visionFlow,
-    swapFlow,
-    vaultFlow,
-    bridgeFlow,
-    invoiceFlow,
-    batchFlow,
-    splitFlow,
-    scheduleFlow,
-    transcribeFlow,
-    asciiFlow,
-    extraPortfolioFlow,
-  ];
-}
-
-async function runEconomyBenchmarkJob(jobId: string, normalizedWalletAddress: Address): Promise<void> {
-  try {
-    updateEconomyBenchmarkJob(jobId, (job) => ({
-      ...job,
-      status: 'running',
-      updatedAt: new Date().toISOString(),
-    }));
-
-    const { getOrCreateUserAgentWallet } = await import('./lib/dcw');
-    const executionWallet = await getOrCreateUserAgentWallet(normalizedWalletAddress);
-    if (!executionWallet?.wallet_id) {
-      throw new Error('No execution wallet');
-    }
-
-    const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-    if (!internalKey) {
-      throw new Error('AGENTFLOW_BRAIN_INTERNAL_KEY is required for benchmark orchestration');
-    }
-
-    const ctx: BenchmarkRunContext = {
-      jobId,
-      userWallet: normalizedWalletAddress,
-      internalKey,
-      healthFailures: new Set<string>(),
-      flowExecutions: [],
-    };
-
-    const flows = buildBenchmarkFlows();
-    let aggregate: BenchmarkFlowRunResult = {
-      entries: [],
-      x402Count: 0,
-      a2aCount: 0,
-      totalUsdc: 0,
-      coveredAgents: [],
-      arcTxIds: [],
-    };
-
-    const updateProgress = (currentAgent: string | null) => {
-      const completed = aggregate.entries.length;
-      const successful = aggregate.entries.filter((item) => item.status === 'success').length;
-      const failed = completed - successful;
-
-      updateEconomyBenchmarkJob(jobId, (job) => ({
-        ...job,
-        updatedAt: new Date().toISOString(),
-        progress: {
-          completed,
-          total: benchmarkProgressTotal(),
-          successful,
-          failed,
-          currentAgent,
-        },
-      }));
-    };
-
-    const applyFlowResult = (
-      flow: BenchmarkFlowDefinition,
-      runIndex: number,
-      result: BenchmarkFlowRunResult,
-    ) => {
-      aggregate = mergeBenchmarkFlowResult(aggregate, result);
-      const currentAgent = result.entries.at(-1)?.agent ?? flow.name ?? null;
-      if (result.entries.every((entry) => entry.status === 'success')) {
-        ctx.flowExecutions.push(`${flow.name} #${runIndex + 1}`);
-      }
-      updateProgress(currentAgent);
-    };
-
-    const buildFlowErrorResult = (
-      flow: BenchmarkFlowDefinition,
-      runIndex: number,
-      error: unknown,
-    ): BenchmarkFlowRunResult => ({
-      entries: [
-        asBenchmarkEntry(
-          -1,
-          flow.name,
-          0,
-          'failed',
-          { error: `[benchmark:${flow.name}#${runIndex + 1}] ${getErrorMessage(error)}` },
-        ),
-      ],
-      x402Count: 0,
-      a2aCount: 0,
-      totalUsdc: 0,
-      coveredAgents: [],
-      arcTxIds: [],
-    });
-
-    const runAndApplyFlow = async (flow: BenchmarkFlowDefinition, runIndex: number) => {
-      try {
-        const result = await flow.run(ctx, runIndex);
-        applyFlowResult(flow, runIndex, result);
-      } catch (error) {
-        applyFlowResult(flow, runIndex, buildFlowErrorResult(flow, runIndex, error));
-      }
-    };
-
-    const requireFlow = (name: string): BenchmarkFlowDefinition => {
-      const flow = flows.find((item) => item.name === name);
-      if (!flow) {
-        throw new Error(`[benchmark] missing flow: ${name}`);
-      }
-      return flow;
-    };
-
-    const sequentialFlowNames = [
-      'Research pipeline',
-      'Vision -> Research pipeline',
-      'Invoice -> Research',
-    ];
-    const independentFlowNames = [
-      'Swap -> Portfolio',
-      'Vault -> Portfolio',
-      'Bridge -> Portfolio',
-      'Batch -> Portfolio',
-      'Split -> Portfolio',
-      'Schedule',
-      'Transcribe',
-      'ASCII',
-      'Portfolio direct',
-    ];
-
-    for (const flowName of sequentialFlowNames) {
-      const flow = requireFlow(flowName);
-      for (let runIndex = 0; runIndex < flow.runs; runIndex += 1) {
-        await runAndApplyFlow(flow, runIndex);
-        await benchmarkDelay();
-      }
-    }
-
-    const independentRuns = independentFlowNames.flatMap((flowName) => {
-      const flow = requireFlow(flowName);
-      return Array.from({ length: flow.runs }, (_, runIndex) => ({ flow, runIndex }));
-    });
-
-    await Promise.allSettled(
-      independentRuns.map(({ flow, runIndex }) => runAndApplyFlow(flow, runIndex)),
-    );
-
-    const benchmarkGas = await estimateArcGasPaidUsd(aggregate.arcTxIds);
-    const gasPaid = aggregate.entries.length * 0.000001;
-    const netMarginPercent = 99.995;
-    const benchmarkCountForComparison = Math.max(aggregate.entries.length, 1);
-    const arcCostForComparison =
-      benchmarkGas.countedTxs > 0 ? benchmarkGas.totalUsd : gasPaid;
-    const ethCost =
-      aggregate.entries.length *
-      (Number.isFinite(ECONOMY_ETHEREUM_GAS_PER_TX_USD) && ECONOMY_ETHEREUM_GAS_PER_TX_USD > 0
-        ? ECONOMY_ETHEREUM_GAS_PER_TX_USD
-        : 2.5);
-    const arcVsEthStats = buildArcVsEthereumStats(
-      arcCostForComparison,
-      benchmarkGas.countedTxs > 0 ? benchmarkGas.countedTxs : benchmarkCountForComparison,
-    );
-    const completedAt = new Date().toISOString();
-    const uniqueCoveredAgents = [...new Set(aggregate.coveredAgents)].sort();
-
-    updateEconomyBenchmarkJob(jobId, (job) => ({
-      ...job,
-      status: 'complete',
-      updatedAt: completedAt,
-      completedAt,
-      progress: {
-        completed: aggregate.entries.length,
-        total: benchmarkProgressTotal(),
-        successful: aggregate.entries.filter((item) => item.status === 'success').length,
-        failed: aggregate.entries.filter((item) => item.status === 'failed').length,
-        currentAgent: null,
-      },
-      result: {
-        total_txs: aggregate.entries.length,
-        total_usdc: aggregate.totalUsdc.toFixed(4),
-        gas_paid: gasPaid.toFixed(8),
-        margin: `${netMarginPercent.toFixed(3)}%`,
-        results: aggregate.entries,
-        agents_covered: uniqueCoveredAgents,
-        flows_completed: ctx.flowExecutions,
-        arc_tx_ids: [...new Set(aggregate.arcTxIds)],
-        breakdown: {
-          x402_payments: aggregate.x402Count,
-          a2a_payments: aggregate.a2aCount,
-        },
-        execution_wallet: executionWallet.address,
-        arc_vs_eth: {
-          arc_cost: `$${arcCostForComparison.toFixed(8)}`,
-          eth_cost: `$${ethCost.toFixed(2)}`,
-          savings: arcVsEthStats.savings_multiplier,
-        },
-      },
-      error:
-        ctx.healthFailures.size > 0
-          ? `Skipped unhealthy agents: ${[...ctx.healthFailures].sort().join(', ')}`
-          : null,
-    }));
-  } catch (e: unknown) {
-    const completedAt = new Date().toISOString();
-    updateEconomyBenchmarkJob(jobId, (job) => ({
-      ...job,
-      status: 'failed',
-      updatedAt: completedAt,
-      completedAt,
-      progress: {
-        ...job.progress,
-        currentAgent: null,
-      },
-      error: getErrorMessage(e),
-    }));
-    console.warn('[economy] benchmark failed:', getErrorMessage(e));
-  }
-}
 
 function resolveAgentRunUrl(configured: string | undefined, fallback: string): string {
   const value = (configured || fallback).trim();
@@ -1746,13 +707,140 @@ function getErrorMessage(err: unknown): string {
   }
 }
 
+function pushPipelineTimingTrace(
+  trace: PipelineTimingTracePoint[],
+  traceStart: number,
+  label: string,
+  meta?: Record<string, unknown>,
+): void {
+  if (!RESEARCH_TIMING_TRACE) return;
+  const atMs = Date.now() - traceStart;
+  const prev = trace[trace.length - 1];
+  trace.push({
+    label,
+    at_ms: atMs,
+    delta_ms: prev ? atMs - prev.at_ms : atMs,
+    ...(meta ? { meta } : {}),
+  });
+}
+
+type ParseOutcome = 'success_without_unwrapping' | 'success_after_unwrapping' | 'failed';
+
 function safeParseObject(value: string): Record<string, unknown> | null {
-  if (!value.trim()) return null;
-  try {
-    return JSON.parse(value) as Record<string, unknown>;
-  } catch {
-    return null;
+  return parseObjectWithDiagnostics(value).parsed;
+}
+
+function parseObjectWithDiagnostics(value: string): {
+  parsed: Record<string, unknown> | null;
+  outcome: ParseOutcome;
+} {
+  if (!value.trim()) {
+    return { parsed: null, outcome: 'failed' };
   }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return {
+      parsed:
+        parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null,
+      outcome: 'success_without_unwrapping',
+    };
+  } catch {
+    const unwrapped = unwrapJsonLikeResponse(value);
+    if (!unwrapped || unwrapped === value.trim()) {
+      return { parsed: null, outcome: 'failed' };
+    }
+    try {
+      const parsed = JSON.parse(unwrapped) as unknown;
+      return {
+        parsed:
+          parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null,
+        outcome: 'success_after_unwrapping',
+      };
+    } catch {
+      return { parsed: null, outcome: 'failed' };
+    }
+  }
+}
+
+function unwrapJsonLikeResponse(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+
+  let candidate = trimmed;
+
+  const fencedMatch = candidate.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fencedMatch?.[1]) {
+    candidate = fencedMatch[1].trim();
+  } else {
+    const firstFenceIndex = candidate.search(/```(?:json)?/i);
+    if (firstFenceIndex >= 0) {
+      const afterFence = candidate.slice(firstFenceIndex).replace(/^```(?:json)?\s*/i, '');
+      const closingFenceIndex = afterFence.lastIndexOf('```');
+      candidate =
+        closingFenceIndex >= 0
+          ? afterFence.slice(0, closingFenceIndex).trim()
+          : afterFence.trim();
+    }
+  }
+
+  const firstArray = candidate.indexOf('[');
+  const firstObject = candidate.indexOf('{');
+  const firstJsonIndex =
+    firstArray === -1
+      ? firstObject
+      : firstObject === -1
+        ? firstArray
+        : Math.min(firstArray, firstObject);
+  if (firstJsonIndex > 0) {
+    candidate = candidate.slice(firstJsonIndex).trim();
+  }
+
+  const lastArray = candidate.lastIndexOf(']');
+  const lastObject = candidate.lastIndexOf('}');
+  const lastJsonIndex = Math.max(lastArray, lastObject);
+  if (lastJsonIndex >= 0 && lastJsonIndex < candidate.length - 1) {
+    candidate = candidate.slice(0, lastJsonIndex + 1).trim();
+  }
+
+  return candidate;
+}
+
+async function writeResearchOutputDebug(params: {
+  query: string;
+  mode: 'fast' | 'deep';
+  rawResearchText: string;
+  parserOutcome: ParseOutcome;
+  parsedValue: Record<string, unknown> | null;
+}): Promise<void> {
+  if (process.env.RESEARCH_OUTPUT_DEBUG !== '1') {
+    return;
+  }
+
+  const dir = path.join('tmp', 'research-output-debug');
+  const timestamp = new Date().toISOString();
+  const safeTimestamp = timestamp.replace(/[:.]/g, '-');
+  const filePath = path.join(dir, `${safeTimestamp}.json`);
+
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(
+    filePath,
+    `${JSON.stringify(
+      {
+        timestamp,
+        query: params.query,
+        mode: params.mode,
+        raw_research_text: params.rawResearchText,
+        parser_outcome: params.parserOutcome,
+        parsed_value: params.parsedValue,
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
 }
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -1765,15 +853,53 @@ function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
+function canonicalSourceDisplayKey(value: string): string {
+  const clean = value.replace(/^https?:\/\//i, '').trim().toLowerCase();
+  const domain = clean.replace(/^www\./, '').replace(/\/.*$/, '');
+  return domain
+    .replace(/\.(com|org|net|io|co|ai|gov|edu|news|trade|finance)$/i, '')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function formatLiveSourceDisplayName(value: string): string {
+  const clean = value.replace(/^https?:\/\//i, '').trim();
+  const domain = clean.replace(/^www\./i, '').replace(/\/.*$/, '');
+  const haystack = `${clean} ${domain}`.toLowerCase();
+
+  if (haystack.includes('finance.yahoo.com')) return 'Yahoo Finance';
+  if (haystack.includes('coinmarketcap')) return 'CoinMarketCap';
+  if (haystack.includes('coingecko')) return 'CoinGecko';
+  if (haystack.includes('defillama')) return 'DefiLlama';
+  if (haystack.includes('coindesk')) return 'CoinDesk';
+  if (haystack.includes('tradingview')) return 'TradingView';
+  if (haystack.includes('wikipedia')) return 'Wikipedia';
+  if (haystack.includes('forbes')) return 'Forbes';
+  if (haystack.includes('bitcoin.org')) return 'bitcoin.org';
+
+  return domain || clean;
+}
+
+function liveSourceDisplayPriority(value: string): number {
+  if (/^(?:CoinGecko|CoinMarketCap|DefiLlama|CoinDesk|Yahoo Finance|TradingView|Forbes|Wikipedia|bitcoin\.org)$/i.test(value)) {
+    return 10;
+  }
+  return 0;
+}
+
 function summarizeLiveDataSourceNames(liveData: Record<string, unknown> | null): string[] {
   if (!liveData) return [];
   const names = new Set<string>();
+  const canonicalNames = new Set<string>();
   const add = (value: unknown) => {
     if (typeof value !== 'string') return;
     const clean = value.replace(/\s+/g, ' ').trim();
     if (!clean) return;
     if (/^(firecrawl|gdelt|google news rss|dynamic rss|source registry)$/i.test(clean)) return;
-    names.add(clean);
+    const displayName = formatLiveSourceDisplayName(clean);
+    const canonical = canonicalSourceDisplayKey(displayName);
+    if (canonicalNames.has(canonical)) return;
+    canonicalNames.add(canonical);
+    names.add(displayName);
   };
   const addArticle = (item: unknown) => {
     const article = recordValue(item);
@@ -1805,7 +931,74 @@ function summarizeLiveDataSourceNames(liveData: Record<string, unknown> | null):
   for (const item of arrayValue(recordValue(liveData.dynamic_sources)?.articles)) addArticle(item);
   for (const item of arrayValue(recordValue(liveData.the_hacker_news)?.articles)) addArticle(item);
 
-  return [...names].slice(0, 8);
+  return [...names]
+    .sort((left, right) => liveSourceDisplayPriority(right) - liveSourceDisplayPriority(left))
+    .slice(0, 8);
+}
+
+function formatLiveDataSourceSummary(sources: string[]): string {
+  const visibleSources = sources.slice(0, 4);
+  const hiddenSourceCount = sources.length - visibleSources.length;
+  return `${visibleSources.join(', ')}${hiddenSourceCount > 0 ? ` +${hiddenSourceCount} more` : ''}`;
+}
+
+function parseLiveDataPayload(liveData: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(liveData) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function getCurrentEventSnapshotCount(payload: Record<string, unknown> | null): number {
+  const currentEvents = payload?.current_events;
+  if (!currentEvents || typeof currentEvents !== 'object') {
+    return 0;
+  }
+
+  const snapshots = (currentEvents as { article_snapshots?: unknown }).article_snapshots;
+  return Array.isArray(snapshots) ? snapshots.length : 0;
+}
+
+type LiveDataTimeoutClass = 'forecasting' | 'niche_protocol' | 'creator_audience' | 'current_events' | 'default';
+
+function classifyLiveDataTimeout(task: string): { timeoutMs: number; queryClass: LiveDataTimeoutClass } {
+  if (detectForecastingIntent(task).forecasting) {
+    return {
+      timeoutMs: LIVE_DATA_TIMEOUT_MS_FORECASTING,
+      queryClass: 'forecasting',
+    };
+  }
+
+  const protocolShape = detectProtocolQueryShape(task);
+  if (protocolShape === 'strong_crypto' || protocolShape === 'weak_status') {
+    return {
+      timeoutMs: LIVE_DATA_TIMEOUT_MS_NICHE_PROTOCOL,
+      queryClass: 'niche_protocol',
+    };
+  }
+
+  if (isCreatorAudienceMetricTask(task)) {
+    return {
+      timeoutMs: LIVE_DATA_TIMEOUT_MS_CREATOR_AUDIENCE,
+      queryClass: 'creator_audience',
+    };
+  }
+
+  if (shouldGatherCurrentEvents(task)) {
+    return {
+      timeoutMs: LIVE_DATA_TIMEOUT_MS_CURRENT_EVENTS,
+      queryClass: 'current_events',
+    };
+  }
+
+  return {
+    timeoutMs: LIVE_DATA_TIMEOUT_MS_DEFAULT,
+    queryClass: 'default',
+  };
 }
 
 function requiresLiveEvidence(task: string): boolean {
@@ -1835,6 +1028,22 @@ function buildSparseEvidenceResearch(task: string, asOf: string): string {
     open_questions: ['Which dated public sources currently support the user premise?'],
     sources: [],
   });
+}
+
+function formatChatAmount(value: number): string {
+  if (!Number.isFinite(value)) {
+    return '0';
+  }
+  return value.toFixed(6).replace(/\.?0+$/g, '');
+}
+
+function extractRequestedUsdcAmount(message: string): number | null {
+  const match = message.match(/\b(\d+(?:\.\d+)?)\s*USDC\b/i);
+  if (!match?.[1]) {
+    return null;
+  }
+  const value = Number(match[1]);
+  return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 async function tryBuildWalletIntentReply(input: {
@@ -1910,13 +1119,23 @@ async function tryBuildWalletIntentReply(input: {
       const circleWallet = await getOrCreateCircleFundingWalletForChat(normalizedWallet);
       const gatewayBalance = await fetchGatewayBalanceForAddress(circleWallet.address);
       const executionBalance = await getExecutionWalletBalanceForChat(normalizedWallet);
+      const gatewayUsdc = Number(gatewayBalance.available || '0');
+      const executionUsdc = Number(executionBalance.usdc || '0');
+      const requestedUsdc = extractRequestedUsdcAmount(input.message);
+      const affordabilityLine =
+        requestedUsdc !== null
+          ? gatewayUsdc + executionUsdc >= requestedUsdc
+            ? `Yes, your current AgentFlow balances can cover ${formatChatAmount(requestedUsdc)} USDC.`
+            : `No, your current AgentFlow balances cannot cover ${formatChatAmount(requestedUsdc)} USDC. You have ${formatChatAmount(gatewayUsdc + executionUsdc)} USDC available across Gateway and execution wallet.`
+          : '';
       return [
+        affordabilityLine,
         `Connected wallet: ${normalizedWallet}`,
         `Gateway wallet: ${circleWallet.address}`,
         `Gateway balance: ${gatewayBalance.available} USDC`,
         `Execution wallet: ${executionBalance.address}`,
         `Execution wallet USDC: ${executionBalance.usdc}`,
-      ].join('\n');
+      ].filter(Boolean).join('\n');
     }
     case 'GATEWAY_TO_EXECUTION': {
       const executionBalance = await getExecutionWalletBalanceForChat(normalizedWallet);
@@ -2034,14 +1253,66 @@ type ResearchWalletContext = {
   error?: string;
 };
 
-type BrainSessionContext = {
-  executionTarget?: 'EOA' | 'DCW';
-};
-
 type BrainConversationMessage = {
   role: 'user' | 'assistant';
   content: string;
 };
+
+function buildFastpathBrainEventFields(finalIntent: string) {
+  return {
+    final_intent: finalIntent,
+    layer_used: 'fastpath' as const,
+    fastpath_confidence: 1.0,
+    llm_intent_json: null,
+    validator_passed: null,
+    experiment_variant: null,
+  };
+}
+
+function buildIntentRouterBrainEventFields(intent: AgentFlowIntent, validatorPassed: boolean) {
+  return {
+    final_intent: intent.intent,
+    layer_used: 'intent_router' as const,
+    fastpath_confidence: null,
+    llm_intent_json: intent,
+    validator_passed: validatorPassed,
+    experiment_variant: null,
+  };
+}
+
+function buildHermesBrainEventFields() {
+  return {
+    final_intent: null,
+    layer_used: 'hermes_agent' as const,
+    fastpath_confidence: null,
+    llm_intent_json: null,
+    validator_passed: null,
+    experiment_variant: null,
+  };
+}
+
+function buildClassifierHistory(
+  history: BrainConversationMessage[],
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  return history
+    .slice(-4)
+    .filter(
+      (m): m is typeof m & { role: 'user' | 'assistant' } =>
+        m.role === 'user' || m.role === 'assistant',
+    )
+    .map((m) => ({
+      role: m.role,
+      content:
+        typeof m.content === 'string'
+          ? m.content
+              .replace(/\[TOOL_CALL:[^\]]+\]/g, '')
+              .replace(/\[TOOL_RESULT:[^\]]+\]/g, '')
+              .trim()
+              .slice(0, 280)
+          : '',
+    }))
+    .filter((m) => m.content.length > 0);
+}
 
 
 type BrainUserProfileRow = {
@@ -2078,19 +1349,361 @@ async function writeLocalBrainJson<T>(filePath: string, value: T): Promise<void>
   }
 }
 
-function normalizeBrainExecutionTarget(raw: unknown): 'EOA' | 'DCW' | undefined {
-  if (raw === 'EOA' || raw === 'DCW') {
-    return raw;
-  }
-  return undefined;
-}
-
-function brainSessionContextKey(sessionId: string): string {
-  return `chat:context:${sessionId}`;
-}
-
 function brainHistoryKey(sessionId: string): string {
   return `chat:history:${sessionId}`;
+}
+
+/** When the client sends `x-session-id: wallet-0xabc...-chat-{uuid}`, isolate brain history per thread. */
+function deriveBrainMemorySessionId(
+  walletAddress: Address | undefined,
+  requestSessionId: string,
+  actionSessionId: string,
+): string {
+  const req = requestSessionId.trim();
+  if (!walletAddress) {
+    return req || actionSessionId;
+  }
+  const prefix = `wallet-${walletAddress.toLowerCase()}-`;
+  if (req.startsWith(prefix) && req.length > prefix.length) {
+    return req;
+  }
+  return actionSessionId;
+}
+
+function isAgentflowChatSessionTraceDebug(): boolean {
+  return String(process.env.AGENTFLOW_CHAT_SESSION_TRACE ?? '').trim().toLowerCase() === 'true';
+}
+
+function isAgentflowChatSseDebug(): boolean {
+  return String(process.env.AGENTFLOW_CHAT_SSE_DEBUG ?? '').trim().toLowerCase() === 'true';
+}
+
+function logChatSseDebug(payload: Record<string, unknown>): void {
+  if (!isAgentflowChatSseDebug()) return;
+  console.info('[chat-sse-debug]', payload);
+}
+
+function isAgentflowFastPathDebug(): boolean {
+  return String(process.env.AGENTFLOW_FASTPATH_DEBUG ?? '').trim().toLowerCase() === 'true';
+}
+
+function logFastPathDebug(payload: Record<string, unknown>): void {
+  if (!isAgentflowFastPathDebug()) return;
+  console.info('[fast-path]', payload);
+}
+
+/** Shown only when SSE ends with meta (or zero) chunks and no assistant delta reached the UI. */
+const CHAT_SSE_EMPTY_REPLY_FALLBACK =
+  'AgentFlow did not return a complete response for that message. Please retry in a moment.';
+
+type BrainInputValidationResult =
+  | { ok: true }
+  | { ok: false; reason: 'empty' | 'too_short' | 'symbol_noise' | 'garbage_pattern' };
+
+type BrainInputAnalysis = {
+  trimmed: string;
+  visibleChars: string[];
+  alphaCharCount: number;
+  alphaNumCharCount: number;
+  symbolCharCount: number;
+  nonAlphaRatio: number;
+  letterTokens: string[];
+  noisyLetterTokens: string[];
+};
+
+function analyzeBrainInput(message: string): BrainInputAnalysis {
+  const trimmed = message.trim();
+  const visibleChars = Array.from(trimmed).filter((char) => !/\s/u.test(char));
+  const alphaChars = visibleChars.filter((char) => /\p{L}/u.test(char));
+  const alphaNumChars = visibleChars.filter((char) => /[\p{L}\p{N}]/u.test(char));
+  const symbolCharCount = visibleChars.length - alphaNumChars.length;
+  const nonAlphaRatio =
+    visibleChars.length > 0 ? (visibleChars.length - alphaChars.length) / visibleChars.length : 0;
+  const letterTokens = Array.from(trimmed.matchAll(/\p{L}+/gu)).map((match) => match[0]);
+  const noisyLetterTokens = letterTokens.filter(isLikelyNoiseWord);
+
+  return {
+    trimmed,
+    visibleChars,
+    alphaCharCount: alphaChars.length,
+    alphaNumCharCount: alphaNumChars.length,
+    symbolCharCount,
+    nonAlphaRatio,
+    letterTokens,
+    noisyLetterTokens,
+  };
+}
+
+function isLikelyNoiseWord(token: string): boolean {
+  const normalized = token.toLowerCase();
+  if (normalized.length < 6) {
+    return false;
+  }
+  if (!/^\p{L}+$/u.test(normalized)) {
+    return false;
+  }
+
+  const vowels = Array.from(normalized).filter((char) => /[aeiouy]/i.test(char)).length;
+  const vowelRatio = vowels / normalized.length;
+  const consonantRuns = normalized.match(/[^aeiouy]{4,}/gi) ?? [];
+  const longestConsonantRun = consonantRuns.reduce((max, run) => Math.max(max, run.length), 0);
+
+  if (normalized.length >= 10 && vowels <= 1) {
+    return true;
+  }
+  if (normalized.length >= 8 && vowelRatio < 0.25 && longestConsonantRun >= 4) {
+    return true;
+  }
+  if (normalized.length >= 6 && vowelRatio < 0.2 && longestConsonantRun >= 5) {
+    return true;
+  }
+
+  return false;
+}
+
+function validateChatInputForBrain(message: string): BrainInputValidationResult {
+  const analysis = analyzeBrainInput(message);
+  const { trimmed, visibleChars, alphaCharCount, alphaNumCharCount, symbolCharCount, noisyLetterTokens } = analysis;
+  if (!trimmed) {
+    return { ok: false, reason: 'empty' };
+  }
+  if (trimmed.length < 2) {
+    return { ok: false, reason: 'too_short' };
+  }
+  if (/^[^\p{L}\p{N}]+$/u.test(trimmed)) {
+    return { ok: false, reason: 'garbage_pattern' };
+  }
+
+  if (visibleChars.length === 1 && /\p{Extended_Pictographic}/u.test(visibleChars[0] || '')) {
+    return { ok: false, reason: 'garbage_pattern' };
+  }
+
+  if (visibleChars.length >= 6 && symbolCharCount / visibleChars.length >= 0.75) {
+    return { ok: false, reason: 'symbol_noise' };
+  }
+
+  if (
+    alphaCharCount >= 6 &&
+    alphaNumCharCount > 0 &&
+    symbolCharCount / visibleChars.length >= 0.15 &&
+    noisyLetterTokens.length >= 2
+  ) {
+    return { ok: false, reason: 'garbage_pattern' };
+  }
+
+  if (
+    alphaCharCount >= 18 &&
+    noisyLetterTokens.length >= 3
+  ) {
+    return { ok: false, reason: 'garbage_pattern' };
+  }
+
+  if (visibleChars.length > 0) {
+    const alphaNumRatio = alphaNumCharCount / visibleChars.length;
+    if (alphaNumRatio < 0.35 && alphaCharCount < 4) {
+      return { ok: false, reason: 'symbol_noise' };
+    }
+  }
+
+  return { ok: true };
+}
+
+function maybeLogInputFilterDebug(message: string): void {
+  const analysis = analyzeBrainInput(message);
+  if (analysis.visibleChars.length >= 8 || analysis.nonAlphaRatio <= 0.3) {
+    return;
+  }
+
+  console.info('[INPUT_FILTER_DEBUG]', {
+    preview: analysis.trimmed.slice(0, 40),
+    visible_chars: analysis.visibleChars.length,
+    non_alpha_ratio: Number(analysis.nonAlphaRatio.toFixed(3)),
+    noisy_letter_tokens: analysis.noisyLetterTokens,
+  });
+}
+
+function maybeLowConfidenceClarify(message: string): string | null {
+  const normalized = message.trim();
+  if (!/\b(?:swap|trade|exchange|convert)\b/i.test(normalized)) {
+    if (
+      /\bwithdraw\b/i.test(normalized) &&
+      /\bvault\b/i.test(normalized) &&
+      !/\blune(?:usdc|eurc)\b/i.test(normalized)
+    ) {
+      return 'Which vault should I use: luneUSDC or luneEURC?';
+    }
+    return null;
+  }
+  const hasTargetToken = /\b(?:to|for)\s+(?:USDC|EURC|usd coin|euro?s?|eurc)\b/i.test(normalized);
+  const hasSourceToken = /\b\d+(?:\.\d+)?\s*(?:USDC|EURC)\b/i.test(normalized);
+  const hasAmount = /\b\d+(?:\.\d+)?\b/.test(normalized);
+  if (hasAmount && hasSourceToken && !hasTargetToken) {
+    return 'Do you want a live swap quote, or do you want me to explain how swaps work on AgentFlow?';
+  }
+  if (hasAmount && hasTargetToken && !hasSourceToken) {
+    return 'Which token should I swap from: USDC or EURC?';
+  }
+  return null;
+}
+
+function buildLowConfidenceClarifyRoute(message: string): DirectAgentFlowRoute | null {
+  const normalized = message.trim();
+
+  if (/\b(?:swap|trade|exchange|convert)\b/i.test(normalized)) {
+    const hasGenericHelpCue =
+      /\b(?:help|how|explain|walk\s+me\s+through|guide|tell\s+me)\b/i.test(normalized);
+    const sourceMatch = normalized.match(/\b(\d+(?:\.\d+)?)\s*(USDC|EURC)\b/i);
+    const targetMatch = normalized.match(/\b(?:to|for)\s+(USDC|EURC)\b/i);
+
+    if (hasGenericHelpCue && !sourceMatch && !targetMatch) {
+      return {
+        type: 'reply',
+        text: 'I can explain how swaps work on AgentFlow, or I can fetch a live USDC/EURC quote for you. Which do you want?',
+        quickActionGroups: [
+          {
+            title: 'Swap help',
+            actions: [
+              { label: 'How swaps work', prompt: 'how do swaps work on AgentFlow' },
+              { label: 'Quote 1 USDC to EURC', prompt: 'swap 1 USDC to EURC' },
+              { label: 'Quote 1 EURC to USDC', prompt: 'swap 1 EURC to USDC' },
+            ],
+          },
+        ],
+      };
+    }
+
+    if (sourceMatch && !targetMatch) {
+      const amount = sourceMatch[1];
+      const sourceToken = sourceMatch[2].toUpperCase();
+      const defaultTarget = sourceToken === 'USDC' ? 'EURC' : 'USDC';
+      return {
+        type: 'reply',
+        text: `Do you want me to explain how swaps work on AgentFlow, or do you want a live quote for ${amount} ${sourceToken} to ${defaultTarget}?`,
+        quickActionGroups: [
+          {
+            title: 'Swap help',
+            actions: [
+              { label: 'How swaps work', prompt: 'how do swaps work on AgentFlow' },
+              { label: 'Get quote', prompt: `swap ${amount} ${sourceToken} to ${defaultTarget}` },
+            ],
+          },
+        ],
+      };
+    }
+
+    if (targetMatch && !sourceMatch) {
+      const targetToken = targetMatch[1].toUpperCase();
+      const sourceOptions = ['USDC', 'EURC'].filter((token) => token !== targetToken);
+      return {
+        type: 'reply',
+        text: `Which token do you want to swap from for ${targetToken}?`,
+        quickActionGroups: [
+          {
+            title: 'Choose source token',
+            actions: sourceOptions.map((token) => ({
+              label: token,
+              prompt: `swap 1 ${token} to ${targetToken}`,
+            })),
+          },
+        ],
+      };
+    }
+  }
+
+  const lowConfidenceClarification = maybeLowConfidenceClarify(message);
+  return lowConfidenceClarification
+    ? {
+        type: 'reply',
+        text: lowConfidenceClarification,
+      }
+    : null;
+}
+
+const recentBrainEventsBySession = new Map<
+  string,
+  { eventId: string; assistantAt: number }
+>();
+
+function summarizeTelemetryValue(value: unknown, max = 160): string {
+  if (value == null) return '';
+  const raw = typeof value === 'string' ? value : JSON.stringify(value);
+  return raw.replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function summarizeToolParams(params: Record<string, unknown>): string {
+  const safe: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(params)) {
+    if (/address|wallet|signature|jwt|token|auth/i.test(key)) {
+      safe[key] = '[redacted]';
+    } else {
+      safe[key] = value;
+    }
+  }
+  return summarizeTelemetryValue(safe, 240);
+}
+
+function startsLikeCorrection(message: string): boolean {
+  return /^(?:no|wait|actually|correction|wrong|not quite|that's wrong)\b/i.test(message.trim());
+}
+
+async function markPossibleBrainCorrection(
+  sessionId: string,
+  message: string,
+): Promise<void> {
+  const previous = recentBrainEventsBySession.get(sessionId);
+  if (!previous || Date.now() - previous.assistantAt > 60_000 || !startsLikeCorrection(message)) {
+    return;
+  }
+  await updateBrainEvent(previous.eventId, { user_correction: message });
+}
+
+async function appendBrainToolTelemetry(
+  eventId: string,
+  tools: BrainToolTelemetry[],
+  entry: BrainToolTelemetry,
+): Promise<void> {
+  tools.push(entry);
+  await updateBrainEvent(eventId, { tools_called: tools });
+}
+
+function classifyBrainToolResult(responseText: string): {
+  success: boolean;
+  outcome: BrainEventOutcome;
+  failureReason: string | null;
+} {
+  const text = responseText.trim();
+  if (/^Tool validation error\b/i.test(text)) {
+    return {
+      success: false,
+      outcome: 'validation_error',
+      failureReason: text,
+    };
+  }
+  if (/^Error executing\b/i.test(text)) {
+    return {
+      success: false,
+      outcome: 'tool_error',
+      failureReason: text,
+    };
+  }
+  return {
+    success: true,
+    outcome: 'success',
+    failureReason: null,
+  };
+}
+
+function lastAssistantContentPreview(
+  history: ReadonlyArray<{ role: string; content: string }>,
+  maxLen = 200,
+): string {
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const t = history[i];
+    if (t.role === 'assistant' && typeof t.content === 'string') {
+      return t.content.trim().slice(0, maxLen);
+    }
+  }
+  return '';
 }
 
 async function loadLocalBrainConversationHistory(
@@ -2279,6 +1892,7 @@ async function appendBrainConversationTurn(
   sessionId: string,
   userMessage: string,
   assistantMessage: string,
+  redisActionScopeKey?: string,
 ): Promise<void> {
   if (isErrorResponse(assistantMessage)) {
     console.warn('[brain] skipping history write — response looks like an error state');
@@ -2290,6 +1904,16 @@ async function appendBrainConversationTurn(
     { role: 'assistant', content: assistantMessage },
   ]);
   await storeBrainConversationHistory(sessionId, merged);
+
+  await persistResearchConfirmationOfferRedis(
+    redisActionScopeKey?.trim(),
+    userMessage,
+    assistantMessage,
+  ).catch(() => null);
+
+  await maybeCaptureEpisodicMemory(sessionId, userMessage, assistantMessage).catch((error) => {
+    console.warn('[semantic-memory] episodic capture failed:', getErrorMessage(error));
+  });
 }
 
 async function loadBrainUserProfile(walletAddress?: Address): Promise<BrainUserProfileRow | null> {
@@ -2329,18 +1953,353 @@ const GREETING_PATTERNS =
 const FOLLOWUP_PATTERNS =
   /what did you find|what was.*about|tell me more|continue|go ahead|yeah go|do it|what happened|show me|what were the results|previous research|last report|what topic/i;
 
+const SESSION_CONTEXT_PATTERNS =
+  /\b(?:previous conversation|last time|earlier|before|what did i tell you|what did we talk about|what were we talking about|pick up where we left off|where did we leave off|continue|go on|carry on|resume|remember|do you remember|you remember|what happened before|last report|previous research)\b/i;
+
+type BrainSemanticQueryIntent =
+  | 'none'
+  | 'profile_name'
+  | 'profile_preference'
+  | 'routing_policy'
+  | 'episodic_recall';
+
+function detectBrainSemanticQueryIntent(message: string): BrainSemanticQueryIntent {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) {
+    return 'none';
+  }
+  if (
+    /\b(?:my name|remember my name|do you remember my name|what'?s my name|who am i|call me|what did you call me)\b/i.test(
+      normalized,
+    )
+  ) {
+    return 'profile_name';
+  }
+  if (
+    /\b(?:prefer|preference|style|answer me|reply style|how should you answer|short direct answers)\b/i.test(
+      normalized,
+    )
+  ) {
+    return 'profile_preference';
+  }
+  if (
+    /\b(?:telegram|policy|intent|router|routing|chat mode|fallback|bot policy|agentflow|hermes|standalone)\b/i.test(
+      normalized,
+    ) &&
+    /\b(?:should|shouldn'?t|do not|don'?t|instead|why|act like|behave|route|routing|policy|mode)\b/i.test(
+      normalized,
+    )
+  ) {
+    return 'routing_policy';
+  }
+  if (SESSION_CONTEXT_PATTERNS.test(normalized)) {
+    return 'episodic_recall';
+  }
+  return 'none';
+}
+
+function isBareGreetingMessage(message: string): boolean {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (!GREETING_PATTERNS.test(trimmed)) {
+    return false;
+  }
+  if (
+    /\b(?:swap|vault|bridge|portfolio|balance|wallet|send|pay|request|invoice|research|market|prediction|schedule|split|batch)\b/i.test(
+      trimmed,
+    )
+  ) {
+    return false;
+  }
+  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+  return wordCount <= 5;
+}
+
+function buildContextualGreetingReply(
+  message: string,
+  history: BrainConversationMessage[] = [],
+): string | null {
+  if (!isBareGreetingMessage(message)) {
+    return null;
+  }
+
+  const recentMeaningfulTurn = [...history]
+    .reverse()
+    .find((turn) => turn?.content?.trim() && !isBareGreetingMessage(turn.content));
+
+  if (recentMeaningfulTurn) {
+    return "Hey, I'm here - want to pick up where we left off?";
+  }
+
+  return "Hey, I'm here. What do you want to do?";
+}
+
+function isConversationRecallRequest(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return /\b(?:what were we talking about|what did we talk about|what did i tell you|do you remember|you remember|what do you remember|where did we leave off|pick up where we left off|what happened before|what did you call me)\b/i.test(
+    normalized,
+  );
+}
+
+function compactRecallLine(text: string, maxLen = 180): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (clean.length <= maxLen) {
+    return clean;
+  }
+  return `${clean.slice(0, maxLen - 3).trim()}...`;
+}
+
+function isLowValueAssistantChitChat(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  return (
+    isBareGreetingMessage(text) ||
+    normalized === "hey, i'm here - want to pick up where we left off?" ||
+    normalized === "hey, i'm here. what do you want to do?"
+  );
+}
+
+function extractWalletAddressFromSessionId(sessionId: string): Address | undefined {
+  const trimmed = sessionId.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  const match = trimmed.match(/wallet-(0x[a-f0-9]{40})/i) ?? trimmed.match(/^(0x[a-f0-9]{40})$/i);
+  if (!match?.[1]) {
+    return undefined;
+  }
+  try {
+    return getAddress(match[1]);
+  } catch {
+    return undefined;
+  }
+}
+
+function episodicCategoryForMessage(message: string): string | null {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return null;
+  if (/\b(?:portfolio|holdings|positions|balance|wallet|vault shares|gateway reserve)\b/.test(normalized)) {
+    return 'portfolio_context';
+  }
+  if (/\b(?:research|report|analy[sz]e|news|market context)\b/.test(normalized)) {
+    return 'research_context';
+  }
+  if (/\b(?:swap|vault|bridge|send|pay|request|invoice|schedule|split|batch)\b/.test(normalized)) {
+    return 'workflow_context';
+  }
+  if (/\b(?:telegram|agentpay|predmarket|dcw|eoa|intent|router|policy)\b/.test(normalized)) {
+    return 'product_policy';
+  }
+  return null;
+}
+
+function shouldCaptureEpisodicMemory(userMessage: string, assistantMessage: string): boolean {
+  const user = userMessage.trim();
+  const assistant = assistantMessage.trim();
+  if (!user || !assistant) return false;
+  if (isErrorResponse(assistant) || isLowValueAssistantChitChat(assistant)) return false;
+  if (user.length < 8 || assistant.length < 16) return false;
+  if (!episodicCategoryForMessage(user)) return false;
+  if (/^I could not|^I couldn't|couldn't route|could not route|link your wallet first/i.test(assistant)) {
+    return false;
+  }
+  return true;
+}
+
+async function maybeCaptureEpisodicMemory(
+  sessionId: string,
+  userMessage: string,
+  assistantMessage: string,
+): Promise<void> {
+  const walletAddress = extractWalletAddressFromSessionId(sessionId);
+  const category = episodicCategoryForMessage(userMessage);
+  if (!walletAddress || !category || !shouldCaptureEpisodicMemory(userMessage, assistantMessage)) {
+    return;
+  }
+
+  await rememberSemanticMemory({
+    wallet_address: walletAddress,
+    session_id: sessionId,
+    memory_type: 'episodic',
+    category,
+    content: `Earlier in this thread, the user asked: ${userMessage.replace(/\s+/g, ' ').trim()} | AgentFlow replied: ${assistantMessage.replace(/\s+/g, ' ').trim().slice(0, 700)}`,
+    source_user_message: userMessage,
+    source_assistant_message: assistantMessage.slice(0, 1200),
+    confidence: 0.72,
+  });
+}
+
+function buildConversationRecallReply(
+  message: string,
+  history: BrainConversationMessage[] = [],
+  profile: BrainUserProfileRow | null = null,
+): string | null {
+  if (!isConversationRecallRequest(message)) {
+    return null;
+  }
+
+  const lastUser = [...history]
+    .reverse()
+    .find((turn) => turn.role === 'user' && turn.content.trim() && !isBareGreetingMessage(turn.content));
+  const lastAssistant = [...history]
+    .reverse()
+    .find(
+      (turn) =>
+        turn.role === 'assistant' &&
+        turn.content.trim() &&
+        !isLowValueAssistantChitChat(turn.content),
+    );
+  const safeDisplayName = sanitizeDisplayNameForReply(profile?.display_name);
+
+  if (!lastUser && !lastAssistant && !safeDisplayName) {
+    return "We haven't really started a thread here yet.";
+  }
+
+  const parts: string[] = [];
+  if (lastUser) {
+    parts.push(`You last asked about ${compactRecallLine(lastUser.content)}.`);
+  }
+  if (lastAssistant) {
+    parts.push(`I last replied with ${compactRecallLine(lastAssistant.content)}.`);
+  }
+  if (
+    /\b(?:what did you call me|do you remember|what do you remember|my name)\b/i.test(
+      message.trim().toLowerCase(),
+    ) &&
+    safeDisplayName
+  ) {
+    parts.push(`For this wallet profile, I have your saved name as ${safeDisplayName}.`);
+  }
+
+  return parts.join(' ');
+}
+
+function buildReferentialWorkflowClarification(
+  message: string,
+  history: BrainConversationMessage[] = [],
+): string | null {
+  const normalized = message.trim().toLowerCase();
+  if (!/^(?:yeah make that|make that|set up that payment every.+|do that|do that every.+|continue with that)$/i.test(normalized)) {
+    return null;
+  }
+
+  const recentUserTurns = history
+    .filter((turn) => turn.role === 'user' && typeof turn.content === 'string')
+    .map((turn) => turn.content.trim())
+    .filter(Boolean);
+  const lastUser = recentUserTurns.at(-1) ?? '';
+  const previousUser = recentUserTurns.at(-2) ?? '';
+  const recentContext = `${previousUser}\n${lastUser}`.toLowerCase();
+
+  if (/\b(payment link|pay link|qr|scan to pay|scan\b.*pay)\b/i.test(recentContext)) {
+    const amountMatch = `${previousUser}\n${lastUser}`.match(/\b(\d+(?:\.\d+)?)\s*USDC\b/i);
+    const amountHint = amountMatch?.[1] ? ` for ${amountMatch[1]} USDC` : '';
+    return `Who should pay through the payment link${amountHint}?`;
+  }
+
+  if (
+    /\b(send|pay|transfer)\b/i.test(previousUser) &&
+    /\bto\s+[a-z0-9_.-]+(?:\.arc)?\b/i.test(previousUser) &&
+    /\b(recurring payment|every month|every week|every monday|monthly|weekly|daily)\b/i.test(
+      `${previousUser}\n${lastUser}`,
+    )
+  ) {
+    const recipientMatch = previousUser.match(/\bto\s+([a-z0-9_.-]+(?:\.arc)?|0x[a-f0-9]{40})\b/i);
+    const amountMatch = previousUser.match(/\b(\d+(?:\.\d+)?)\s*USDC\b/i);
+    const recipient = recipientMatch?.[1];
+    const amount = amountMatch?.[1];
+    if (recipient && amount) {
+      return `Set up a recurring payment of ${amount} USDC to ${recipient}? If yes, tell me the exact cadence like "every month" or "every monday".`;
+    }
+  }
+
+  return null;
+}
+
 function shouldAttachBrainProfileContext(message: string): boolean {
   const trimmed = message.trim();
   if (!trimmed) {
     return false;
   }
-  if (GREETING_PATTERNS.test(trimmed)) {
-    return true;
-  }
   const normalized = trimmed.toLowerCase();
-  return /\b(my name|do you know my name|what'?s my name|who am i|call me|remember me|remember my|what do you remember|profile|preference|prefer|previous conversation|last time|earlier|before|what did i tell you|what did you call me)\b/i.test(
-    normalized,
+  return (
+    /\b(my name|do you know my name|what'?s my name|who am i|call me|remember me|remember my|what do you remember|profile|preference|prefer|what did you call me)\b/i.test(
+      normalized,
+    ) || SESSION_CONTEXT_PATTERNS.test(normalized)
   );
+}
+
+function shouldAttachBrainSemanticMemoryContext(message: string): boolean {
+  return detectBrainSemanticQueryIntent(message) !== 'none';
+}
+
+function buildPreferenceMemoryAck(message: string, walletAddress?: Address): string | null {
+  const normalized = message.trim();
+  if (!normalized) return null;
+  if (!/\b(?:my name is|call me|i prefer|remember that|remember my)\b/i.test(normalized)) {
+    return null;
+  }
+
+  const displayNameUsagePreference = extractDisplayNameUsagePreference(normalized);
+  if (displayNameUsagePreference) {
+    const scope = walletAddress ? ' for this wallet profile' : ' for this chat';
+    return `Got it. I'll use your saved name more often${scope}.`;
+  }
+
+  const nameMatch = normalized.match(/\bmy name is\s+([a-z][a-z0-9_-]{1,40})\b/i);
+  const prefersShort = /\b(?:short|direct|concise|brief)\b/i.test(normalized);
+  if (!nameMatch && !prefersShort) {
+    return null;
+  }
+
+  const parts: string[] = [];
+  if (nameMatch?.[1]) {
+    parts.push(nameMatch[1]);
+  }
+  if (prefersShort) {
+    parts.push('short direct answers');
+  }
+
+  const scope = walletAddress ? ' for this wallet profile' : ' for this chat';
+  return `Got it${parts.length ? `: ${parts.join(', ')}` : ''}. I’ll use that${scope}.`;
+}
+
+async function buildNameAddressingPreferenceFollowupReply(
+  message: string,
+  history: BrainConversationMessage[] = [],
+  walletAddress?: Address,
+): Promise<string | null> {
+  const normalized = message.trim().toLowerCase();
+  if (!/^(?:yes|y|yeah|yep|sure|ok|okay|yes please|go ahead)$/i.test(normalized)) {
+    return null;
+  }
+
+  const lastAssistant = [...history]
+    .reverse()
+    .find((turn) => turn.role === 'assistant' && turn.content.trim());
+  if (!lastAssistant) {
+    return null;
+  }
+
+  if (!/\bwant me to call you by name more often\??/i.test(lastAssistant.content)) {
+    return null;
+  }
+
+  if (walletAddress) {
+    await rememberUserProfileFact(
+      walletAddress,
+      NAME_ADDRESSING_PREFERENCE_KEY,
+      NAME_ADDRESSING_MORE_OFTEN_VALUE,
+    );
+  }
+
+  const scope = walletAddress ? ' for this wallet profile' : ' for this chat';
+  return `Got it. I'll use your saved name more often${scope}.`;
 }
 
 function isCasualSmallTalkTurn(message: string): boolean {
@@ -2371,85 +2330,34 @@ function isCasualSmallTalkTurn(message: string): boolean {
     );
 }
 
+function shouldKeepPersistentConversationContext(message: string): boolean {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return (
+    GREETING_PATTERNS.test(trimmed) ||
+    FOLLOWUP_PATTERNS.test(trimmed) ||
+    SESSION_CONTEXT_PATTERNS.test(trimmed)
+  );
+}
+
 function shouldPrefetchFinancialContext(message: string): boolean {
-  const normalized = message.trim().toLowerCase();
-  if (!normalized) {
+  if (isVaultPositionIntent(message)) {
     return false;
   }
-  if (shouldHandleAsResearchRequest(normalized)) {
+  if (shouldHandleAsResearchRequest(message)) {
     return false;
   }
-
-  const advicePattern =
-    /\b(what should i do|what do you recommend|recommend|recommendation|advice|strategy|allocate|allocation|best move|how should i)\b/i;
-  const analysisPattern =
-    /\b(analyze|analyse|analysis|review|scan|summarize|summary|break\s*down|overview|assess|check|show)\b/i;
-  const holdingsPattern =
-    /\b(funds|portfolio|holdings|balance|balances|usdc|eurc|vault|vault shares?|gateway|reserve|position|positions)\b/i;
-
-  return (advicePattern.test(normalized) || analysisPattern.test(normalized)) && holdingsPattern.test(normalized);
+  const portfolioRequestMode = classifyPortfolioRequestMode(message);
+  if (portfolioRequestMode === 'snapshot' || portfolioRequestMode === 'clarify') {
+    return false;
+  }
+  return answerModeRequiresFinancialContext(classifyAnswerMode(message));
 }
 
-function extractBalanceValue(summary: string, label: 'USDC' | 'EURC' | 'Vault'): number {
-  const match = summary.match(new RegExp(`${label}:\\s*([0-9]+(?:\\.[0-9]+)?)`, 'i'));
-  return match ? Number(match[1]) : 0;
-}
-
-async function tryBuildEoaFinancialAdviceReply(
-  message: string,
-  walletCtx: {
-    walletAddress: string;
-    executionWalletId?: string;
-    executionWalletAddress?: string;
-    executionTarget?: 'EOA' | 'DCW';
-    profileContext?: string;
-  },
-  sessionId: string,
-): Promise<string | null> {
-  if (walletCtx.executionTarget !== 'EOA') {
-    return null;
-  }
-  if (!shouldPrefetchFinancialContext(message)) {
-    return null;
-  }
-
-  const balanceSummary = await executeTool('get_balance', {}, walletCtx, sessionId);
-  const portfolioSummary = await executeTool('get_portfolio', {}, walletCtx, sessionId);
-  const usdc = extractBalanceValue(balanceSummary, 'USDC');
-  const eurc = extractBalanceValue(balanceSummary, 'EURC');
-  const vault = extractBalanceValue(balanceSummary, 'Vault');
-
-  const suggestions: string[] = [];
-  if (usdc > 0) {
-    suggestions.push(
-      `You have ${usdc.toFixed(2)} USDC liquid in EOA manual mode, so the cleanest next step is to keep that available while you decide whether to execute manually yourself or use DCW mode for in-chat automation.`,
-    );
-  }
-  if (eurc > 0) {
-    suggestions.push(
-      `You also have ${eurc.toFixed(2)} EURC, so there is no urgent need to rotate unless you specifically want more dollar exposure.`,
-    );
-  }
-  if (vault <= 0) {
-    suggestions.push(
-      'You do not have an active vault position on this EOA view right now, and AgentFlow can execute vault actions for you in chat only in DCW mode.',
-    );
-  }
-
-  return [
-    'Here is the grounded view for your connected EOA:',
-    '',
-    balanceSummary,
-    '',
-    portfolioSummary,
-    '',
-    'Best next step:',
-    suggestions.length > 0
-      ? suggestions.join(' ')
-      : 'Keep the wallet liquid for now while you stay in manual EOA mode, or use DCW mode when you want AgentFlow to execute for you in chat.',
-    '',
-    'If you want AgentFlow itself to execute inside chat, use DCW mode. If you prefer to stay in EOA mode, you can act manually from your own wallet.',
-  ].join('\n');
+function isFinancialAdvisoryScopeIntent(message: string): boolean {
+  return isFinancialAdvisoryScopeMessage(message);
 }
 
 async function buildFinancialContextNote(
@@ -2472,6 +2380,9 @@ async function buildFinancialContextNote(
   if (!shouldPrefetchFinancialContext(message)) {
     return '';
   }
+  if (isFinancialAdvisoryScopeIntent(message)) {
+    return '';
+  }
 
   const [balanceResult, portfolioResult] = await Promise.all([
     executeTool('get_balance', {}, walletCtx, sessionId),
@@ -2488,6 +2399,9 @@ async function buildFinancialContextNote(
     'Do not say you are going to check balances or portfolio first.',
     'If the user asked for wallet, vault shares, Gateway reserve, or recent activity, cover those requested parts in the answer. Include one concise next step. Do not suggest a test swap unless the user explicitly asked to execute or demonstrate a trade.',
     'Do not invent extra buckets such as bridge-locked funds, off-chain positions, or market narratives unless they are explicitly present above.',
+    'Treat Gateway reserve as x402 and agent-to-agent payment liquidity. Do not recommend depositing it into vaults as though it were already deployable investment capital; explain that the user would first choose an amount to move into the execution wallet.',
+    'For portfolio-aware answers, describe options factually by default. Avoid unsolicited "you should", "you could", "I recommend", "consider moving", "consider depositing", or "consider allocating" language about user funds.',
+    'Only recommend a specific move when the user explicitly asks what they should do, what you would do, or asks for a recommendation. When giving that advice, include caveats and state that the user decides whether to act.',
     'If the user asks how a recent action changed their wallet, combine this live wallet context with the current conversation history. Do not pretend you need them to repeat an action that already happened in this session.',
   ].join('\n');
 }
@@ -2495,6 +2409,33 @@ async function buildFinancialContextNote(
 async function loadBrainProfileContext(walletAddress?: Address): Promise<string> {
   const profile = await loadBrainUserProfile(walletAddress);
   return buildBrainProfileContext(profile);
+}
+
+async function buildBrainSemanticMemoryContext(
+  walletAddress: Address | undefined,
+  sessionId: string,
+  message: string,
+): Promise<string> {
+  if (!walletAddress || !message.trim()) {
+    return '';
+  }
+  const queryIntent = detectBrainSemanticQueryIntent(message);
+  if (queryIntent === 'none') {
+    return '';
+  }
+  const types =
+    queryIntent === 'profile_name' || queryIntent === 'profile_preference'
+      ? (['profile'] as const)
+      : queryIntent === 'routing_policy'
+        ? (['routing_example'] as const)
+        : (['episodic', 'session_summary'] as const);
+  return buildSemanticMemoryContext({
+    walletAddress,
+    sessionId,
+    query: message,
+    limit: queryIntent === 'episodic_recall' ? 3 : 2,
+    types: [...types],
+  });
 }
 
 async function upsertBrainUserProfile(
@@ -2552,11 +2493,28 @@ async function rememberUserProfileFact(
 
   if (normalizedKey === 'display_name') {
     await upsertBrainUserProfile(walletAddress, { display_name: trimmedValue });
+    await rememberSemanticMemory({
+      wallet_address: walletAddress,
+      memory_type: 'profile',
+      category: 'display_name',
+      content: `Saved display name: ${trimmedValue}`,
+      structured: { key: normalizedKey, value: trimmedValue },
+      keywords: ['name', 'display_name', trimmedValue],
+      confidence: 0.98,
+    });
     return;
   }
 
   if (normalizedKey === 'memory_notes') {
     await upsertBrainUserProfile(walletAddress, { memory_notes: trimmedValue });
+    await rememberSemanticMemory({
+      wallet_address: walletAddress,
+      memory_type: 'profile',
+      category: 'memory_note',
+      content: trimmedValue,
+      structured: { key: normalizedKey, value: trimmedValue },
+      confidence: 0.82,
+    });
     return;
   }
 
@@ -2590,6 +2548,54 @@ async function rememberUserProfileFact(
 
   preferences[normalizedKey] = trimmedValue;
   await upsertBrainUserProfile(walletAddress, { preferences });
+  await rememberSemanticMemory({
+    wallet_address: walletAddress,
+    memory_type: 'profile',
+    category: `preference:${normalizedKey}`,
+    content: `User preference for ${normalizedKey}: ${trimmedValue}`,
+    structured: { key: normalizedKey, value: trimmedValue },
+    keywords: [normalizedKey, ...trimmedValue.split(/\s+/)],
+    confidence: 0.9,
+  });
+}
+
+function shouldCaptureSemanticCorrection(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (
+    !startsLikeCorrection(normalized) &&
+    !/\b(?:we need|should|shouldn't|do not|don't|instead|not in telegram|use web|dcw|eoa)\b/i.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+  return /\b(?:telegram|web|agentpay|vault|swap|bridge|portfolio|balance|predmarket|research|intent|router|dcw|eoa)\b/i.test(
+    normalized,
+  );
+}
+
+async function maybeCaptureSemanticCorrection(
+  walletAddress: Address | undefined,
+  sessionId: string,
+  message: string,
+): Promise<void> {
+  if (!walletAddress || !shouldCaptureSemanticCorrection(message)) {
+    return;
+  }
+
+  await rememberSemanticMemory({
+    wallet_address: walletAddress,
+    session_id: sessionId,
+    memory_type: 'routing_example',
+    category: 'user_correction',
+    content: `User correction or policy guidance: ${message.replace(/\s+/g, ' ').trim()}`,
+    source_user_message: message,
+    keywords: ['correction', 'policy', ...message.split(/\s+/)],
+    confidence: 0.78,
+  });
 }
 
 const PROFILE_FACT_TRIGGER =
@@ -2601,6 +2607,9 @@ type ExtractedProfileFacts = {
   note?: string | null;
 };
 
+const NAME_ADDRESSING_PREFERENCE_KEY = 'name_addressing_preference';
+const NAME_ADDRESSING_MORE_OFTEN_VALUE = 'Use my saved display name more often in direct replies.';
+
 function normalizeDisplayName(value: string): string {
   return value
     .trim()
@@ -2611,6 +2620,30 @@ function normalizeDisplayName(value: string): string {
     .slice(0, 3)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
     .join(' ');
+}
+
+function looksLikePseudoDisplayName(value: string): boolean {
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized === 'by my name' ||
+    normalized === 'by my name more often' ||
+    normalized === 'my name' ||
+    normalized === 'my name more often' ||
+    normalized === 'by name' ||
+    normalized === 'name' ||
+    /\b(?:my name|your name|by name|more often)\b/.test(normalized)
+  );
+}
+
+function sanitizeDisplayNameForReply(value?: string | null): string | null {
+  const normalized = value?.trim().replace(/\s+/g, ' ') || '';
+  if (!normalized || looksLikePseudoDisplayName(normalized)) {
+    return null;
+  }
+  return normalized;
 }
 
 function isProfileFactQuestion(message: string): boolean {
@@ -2633,7 +2666,7 @@ function extractExplicitDisplayName(message: string): string | null {
 
   const patterns = [
     /\b(?:remember\s+)?my\s+name\s+is\s+([a-z][a-z .'-]{0,48})(?:[.!?,;:]|$)/i,
-    /\bcall\s+me\s+([a-z][a-z .'-]{0,48})(?:[.!?,;:]|$)/i,
+    /\bcall\s+me\s+(?!by\b)([a-z][a-z .'-]{0,48})(?:[.!?,;:]|$)/i,
   ];
 
   for (const pattern of patterns) {
@@ -2642,9 +2675,30 @@ function extractExplicitDisplayName(message: string): string | null {
       continue;
     }
     const candidate = normalizeDisplayName(match[1]);
-    if (candidate && /^[A-Za-z][A-Za-z .'-]{0,48}$/.test(candidate)) {
+    if (
+      candidate &&
+      /^[A-Za-z][A-Za-z .'-]{0,48}$/.test(candidate) &&
+      !looksLikePseudoDisplayName(candidate)
+    ) {
       return candidate;
     }
+  }
+
+  return null;
+}
+
+function extractDisplayNameUsagePreference(message: string): string | null {
+  const normalized = message.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  if (
+    /\b(?:call\s+me\s+by\s+(?:my\s+)?name(?:\s+more\s+often)?|use\s+my\s+name\s+more\s+often|address\s+me\s+by\s+(?:my\s+)?name)\b/i.test(
+      normalized,
+    )
+  ) {
+    return NAME_ADDRESSING_MORE_OFTEN_VALUE;
   }
 
   return null;
@@ -2681,6 +2735,16 @@ async function extractProfileFact(message: string, walletAddress?: Address): Pro
 
   const normalized = message.trim();
   if (!normalized || !PROFILE_FACT_TRIGGER.test(normalized)) {
+    return;
+  }
+
+  const displayNameUsagePreference = extractDisplayNameUsagePreference(normalized);
+  if (displayNameUsagePreference) {
+    await rememberUserProfileFact(
+      walletAddress,
+      NAME_ADDRESSING_PREFERENCE_KEY,
+      displayNameUsagePreference,
+    );
     return;
   }
 
@@ -2726,51 +2790,6 @@ Rules:
   }
 }
 
-async function loadBrainSessionContext(sessionId: string): Promise<BrainSessionContext | null> {
-  if (!sessionId) {
-    return null;
-  }
-  try {
-    const raw = await getRedis().get(brainSessionContextKey(sessionId));
-    if (!raw) {
-      return null;
-    }
-    return JSON.parse(raw) as BrainSessionContext;
-  } catch (error) {
-    console.warn('[brain] session context load failed:', getErrorMessage(error));
-    return null;
-  }
-}
-
-async function storeBrainSessionContext(
-  sessionId: string,
-  context: BrainSessionContext,
-): Promise<void> {
-  if (!sessionId) {
-    return;
-  }
-  try {
-    await getRedis().set(brainSessionContextKey(sessionId), JSON.stringify(context), 'EX', 7200);
-  } catch (error) {
-    console.warn('[brain] session context store failed:', getErrorMessage(error));
-  }
-}
-
-async function resolveBrainExecutionTarget(
-  rawTarget: unknown,
-  sessionId?: string,
-): Promise<'EOA' | 'DCW' | undefined> {
-  const direct = normalizeBrainExecutionTarget(rawTarget);
-  if (direct) {
-    return direct;
-  }
-  if (!sessionId) {
-    return undefined;
-  }
-  const stored = await loadBrainSessionContext(sessionId);
-  return normalizeBrainExecutionTarget(stored?.executionTarget);
-}
-
 function resolveBrainWalletAddress(
   walletAddress: unknown,
   sessionId?: unknown,
@@ -2792,18 +2811,67 @@ type DirectAgentFlowRoute =
         | 'get_portfolio'
         | 'swap_tokens'
         | 'vault_action'
-        | 'bridge_usdc'
-        | 'bridge_precheck';
+        | 'predict_action'
+        | 'bridge_precheck'
+        | 'agentpay_send'
+        | 'agentpay_request';
       args: Record<string, unknown>;
       postActionNote?: string;
+      quickActionGroups?: Array<{
+        title?: string;
+        actions: Array<{
+          label: string;
+          prompt: string;
+          actionId?: string;
+          tone?: 'primary' | 'secondary';
+        }>;
+      }>;
     }
   | {
       type: 'reply';
       text: string;
+      quickActionGroups?: Array<{
+        title?: string;
+        actions: Array<{
+          label: string;
+          prompt: string;
+          actionId?: string;
+          tone?: 'primary' | 'secondary';
+        }>;
+      }>;
     };
 
 function normalizeDirectRouteMessage(message: string): string {
   return message.trim().replace(/[!?.]+$/g, '').trim();
+}
+
+function parseQuickActionIntent(actionId: unknown, rawMessage: string): AgentFlowIntent | null {
+  if (typeof actionId !== 'string') {
+    return null;
+  }
+
+  switch (actionId.trim()) {
+    case AgentFlowIntentName.VaultList:
+      return {
+        domain: AgentFlowDomain.Vault,
+        intent: AgentFlowIntentName.VaultList,
+        slots: {},
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    case AgentFlowIntentName.VaultPosition:
+      return {
+        domain: AgentFlowDomain.Vault,
+        intent: AgentFlowIntentName.VaultPosition,
+        slots: {},
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    default:
+      return null;
+  }
 }
 
 function getMostRecentAssistantMessage(history: BrainConversationMessage[] = []): string {
@@ -2814,6 +2882,61 @@ function getMostRecentAssistantMessage(history: BrainConversationMessage[] = [])
     }
   }
   return '';
+}
+
+function isTelegramProductQuestion(normalized: string): boolean {
+  return (
+    /\btelegram\b/i.test(normalized) &&
+    (/(?:^|\b)(?:what|how|why|which|explain|tell\s+me\s+about)\b/i.test(normalized) ||
+      /\bwhat\s+is\b/i.test(normalized) ||
+      /\bhow\s+does\b/i.test(normalized) ||
+      /\b(?:connect|link|use)\b/i.test(normalized))
+  );
+}
+
+function buildTelegramHelpRoute(): DirectAgentFlowRoute {
+  return {
+    type: 'reply',
+    text: [
+      'You can link AgentFlow to Telegram and keep using the same account there.',
+      '',
+      'Connect the same wallet on the web app first, then open AgentFlow in Telegram.',
+      '',
+      'Swaps, research, and AgentPay features work in Telegram.',
+      '',
+      'Do you want setup steps or do you want to see what works in Telegram?',
+    ].join('\n'),
+    quickActionGroups: [
+      {
+        title: 'Telegram',
+        actions: [
+          { label: 'Show setup steps', prompt: 'how do i connect telegram' },
+          { label: 'What works there?', prompt: 'what works in telegram' },
+          { label: 'Telegram notifications', prompt: 'how do telegram notifications work', tone: 'secondary' },
+        ],
+      },
+    ],
+  };
+}
+
+function buildTelegramSetupReply(): string {
+  return [
+    'To use AgentFlow in Telegram, connect the same wallet on the web app first.',
+    '',
+    'Then open AgentFlow in Telegram and it will carry over that linked account.',
+    '',
+    'Once linked, you can continue swaps, research, and AgentPay flows there.',
+  ].join('\n');
+}
+
+function buildTelegramCapabilitiesReply(): string {
+  return [
+    'In Telegram, AgentFlow supports swaps, research, and AgentPay features.',
+    '',
+    'That includes requests, payment links, invoices, contacts, schedules, split payments, and batch payouts.',
+    '',
+    'If Telegram is linked, AgentFlow can also notify you there when longer research finishes.',
+  ].join('\n');
 }
 
 function isShortReferentialFollowup(message: string): boolean {
@@ -2852,8 +2975,61 @@ function buildReferentialRecoveryReply(lastAssistantMessage: string): string {
   return "That refers to my previous message. I should answer it directly from the last AgentFlow reply instead of guessing from unrelated context.";
 }
 
-function hasAsciiArtIntent(message: string): boolean {
-  return /\bascii\b|\btext\s+art\b|\bbanner\b/i.test(message);
+function isBridgeOverviewReply(text: string): boolean {
+  return (
+    /\bbridge\s+to\s+arc\s+starts\s+from\s+the\s+source\s+chain\b/i.test(text) ||
+    /\bsupported\s+sources\s+include\b/i.test(text) ||
+    /\bsay\s+["']?i\s+want\s+to\s+bridge/i.test(text)
+  );
+}
+
+function isBridgeWordingFollowup(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    /\b(?:different|diffrent|another|other|alternate|alternative)\s+(?:word|words|phrase|phrasing|way)\b/i.test(normalized) ||
+    /\b(?:what|which)\s+(?:else|other)\s+can\s+i\s+say\b/i.test(normalized) ||
+    /\bcan\s+i\s+say\s+(?:it\s+)?(?:another|different|diffrent|other)\s+way\b/i.test(normalized) ||
+    /\b(?:rephrase|phrase\s+it|say\s+instead)\b/i.test(normalized)
+  );
+}
+
+function buildBridgeWordingFollowupReply(): string {
+  return [
+    'Yes. For bridge, you can use natural wording like:',
+    '',
+    '- "I want to bridge"',
+    '- "Move USDC to Arc"',
+    '- "Bridge 1 USDC from Codex Testnet to Arc"',
+    '- "Check which source chains have USDC and gas"',
+    '- "Use Codex Testnet as the source"',
+    '',
+    'If you only say the source chain, I will ask for the amount. If you only say the amount after that, I will continue the bridge draft.',
+  ].join('\n');
+}
+
+function isVoiceToTextAssistantReply(text: string): boolean {
+  return /\b(?:voice\s+to\s+text|dictation|mic(?:rophone)?|transcribe)\b/i.test(text);
+}
+
+function isVoiceToTextIntent(message: string): boolean {
+  return /\b(?:voice\s+to\s+text|voice-to-text|dictation|dictate|mic(?:rophone)?|transcribe|speech\s+to\s+text)\b/i.test(
+    message,
+  );
+}
+
+function buildVoiceToTextGuideReply(): string {
+  return [
+    'Use the mic button in the chat composer.',
+    '',
+    '1. Click the mic icon beside the send button.',
+    '2. Allow microphone permission if the browser asks.',
+    '3. Speak naturally.',
+    '4. Click the mic again to stop.',
+    '5. AgentFlow transcribes your speech into the input box, then you can edit or send it.',
+    '',
+    'If the wrong mic is selected, use the small dropdown next to the mic icon and choose the correct input.',
+  ].join('\n');
 }
 
 function hasSequentialIntentCue(message: string): boolean {
@@ -2892,50 +3068,16 @@ function hasResearchFollowupIntent(message: string): boolean {
   );
 }
 
-function parseSupportedBridgeSourceChain(
-  message: string,
-): 'ethereum-sepolia' | 'base-sepolia' | undefined {
-  const normalized = message
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\betherium\b/g, 'ethereum')
-    .replace(/\betherem\b/g, 'ethereum')
-    .replace(/\bethreum\b/g, 'ethereum')
-    .replace(/\bethrium\b/g, 'ethereum')
-    .replace(/\bsepoll?ia\b/g, 'sepolia')
-    .replace(/\bsepoll?a\b/g, 'sepolia')
-    .replace(/\bsepola\b/g, 'sepolia')
-    .replace(/\bsepoila\b/g, 'sepolia')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (
-    /\bbase\b/.test(normalized) &&
-    (!/\bsepolia\b/.test(normalized) || /\bbase\s+(?:on\s+)?sepolia\b/.test(normalized) || /\bbase\s+sep\b/.test(normalized))
-  ) {
-    return 'base-sepolia';
-  }
-
-  if (
-    /\beth(?:ereum)?\b/.test(normalized) &&
-    (/\bsepolia\b/.test(normalized) || /\bsep\b/.test(normalized))
-  ) {
-    return 'ethereum-sepolia';
-  }
-
-  if (
-    /\beth(?:ereum)?\s+(?:on\s+)?sepolia\b/.test(normalized) ||
-    /\beth(?:ereum)?\s+sep\b/.test(normalized) ||
-    /\beth\s+network\s+sepolia\b/.test(normalized)
-  ) {
-    return 'ethereum-sepolia';
-  }
-  return undefined;
-}
-
 function isPortfolioSnapshotIntent(message: string): boolean {
   const normalized = message.trim();
   if (!normalized) return false;
+  if (detectPortfolioImpactIntent(normalized)) return false;
+  if (isPredictionMarketPositionIntent(normalized) || isPredictionMarketPositionHowToIntent(normalized)) {
+    return false;
+  }
+  if (isVaultPositionIntent(normalized)) {
+    return false;
+  }
   if (
     /\b(?:swap|trade|convert|exchange|bridge|deposit|withdraw|stake|send|pay|invoice|request)\b/i.test(
       normalized,
@@ -2944,13 +3086,174 @@ function isPortfolioSnapshotIntent(message: string): boolean {
     return false;
   }
 
+  return classifyPortfolioRequestMode(normalized) === 'snapshot';
+}
+
+function shouldClarifyPortfolioRequest(message: string): boolean {
+  return classifyPortfolioRequestMode(message) === 'clarify';
+}
+
+function buildPortfolioCheckClarificationReply(): string {
+  return [
+    'I can check your current AgentFlow portfolio here.',
+    '',
+    'Do you want me to run the portfolio check now? It reads your live holdings and uses the paid Portfolio Agent.',
+  ].join('\n');
+}
+
+function lastAssistantLooksLikePortfolioSnapshot(message: string): boolean {
+  // Report-presence is read off the visible thread to decide referential follow-ups
+  // ("is that my portfolio?", "is it good?"). Missing a real report here pushes the
+  // follow-up into a fresh *paid* portfolio check, so the anchor set is intentionally
+  // broad but still report-specific (section labels the agent emits, not casual chat).
+  const hasReportAnchor = /\b(?:portfolio|holdings)\b/i.test(message);
+  const hasReportSection =
+    /\b(?:wallet tokens?|gateway reserve|vault shares?|vault position|prediction market positions?|total marked value|marked value|allocation|payment liquidity)\b/i.test(
+      message,
+    );
+  return hasReportAnchor && hasReportSection;
+}
+
+function findRecentPortfolioSnapshotMessage(
+  history: BrainConversationMessage[],
+): string | null {
   return (
-    /\b(?:show|scan|check|review|summarize|summary|analy[sz]e|overview|break\s*down|list)\b/i.test(
-      normalized,
-    ) &&
-    /\b(?:portfolio|holdings|wallet|balances?|vault\s+shares?|gateway\s+reserve|recent\s+(?:arc\s+)?activity|positions?)\b/i.test(
+    [...history]
+      .reverse()
+      .slice(0, 24)
+      .find(
+        (turn) =>
+          turn.role === 'assistant' &&
+          lastAssistantLooksLikePortfolioSnapshot(turn.content),
+      )?.content ?? null
+  );
+}
+
+function hasRecentPortfolioConversationContext(
+  history: BrainConversationMessage[],
+): boolean {
+  if (findRecentPortfolioSnapshotMessage(history)) {
+    return true;
+  }
+  return [...history]
+    .reverse()
+    .slice(0, 24)
+    .some(
+      (turn) =>
+        turn.role === 'assistant' &&
+        /\b(?:portfolio|holdings|gateway reserve|vault shares?|allocation|payment liquidity)\b/i.test(
+          turn.content,
+        ),
+    );
+}
+
+function buildPortfolioContextualFollowupReply(message: string): string {
+  if (/^(?:is|are|was|were)\b/i.test(message.trim())) {
+    return 'Yes. The report above is your current AgentFlow portfolio snapshot.';
+  }
+  return 'You already checked it in the report above. Whenever you want a fresh live snapshot, ask me to show your portfolio.';
+}
+
+function isReferentialNoAntecedentQuestion(message: string): boolean {
+  const normalized = message.trim();
+  if (!normalized) {
+    return false;
+  }
+  const words = normalized.split(/\s+/).filter(Boolean);
+  return (
+    words.length <= 12 &&
+    /\b(?:it|that|this|there)\b/i.test(normalized) &&
+    /^(?:where|what|which|how|is|are|was|were|do|does|did|can|could|should)\b/i.test(
       normalized,
     )
+  );
+}
+
+function buildMissingReferentReply(): string {
+  return 'What do you mean by “it” here — your portfolio report, wallet balance, vaults, or something else?';
+}
+
+function isPortfolioQualityReferentialFollowup(message: string): boolean {
+  const normalized = message.trim();
+  if (!normalized) {
+    return false;
+  }
+  const words = normalized.split(/\s+/).filter(Boolean);
+  return (
+    words.length <= 12 &&
+    /\b(?:it|that|this)\b/i.test(normalized) &&
+    /\b(?:good|bad|okay|ok|safe|risky|balanced|healthy|worth|fine|better)\b/i.test(
+      normalized,
+    )
+  );
+}
+
+function shouldGroundPortfolioAdviceContinuation(
+  message: string,
+  history: BrainConversationMessage[],
+): boolean {
+  const normalized = message.trim();
+  if (
+    !/^(?:and\s+)?(?:(?:what\s+should\s+i\s+do\s+next|what\s+now|what(?:'s| is)\s+next|next\s+step|how\s+should\s+i\s+continue)|(?:should|could|would)\s+i\b[\s\S]{0,80}\b(?:invest|allocate|add|move|increase|decrease|reduce|change|do)\b[\s\S]*)\??$/i.test(
+      normalized,
+    ) &&
+    !isPortfolioQualityReferentialFollowup(normalized)
+  ) {
+    return false;
+  }
+  return hasRecentPortfolioConversationContext(history);
+}
+
+function isVaultPositionIntent(message: string): boolean {
+  if (isPredictionMarketPositionIntent(message) || isPredictionMarketPositionHowToIntent(message)) {
+    return false;
+  }
+  const normalized = message.trim();
+  if (!normalized) return false;
+  return (
+    /\bvault\b[\s\S]{0,40}\b(?:positions?|holdings?|shares?|balance|balances?)\b/i.test(normalized) ||
+    /\b(?:positions?|holdings?|shares?|balance|balances?)\b[\s\S]{0,40}\bvault\b/i.test(normalized) ||
+    /\bin my vault\b/i.test(normalized)
+  );
+}
+
+function isPredictionMarketPositionHowToIntent(message: string): boolean {
+  const normalized = normalizeDirectRouteMessage(message).toLowerCase();
+  if (!normalized) return false;
+  return (
+    /\b(?:prediction|predmarket|market)\b/i.test(normalized) &&
+    /\bpositions?\b/i.test(normalized) &&
+    /\b(?:how\s+(?:do|can)\s+i\s+(?:check|see|view|show)|how\s+to\s+(?:check|see|view|show))\b/i.test(
+      normalized,
+    )
+  );
+}
+
+function isPredictionMarketPositionIntent(message: string): boolean {
+  const normalized = normalizeDirectRouteMessage(message)
+    .toLowerCase()
+    .replace(/^(?:and|also|then|ok(?:ay)?)\s+/i, '')
+    .trim();
+  if (!normalized) return false;
+  if (isPredictionMarketPositionHowToIntent(normalized)) return false;
+
+  const hasPredictionMarket =
+    /\b(?:prediction\s+markets?|predmarket|market\s+positions?|predictions?)\b/i.test(normalized);
+  const hasPosition = /\b(?:positions?|holdings?|holding|shares?|bets?)\b/i.test(normalized);
+  const hasOwnPredictionShortcut = /\bmy\s+predictions\b/i.test(normalized);
+  const asksWhichPredictionMarkets =
+    /\bwhat\s+prediction\s+markets\s+am\s+i\s+in\b/i.test(normalized) ||
+    /\bwhich\s+prediction\s+markets\s+am\s+i\s+in\b/i.test(normalized);
+  const asksForOwn =
+    /\bmy\b/i.test(normalized) ||
+    /\b(?:am\s+i\s+in|i\s+hold|i\s+holding|do\s+i\s+have|do\s+i\s+own)\b/i.test(normalized);
+  const asksToShow =
+    /^(?:show|list|check|view|see|what(?:'s| is| are)?|where)\b/i.test(normalized);
+
+  return (
+    (hasPredictionMarket && hasPosition && (asksForOwn || asksToShow)) ||
+    hasOwnPredictionShortcut ||
+    asksWhichPredictionMarkets
   );
 }
 
@@ -3512,11 +3815,114 @@ function formatResearchA2aReport(
     return 'Research Agent did not return a report payload.';
   }
   const task = typeof payload.task === 'string' ? payload.task.trim() : '';
-  const result = typeof payload.result === 'string' ? payload.result.trim() : '';
+  const result = sanitizeResearchA2aVisibleResult(payload, buyerAgentSlug);
   const lines = [`A2A complete: ${agentDisplayName(buyerAgentSlug)} -> Research Agent`, '', 'Research report:'];
   if (task) lines.push(`Task: ${task}`);
   if (result) lines.push('', result);
   return lines.join('\n').trim();
+}
+
+function sanitizeResearchA2aVisibleResult(
+  payload: Record<string, unknown>,
+  buyerAgentSlug: 'invoice' | 'vision',
+): string {
+  const raw = typeof payload.result === 'string' ? payload.result.trim() : '';
+  const textWithoutJson = stripTrailingStructuredJson(raw).trim();
+  if (textWithoutJson) return textWithoutJson;
+
+  const structured =
+    payload.structured && typeof payload.structured === 'object'
+      ? (payload.structured as Record<string, unknown>)
+      : payload.report && typeof payload.report === 'object'
+        ? (payload.report as Record<string, unknown>)
+        : null;
+  if (!structured) return raw && !looksLikeRawStructuredJson(raw) ? raw : '';
+
+  const summary =
+    typeof structured.executive_summary === 'string'
+      ? structured.executive_summary.trim()
+      : typeof structured.summary === 'string'
+        ? structured.summary.trim()
+        : '';
+  const facts = Array.isArray(structured.facts)
+    ? structured.facts
+        .map((fact) =>
+          fact && typeof fact === 'object'
+            ? String((fact as Record<string, unknown>).claim ?? '').trim()
+            : String(fact ?? '').trim(),
+        )
+        .filter(Boolean)
+        .slice(0, buyerAgentSlug === 'vision' ? 4 : 3)
+    : [];
+  const parts: string[] = [];
+  if (summary) parts.push(summary);
+  if (facts.length > 0) parts.push(facts.map((fact) => `- ${fact}`).join('\n'));
+  return parts.join('\n\n').trim();
+}
+
+function stripTrailingStructuredJson(text: string): string {
+  if (!text) return '';
+  const jsonStart = findTrailingStructuredJsonStart(text);
+  if (jsonStart < 0) return text;
+  return text.slice(0, jsonStart).trim();
+}
+
+function findTrailingStructuredJsonStart(text: string): number {
+  const candidates = ['{ "topic"', '{"topic"', '{\n  "topic"', '{\r\n  "topic"', '{ "executive_summary"', '{"executive_summary"'];
+  for (const candidate of candidates) {
+    const index = text.indexOf(candidate);
+    if (index >= 0 && looksLikeRawStructuredJson(text.slice(index))) return index;
+  }
+  return -1;
+}
+
+function looksLikeRawStructuredJson(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{')) return false;
+  if (!/"(?:topic|scope|executive_summary|facts|recent_developments|metrics|sources)"\s*:/.test(trimmed)) {
+    return false;
+  }
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return trimmed.length > 500 && /"facts"\s*:\s*\[/.test(trimmed);
+  }
+}
+
+async function executePortfolioAgentForChat(input: {
+  userWalletAddress: string;
+  sessionId: string;
+  fallback: () => Promise<string>;
+}): Promise<string> {
+  try {
+    if (await isAgentHealthy('portfolio')) {
+      const paid = await executeDcwPaidAgentViaX402<Record<string, unknown>>({
+        userWalletAddress: input.userWalletAddress.trim(),
+        agent: 'portfolio',
+        price: portfolioPrice,
+        url: PORTFOLIO_URL,
+        requestId: `portfolio_chat_${canonicalRedisSessionId(input.sessionId)}_${Date.now()}`,
+      });
+      const data = paid.data ?? {};
+      const errMsg = typeof data.error === 'string' ? data.error.trim() : '';
+      const failed =
+        paid.status < 200 ||
+        paid.status >= 300 ||
+        data.success === false ||
+        Boolean(errMsg);
+      if (!failed) {
+        appendRecentExecutionEntries(input.sessionId, [paid.paymentEntry]);
+        return formatPaidPortfolioAgentChatBody(data, portfolioPrice);
+      }
+    }
+  } catch (err) {
+    console.warn(
+      '[chat/respond] paid portfolio agent failed:',
+      getErrorMessage(err),
+    );
+  }
+  return input.fallback();
 }
 
 function isRequestedPortfolioA2aSuccess(requested: RequestedPortfolioA2a, result: string): boolean {
@@ -3563,10 +3969,11 @@ function shouldUseSemanticScheduleResolver(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return false;
   if (/^(?:yes|no|confirm|cancel|y|n|yeah|yep|nope)$/i.test(normalized)) return false;
-  if (hasAsciiArtIntent(normalized)) return false;
   return (
     /\b(?:scheduled?|recurring|autopay|automatic payment|next run)\b/i.test(normalized) ||
     /\b(?:daily|weekly|monthly)\b/i.test(normalized) ||
+    (/\b(?:pay|send|transfer)\b/i.test(normalized) &&
+      /\b(?:tomorrow|tonight|later|morning|afternoon|evening|next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|on\s+\d{1,2}(?:st|nd|rd|th)?|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i.test(normalized)) ||
     /\bevery\s+(?:day|week|month|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|\d{1,2}(?:st|nd|rd|th))\b/i.test(normalized) ||
     (/\b(?:pay|send|transfer)\b/i.test(normalized) && /\b(?:every|weekly|daily|monthly|recurring|scheduled)\b/i.test(normalized)) ||
     (/\b(?:cancel|delete|remove|stop)\b/i.test(normalized) && /\b(?:payment|payments|schedule|scheduled|recurring|latest|last|current|weekly|daily|monthly)\b/i.test(normalized)) ||
@@ -3578,61 +3985,355 @@ function shouldHandleAsScheduleRequest(message: string): boolean {
   return shouldUseSemanticScheduleResolver(message);
 }
 
-function shouldHandleAsAgentFlowCapabilityQuestion(message: string): boolean {
+function shouldHandleAsAgentPayHistoryRequest(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return false;
   return (
-    /\bwhat\s+can\s+agentflow\s+do\b/i.test(normalized) ||
-    /\bwhat\s+can\s+agentflow\s+do\s+(?:today|right\s+now)\b/i.test(normalized) ||
-    /\bwhat\s+does\s+agentflow\s+do\b/i.test(normalized) ||
-    /\bwhat\s+is\s+agentflow\b/i.test(normalized) ||
-    /\btell\s+me\s+about\s+agentflow\b/i.test(normalized) ||
-    /\bhow\s+does\s+agentflow\s+work\b/i.test(normalized) ||
-    /\bagentflow\s+capabilities?\b/i.test(normalized) ||
-    /\bwhat\s+can\s+you\s+do\b/i.test(normalized) ||
-    /\bwhat\s+can\s+you\s+help\s+with\b/i.test(normalized)
+    /\b(?:show|list|view|check|pull|get|see|display|tell me|what|which|where)\b[\s\S]{0,80}\b(?:agentpay|payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions|activity|records?)\b/i.test(normalized) ||
+    /\b(?:agentpay|payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions|activity|records?)\b[\s\S]{0,80}\b(?:show|list|view|check|pull|get|see|display|history|records?|activity)\b/i.test(normalized) ||
+    /\bwhat\s+(?:payments|transfers|transactions)\s+have\s+i\s+(?:sent|made|received)\b/i.test(normalized) ||
+    /\bwhat\s+(?:payments|transfers|transactions)\s+did\s+i\s+(?:send|make|receive)\b/i.test(normalized) ||
+    /\b(?:payments|transfers|transactions)\s+(?:i\s+)?(?:sent|made|received)\b/i.test(normalized) ||
+    /\bwhat\s+have\s+i\s+(?:sent|paid|received)\b/i.test(normalized) ||
+    /\bwhat\s+did\s+i\s+(?:pay|send|transfer|receive)(?:\s+(?:earlier|before|previously|recently|last|latest))?\b/i.test(normalized) ||
+    /\b(?:payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions)\b[\s\S]{0,80}\b(?:history|last|latest|recent|previous|earlier|happened)\b/i.test(normalized) ||
+    /\b(?:history|last|latest|recent|previous|earlier|what happened)\b[\s\S]{0,80}\b(?:payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions)\b/i.test(normalized) ||
+    /\bagentpay\s+history\b/i.test(normalized)
   );
 }
 
-function isVaultApyLookup(message: string): boolean {
-  const normalized = message.trim().toLowerCase();
-  return /\bvault\b/i.test(normalized) && /\b(?:apy|yield|rate|return)\b/i.test(normalized);
+function buildAgentPayHistoryFastpathIntent(message: string): AgentFlowIntent | null {
+  if (hasExplicitResearchReportRequest(message)) {
+    return null;
+  }
+  if (!shouldHandleAsAgentPayHistoryRequest(message)) {
+    return null;
+  }
+  const normalized = message.toLowerCase();
+  const category = /\b(received|incoming|inbound)\b/i.test(normalized)
+    ? 'received'
+    : /\b(sent|paid|outgoing|outbound)\b/i.test(normalized)
+      ? 'sent'
+      : undefined;
+  return {
+    domain: AgentFlowDomain.AgentPay,
+    intent: AgentFlowIntentName.AgentpayHistory,
+    slots: {
+      filter: {
+        ...(category ? { category } : {}),
+        ...(isAllAgentPayHistoryRequest(message) ? { limit: 10 } : {}),
+      },
+    },
+    confidence: 0.96,
+    source: 'fastpath',
+    raw_message: message,
+  };
 }
 
-function buildAgentFlowProductReply(message: string): string | null {
-  const normalized = message.trim().toLowerCase();
-  if (!normalized) return null;
+function isAllAgentPayHistoryRequest(message: string): boolean {
+  return /\b(?:all|full|entire|complete|everything|every)\b[\s\S]{0,60}\b(?:agentpay|payment|payments|transfer|transfers|transaction|transactions|history|records?)\b/i.test(message);
+}
 
-  const asksProductInfo =
-    /(?:^|\b)(?:what|how|why|which|explain|tell\s+me\s+about)\b/i.test(normalized) ||
-    /\bwhat\s+is\b/i.test(normalized) ||
-    /\bhow\s+does\b/i.test(normalized);
+function normalizeBrowserTimeZone(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const trimmed = value.trim();
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: trimmed }).format(new Date());
+    return trimmed;
+  } catch {
+    return undefined;
+  }
+}
 
-  if (
-    /\bbridge\b/i.test(normalized) &&
-    /\b(?:manual(?:ly)?|eoa|funding)\b/i.test(normalized)
-  ) {
-    return 'No. AgentFlow does not expose a manual EOA bridge in the Funding page anymore. Funding is for moving Arc USDC between your EOA, your Agent wallet, and your Gateway reserve. If you want to bridge to Arc inside AgentFlow, use the sponsored Bridge agent in chat.';
+function normalizeBrowserLocale(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const trimmed = value.trim();
+  try {
+    new Intl.DateTimeFormat(trimmed).format(new Date());
+    return trimmed;
+  } catch {
+    return undefined;
+  }
+}
+
+function formatTxHash(hash: unknown): string {
+  const text = typeof hash === 'string' ? hash.trim() : '';
+  return text.length > 18 ? `${text.slice(0, 10)}...${text.slice(-8)}` : text;
+}
+
+function formatAgentPayHistoryForChat(
+  rows: Array<Record<string, any>>,
+  options: {
+    requestedLimit?: number;
+    allRequested?: boolean;
+    browserTimeZone?: string;
+    browserLocale?: string;
+  } = {},
+): string {
+  if (!rows.length) {
+    return 'I checked AgentPay payment history for this wallet and found no payment records yet.';
   }
 
-  if (shouldHandleAsAgentFlowCapabilityQuestion(message)) {
+  const limit = Math.max(1, Math.min(10, Math.floor(options.requestedLimit ?? 10)));
+  const visibleRows = rows.slice(0, limit);
+  const timeZone = normalizeBrowserTimeZone(options.browserTimeZone);
+  const locale = normalizeBrowserLocale(options.browserLocale) || 'en-US';
+  const dateFormatter = new Intl.DateTimeFormat(locale, {
+    ...(timeZone ? { timeZone } : {}),
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+  const zoneLabel = timeZone ? ` (${timeZone})` : '';
+
+  const lines = [
+    options.allRequested
+      ? `I can show the latest ${visibleRows.length} AgentPay records here. For full history, open the AgentPay history/export view.`
+      : `Showing your latest ${visibleRows.length} AgentPay record${visibleRows.length === 1 ? '' : 's'}.`,
+    '',
+  ];
+
+  for (const [index, row] of visibleRows.entries()) {
+    const amount = row.amount ? `${row.amount} USDC` : 'unknown amount';
+    const direction =
+      row.direction === 'in' ? 'incoming' : row.direction === 'out' ? 'outgoing' : 'payment';
+    const status = typeof row.status === 'string' && row.status.trim() ? row.status.trim() : 'recorded';
+    const counterparty =
+      row.direction === 'in'
+        ? row.from_wallet || row.from || row.payer || ''
+        : row.to_wallet || row.to || row.payee || '';
+    const when = row.created_at ? new Date(String(row.created_at)) : null;
+    const whenText = when && !Number.isNaN(when.getTime()) ? dateFormatter.format(when) : 'recently';
+    const txHash = row.arc_tx_id ? String(row.arc_tx_id) : '';
+    const txText = row.explorerLink
+      ? `[${formatTxHash(txHash) || 'explorer'}](${row.explorerLink})`
+      : txHash
+        ? formatTxHash(txHash)
+        : 'not available';
+
+    lines.push(
+      `${index + 1}. **${direction} ${amount}** - ${status}`,
+      `   - Counterparty: ${counterparty || 'unknown'}`,
+      `   - Time: ${whenText}${zoneLabel}`,
+      `   - Tx: ${txText}`,
+    );
+  }
+
+  if (rows.length > visibleRows.length) {
+    lines.push('', `There are more records available. I’m showing ${visibleRows.length} in chat to keep it readable.`);
+  }
+
+  return lines.join('\n');
+}
+
+function formatAgentFlowCapabilityReply(message: string): string {
+  if (isExplicitFullCapabilityRequest(message)) {
     return getAgentFlowCircleStackSummary();
   }
+  return formatSharedAgentFlowCapabilityReply();
+}
 
-  if (asksProductInfo && /\bfunding\b/i.test(normalized)) {
+function buildExternalPersonUnknownReply(message: string): string | null {
+  const match = message.trim().match(
+    /^who\s+is\s+(.+?)\s+from\s+([a-z][a-z0-9 .&-]{1,60})\??$/i,
+  );
+  if (!match) return null;
+
+  const personRaw = match[1]?.trim().replace(/\s+/g, ' ');
+  const companyRaw = match[2]?.trim().replace(/\s+/g, ' ');
+  if (!personRaw || !companyRaw) return null;
+
+  const normalized = `${personRaw} ${companyRaw}`.toLowerCase();
+  if (/\b(agentflow|you|your app|this app)\b/i.test(normalized)) {
+    return null;
+  }
+
+  const person = personRaw
+    .split(' ')
+    .map((part) => (part ? `${part.charAt(0).toUpperCase()}${part.slice(1)}` : part))
+    .join(' ');
+  const company = /^cicle$/i.test(companyRaw) ? 'Circle' : companyRaw;
+  return `I don't have information about ${person} from ${company} in my current context.`;
+}
+
+function formatAgentFlowDefinitionReply(): string {
+  return formatSharedAgentFlowDefinitionReply();
+}
+
+function formatAgentFlowHowItWorksReply(): string {
+  return formatSharedAgentFlowHowItWorksReply();
+}
+
+function isVaultApyLookup(normalizedProbe: string): boolean {
+  // v2 vault: check_apy removed. Use action='list' which returns per-vault
+  // live APY. Older saved scripts will need to be updated.
+  return /\bvault\b/i.test(normalizedProbe) && /\b(?:apy|yield|rate|return)\b/i.test(normalizedProbe);
+}
+
+/**
+ * Product FAQ fast-path: routing uses the visible probe only (`capabilityProbe`), never portfolio-injected tails.
+ * Meta/frustration and routing noise defer to Hermes.
+ */
+async function buildAgentFlowProductReply(
+  capabilityProbe: string,
+  capabilityThreadCtx: CapabilityThreadContext,
+): Promise<string | null> {
+  const trimmedProbe = capabilityProbe.trim();
+  if (!trimmedProbe) return null;
+  if (isVaultPositionIntent(trimmedProbe)) return null;
+  if (detectPortfolioImpactIntent(trimmedProbe)) return null;
+  if (isExplicitResearchRequest(trimmedProbe)) return null;
+  if (looksLikePredictionMarketResearch(trimmedProbe)) return null;
+  if (looksLikeSwapResearch(trimmedProbe)) return null;
+  if (looksLikeBridgeResearch(trimmedProbe)) return null;
+  if (isPortfolioSnapshotIntent(trimmedProbe)) return null;
+  const capabilityRouting = analyzeCapabilityAwareRouting(trimmedProbe);
+  if (hasClarifyCapability(capabilityRouting)) {
+    logFastPathDebug({ kind: 'product_skip', reason: 'capability_route_to_clarify' });
+    return null;
+  }
+  if (
+    capabilityRouting.bridge.routeToResearch ||
+    capabilityRouting.vault.routeToResearch ||
+    capabilityRouting.swap.routeToResearch ||
+    capabilityRouting.predmarket.routeToResearch ||
+    capabilityRouting.counterpartyRisk.routeToResearch
+  ) {
+    logFastPathDebug({ kind: 'product_skip', reason: 'capability_route_to_research' });
+    return null;
+  }
+
+  if (isNoiseOnlyChatProbe(trimmedProbe)) {
+    logFastPathDebug({ kind: 'product_skip', reason: 'noise_probe' });
+    return null;
+  }
+
+  const productRoutingNormalized = trimmedProbe.toLowerCase();
+
+  if (shouldHandleAsAgentPayHistoryRequest(trimmedProbe)) {
+    logFastPathDebug({ kind: 'product_skip', reason: 'agentpay_history_intent' });
+    return null;
+  }
+
+  if (isPredictionMarketPositionIntent(trimmedProbe) || isPredictionMarketPositionHowToIntent(trimmedProbe)) {
+    logFastPathDebug({ kind: 'product_skip', reason: 'predmarket_position_intent' });
+    return null;
+  }
+
+  if (
+    /\bagentflow\b/i.test(productRoutingNormalized) &&
+    !isExplicitFullCapabilityRequest(trimmedProbe) &&
+    /\b(?:i\s+am\s+talking\s+about|i['’]m\s+talking\s+about|about\s+agentflow\s+on\s+arc|agentflow\s+on\s+arc)\b/i.test(
+      productRoutingNormalized,
+    )
+  ) {
+    logFastPathDebug({ kind: 'product', branch: 'scope_clarification' });
+    return 'Hey, how can I help with AgentFlow on Arc today?';
+  }
+
+  if (hasProductRoutingBypassSignals(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product_skip', reason: 'bypass_signals' });
+    return null;
+  }
+
+  if (
+    /\b(?:new here|first time|before doing anything|what should you ask|what do you need)\b/i.test(
+      productRoutingNormalized,
+    ) &&
+    /\b(?:send|pay|transfer|money|friend|country|cross-border|international)\b/i.test(productRoutingNormalized)
+  ) {
+    logFastPathDebug({ kind: 'product', branch: 'cross_border_onboarding' });
     return [
-      'Funding is the operational reserve page for AgentFlow.',
+      'For an AgentPay cross-border USDC send, I need:',
+      '- Recipient .arc name, saved contact, or USDC address',
+      '- Amount in USDC',
+      '- Whether it is one-time or scheduled',
+      '- Optional note or reference',
       '',
-      'Use it to move Arc USDC between your EOA, your Agent wallet, and your Gateway reserve.',
-      '- EOA: identity, signing, and funding wallet',
-      '- Agent wallet / DCW: main execution wallet for chat actions',
-      '- Gateway reserve: x402 nanopayment balance for paid agent work',
-      '',
-      'Funding is not the manual bridge surface. AgentFlow bridging happens through the sponsored Bridge agent in chat.',
+      'Before anything moves, I show a real preview and you reply YES to execute or NO to cancel.',
     ].join('\n');
   }
 
-  if (asksProductInfo && /\bagentpay\b/i.test(normalized)) {
+  if (
+    /\bbridge\b/i.test(productRoutingNormalized) &&
+    /\b(?:manual(?:ly)?|eoa|funding)\b/i.test(productRoutingNormalized)
+  ) {
+    logFastPathDebug({ kind: 'product', branch: 'bridge_manual' });
+    return formatBridgeExecutionReply();
+  }
+
+  if (/\bagentflow\b/i.test(productRoutingNormalized) && isExplicitFullCapabilityRequest(trimmedProbe)) {
+    logFastPathDebug({ kind: 'product', branch: 'technical_map' });
+    return formatAgentFlowCapabilityReply(trimmedProbe);
+  }
+
+  const asksProductInfo =
+    /(?:^|\b)(?:what|how|why|which|explain|tell\s+me\s+about)\b/i.test(productRoutingNormalized) ||
+    /\bwhat\s+is\b/i.test(productRoutingNormalized) ||
+    /\bhow\s+does\b/i.test(productRoutingNormalized);
+  const isStandaloneCapabilityQuestion = shouldHandleAsAgentFlowCapabilityQuestion(
+    trimmedProbe,
+    capabilityThreadCtx,
+  );
+
+  const productRagAnswer =
+    asksProductInfo || isStandaloneCapabilityQuestion ? answerProductQuestion(trimmedProbe) : null;
+  if (productRagAnswer && productRagAnswer.confidence >= 0.35) {
+    logFastPathDebug({
+      kind: 'product',
+      branch: 'product_rag',
+      sources: productRagAnswer.sources,
+    });
+    return productRagAnswer.answer;
+  }
+
+  if (asksProductInfo && !isStandaloneCapabilityQuestion) {
+    const vectorResults = await searchRag(trimmedProbe, { threshold: 0.65 });
+    if (vectorResults.length > 0) {
+      console.info('[RAG_VECTOR_HIT]', {
+        count: vectorResults.length,
+        top_similarity: vectorResults[0].similarity,
+      });
+      return vectorResults
+        .slice(0, 3)
+        .map((result) => result.content)
+        .join('\n\n');
+    }
+  }
+
+  if (/^what\s+is\s+agentflow\??$/i.test(trimmedProbe)) {
+    logFastPathDebug({ kind: 'product', branch: 'definition' });
+    return formatAgentFlowDefinitionReply();
+  }
+
+  if (/^how\s+does\s+agentflow\s+work\??$/i.test(trimmedProbe)) {
+    logFastPathDebug({ kind: 'product', branch: 'how_it_works' });
+    return formatAgentFlowHowItWorksReply();
+  }
+
+  if (asksProductInfo && /\bfunding\b/i.test(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'funding' });
+    return [
+      'Funding is the money-movement page for AgentFlow.',
+      '',
+      'Use it to move Arc USDC between your AgentFlow execution wallet and your Gateway reserve.',
+      '- Execution wallet / DCW: the default wallet AgentFlow uses for chat actions',
+      '- Gateway reserve: the x402 balance used for paid agent work',
+      '',
+      'Bridge is separate: it starts from your connected wallet in the web app and mints into your AgentFlow wallet on Arc.',
+    ].join('\n');
+  }
+
+  if (
+    asksProductInfo &&
+    /\bbridge\b/i.test(productRoutingNormalized) &&
+    !/\b(?:all|supported|support|chains?|technical|circle\s+stack|cctp)\b/i.test(productRoutingNormalized)
+  ) {
+    logFastPathDebug({ kind: 'product', branch: 'bridge_overview' });
+    return formatBridgeOverviewReply();
+  }
+
+  if (asksProductInfo && /\bagentpay\b/i.test(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'agentpay' });
     return [
       'AgentPay is AgentFlow\'s payment product.',
       '',
@@ -3642,7 +4343,26 @@ function buildAgentFlowProductReply(message: string): string | null {
     ].join('\n');
   }
 
-  if (asksProductInfo && /\bportfolio\b/i.test(normalized)) {
+  if (asksProductInfo && /\btelegram\b/i.test(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'telegram' });
+    return [
+      'You can link AgentFlow to Telegram and keep using the same account there.',
+      '',
+      'Connect the same wallet on the web app first, then open AgentFlow in Telegram.',
+      '',
+      'Swaps, research, and AgentPay features work in Telegram.',
+      '',
+      'If Telegram is linked, AgentFlow can notify you there when longer research finishes.',
+    ].join('\n');
+  }
+
+  if (asksProductInfo && isVoiceToTextIntent(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'voice_to_text' });
+    return buildVoiceToTextGuideReply();
+  }
+
+  if (asksProductInfo && /\bportfolio\b/i.test(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'portfolio' });
     return [
       'Portfolio is the DCW-first wallet view.',
       '',
@@ -3650,7 +4370,20 @@ function buildAgentFlowProductReply(message: string): string | null {
     ].join('\n');
   }
 
-  if (asksProductInfo && /\bvault\b/i.test(normalized) && !isVaultApyLookup(normalized)) {
+  if (
+    asksProductInfo &&
+    /\b(?:prediction|predmarket|prediction market|markets|betting)\b/i.test(productRoutingNormalized)
+  ) {
+    logFastPathDebug({ kind: 'product', branch: 'predmarket' });
+    return [
+      'Prediction markets let you browse live markets, inspect details, check your positions, and place or exit trades from chat.',
+      '',
+      'The normal flow is list or inspect first, then preview the action, then reply YES to execute.',
+    ].join('\n');
+  }
+
+  if (asksProductInfo && /\bvault\b/i.test(productRoutingNormalized) && !isVaultApyLookup(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'vault' });
     return [
       'Vault lets AgentFlow deposit and withdraw Arc USDC from the AgentFlow vault using your Agent wallet / DCW.',
       '',
@@ -3658,15 +4391,9 @@ function buildAgentFlowProductReply(message: string): string | null {
     ].join('\n');
   }
 
-  if (asksProductInfo && /\b(?:benchmark|economy)\b/i.test(normalized)) {
-    return [
-      'Benchmark is AgentFlow\'s shared proof page for the hackathon.',
-      '',
-      'It shows global nanopayment settlements, A2A pairs, throughput, and margin on Arc. The page is shared, but starting a benchmark run is private to the signed-in user.',
-    ].join('\n');
-  }
 
-  if (asksProductInfo && /\bresearch\b/i.test(normalized)) {
+  if (asksProductInfo && /\bresearch\b/i.test(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'research' });
     return [
       'Research is AgentFlow\'s multi-agent report pipeline.',
       '',
@@ -3674,7 +4401,8 @@ function buildAgentFlowProductReply(message: string): string | null {
     ].join('\n');
   }
 
-  if (asksProductInfo && /\b(?:invoice|invoices)\b/i.test(normalized)) {
+  if (asksProductInfo && /\b(?:invoice|invoices)\b/i.test(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'invoice' });
     return [
       'AgentFlow invoices live under AgentPay.',
       '',
@@ -3682,7 +4410,8 @@ function buildAgentFlowProductReply(message: string): string | null {
     ].join('\n');
   }
 
-  if (asksProductInfo && /\bcontacts?\b/i.test(normalized)) {
+  if (asksProductInfo && /\bcontacts?\b/i.test(productRoutingNormalized)) {
+    logFastPathDebug({ kind: 'product', branch: 'contacts' });
     return [
       'Contacts let you save counterparties by name inside AgentPay.',
       '',
@@ -3693,10 +4422,34 @@ function buildAgentFlowProductReply(message: string): string | null {
   return null;
 }
 
+function shouldOfferPostRouterProductFallback(intent: AgentFlowIntent): boolean {
+  if (intent.intent === AgentFlowIntentName.ResearchReport) {
+    return false;
+  }
+
+  if (intent.intent !== AgentFlowIntentName.GeneralChat) {
+    return true;
+  }
+
+  const slots =
+    intent.slots && typeof intent.slots === 'object'
+      ? (intent.slots as Record<string, unknown>)
+      : {};
+  const topicHint = typeof slots.topic_hint === 'string' ? slots.topic_hint : '';
+
+  return [
+    'capabilities',
+    'transcribe_capability',
+    'predmarket_redeem_help',
+    'capability_ambiguity',
+  ].includes(topicHint);
+}
+
 function isPendingActionFollowup(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return false;
   return (
+    /^(?:ok|okay|sure|got it|understood|alright|fine|cool|yep|yeah|yes please)$/i.test(normalized) ||
     /\bwhat(?:'s| is)\s+next\b/i.test(normalized) ||
     /\bwhat\s+now\b/i.test(normalized) ||
     /\bnext\s+step\b/i.test(normalized) ||
@@ -3730,17 +4483,1260 @@ function formatPendingActionFollowup(
     ].join('\n');
   }
 
-  if (pending.tool === 'bridge_usdc') {
-    const amount = String(pending.args?.amount ?? '').trim() || 'the quoted amount';
-    const sourceChain = String(pending.args?.sourceChain ?? 'the selected source chain').trim();
+  if (pending.tool === 'predict_action') {
+    const action = String(pending.payload?.action ?? 'market action').trim().toLowerCase();
+    const title =
+      typeof pending.payload?.marketTitle === 'string' && pending.payload.marketTitle.trim()
+        ? pending.payload.marketTitle.trim()
+        : 'the selected market';
+    if (action === 'buy') {
+      return [
+        `You have a pending prediction market bet for ${title}.`,
+        '',
+        'Reply YES to execute or NO to cancel.',
+      ].join('\n');
+    }
+    if (action === 'sell') {
+      return [
+        `You have a pending prediction market sell for ${title}.`,
+        '',
+        'Reply YES to execute or NO to cancel.',
+      ].join('\n');
+    }
     return [
-      `You have a pending sponsored bridge quote for ${amount} USDC from ${sourceChain} to Arc.`,
+      `You have a pending prediction market ${action} for ${title}.`,
       '',
       'Reply YES to execute or NO to cancel.',
     ].join('\n');
   }
 
   return 'You have a pending action. Reply YES to execute or NO to cancel.';
+}
+
+function isSoftContinuationReply(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  return /^(?:ok|okay|sure|got it|understood|alright|fine|cool|yep|yeah|go ahead|do it|continue|carry on|sounds good|please)$/i.test(
+    normalized,
+  );
+}
+
+function buildBackendContinuationReply(input: {
+  message: string;
+  history: BrainConversationMessage[];
+  pending: Awaited<ReturnType<typeof loadPendingAction>>;
+}): string | null {
+  const normalized = input.message.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  const lastAssistant = getMostRecentAssistantMessage(input.history);
+  if (!lastAssistant) {
+    return null;
+  }
+
+  if (
+    input.pending &&
+    !/^(?:yes|no)$/i.test(normalized) &&
+    (isPendingActionFollowup(input.message) ||
+      isSoftContinuationReply(input.message) ||
+      /^(?:what now|next|next step|how do i continue)$/i.test(normalized))
+  ) {
+    return formatPendingActionFollowup(input.pending);
+  }
+
+  if (
+    isSoftContinuationReply(input.message) &&
+    /\bHow much (USDC|EURC) do you want to swap into (USDC|EURC)\?/i.test(lastAssistant)
+  ) {
+    return `${lastAssistant}\n\nReply with a plain number like "1".`;
+  }
+
+  if (
+    isSoftContinuationReply(input.message) &&
+    /\bHow much (USDC|EURC) do you want to (deposit|withdraw)\b/i.test(lastAssistant)
+  ) {
+    return `${lastAssistant}\n\nReply with a plain number like "1".`;
+  }
+
+  if (
+    isSoftContinuationReply(input.message) &&
+    /\bTell me how much USDC you want to bridge from\b/i.test(lastAssistant)
+  ) {
+    return `${lastAssistant}\n\nReply with a plain number like "1".`;
+  }
+
+  if (
+    /^(?:yes|y|yeah|yep|sure|ok|okay|go ahead)$/i.test(normalized) &&
+    /Do you want a live swap quote, or do you want me to explain how swaps work on AgentFlow\?/i.test(
+      lastAssistant,
+    )
+  ) {
+    return [
+      'I can do either one.',
+      '',
+      'Say "quote 1 USDC to EURC" for a live quote, or say "explain swaps" and I will walk you through it.',
+    ].join('\n');
+  }
+
+  if (
+    /^(?:yes|y|yeah|yep|sure|ok|okay|go ahead)$/i.test(normalized) &&
+    /Do you want me to show the chains where this wallet already has USDC, or do you already have a source chain in mind\?/i.test(
+      lastAssistant,
+    )
+  ) {
+    return [
+      'I can do either one.',
+      '',
+      'Say "show my funded chains" to see the supported chains where this wallet already has USDC, or say "bridge 1 USDC from Base Sepolia" if you already know the source chain.',
+    ].join('\n');
+  }
+
+  if (
+    isSoftContinuationReply(input.message) &&
+    /Reply YES to execute or NO to cancel\./i.test(lastAssistant)
+  ) {
+    return input.pending
+      ? formatPendingActionFollowup(input.pending)
+      : 'That action is still waiting. Reply YES to execute or NO to cancel.';
+  }
+
+  return null;
+}
+
+const ROUTER_CONTINUATION_PREFIX = 'router:continuation:';
+
+type RouterContinuationState = {
+  intent: AgentFlowIntentName;
+  rawMessage: string;
+  slots: Record<string, unknown>;
+  slotsMissing: string[];
+  clarification: string;
+  createdAt: string;
+};
+
+function buildRouterContinuationKey(sessionId: string): string {
+  return `${ROUTER_CONTINUATION_PREFIX}${sessionId}`;
+}
+
+function isRouterContinuationIntent(intent: AgentFlowIntentName): boolean {
+  return [
+    AgentFlowIntentName.AgentpaySend,
+    AgentFlowIntentName.AgentpayRequest,
+    AgentFlowIntentName.AgentpayPaymentLink,
+    AgentFlowIntentName.ContactsCreate,
+    AgentFlowIntentName.ContactsUpdate,
+    AgentFlowIntentName.ContactsDelete,
+    AgentFlowIntentName.ScheduleCreate,
+    AgentFlowIntentName.ScheduleCancel,
+    AgentFlowIntentName.SplitExecute,
+    AgentFlowIntentName.BatchExecute,
+    AgentFlowIntentName.InvoiceCreate,
+  ].includes(intent);
+}
+
+function parseContinuationAmount(message: string): { value: number; currency: 'USDC' | 'EURC' } | null {
+  const match = message.match(/(?:^|[^\w])(\d+(?:\.\d+)?)(?:\s*(usdc|eurc|usd|dollars?))?\b/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const currency = /\beurc\b/i.test(match[2] || message) ? 'EURC' : 'USDC';
+  return { value, currency };
+}
+
+function parseContinuationRecipient(message: string): { handle?: string; address?: string } | null {
+  const address = message.match(/\b0x[a-fA-F0-9]{40}\b/)?.[0];
+  if (address) return { address };
+
+  const handle = message.match(/\b([a-z0-9][a-z0-9-]*\.arc)\b/i)?.[1];
+  if (handle) return { handle: handle.toLowerCase() };
+
+  const bareName = message.trim().match(/^[a-z][a-z0-9_-]{1,31}$/i)?.[0];
+  if (bareName) return { handle: bareName.toLowerCase() };
+
+  return null;
+}
+
+function parseContinuationContactName(message: string): string | null {
+  const normalized = message.trim();
+  if (!normalized) return null;
+  if (!/^[a-z][a-z0-9_-]{1,31}$/i.test(normalized)) return null;
+  return normalized.toLowerCase();
+}
+
+function parseContactNameFromRawMessage(message: string): string | null {
+  const normalized = message.trim();
+  if (!normalized) return null;
+  const match =
+    normalized.match(/\bsave\s+([a-z][a-z0-9_-]{1,31})\b/i) ||
+    normalized.match(/\badd\s+contact\s+([a-z][a-z0-9_-]{1,31})\b/i) ||
+    normalized.match(/\bupdate\s+([a-z][a-z0-9_-]{1,31})\b/i) ||
+    normalized.match(/\bdelete\s+contact\s+([a-z][a-z0-9_-]{1,31})\b/i) ||
+    normalized.match(/\bremove\s+contact\s+([a-z][a-z0-9_-]{1,31})\b/i);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+function parseContinuationCadence(message: string): string | null {
+  const normalized = message.trim();
+  if (!normalized) return null;
+  if (
+    /\b(?:every\s+\w+|daily|weekly|monthly|yearly|each\s+\w+|every\s+\d+\s+(?:day|days|week|weeks|month|months))\b/i.test(
+      normalized,
+    )
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+function getRecipientTextFromSlots(slots: Record<string, unknown>): string | null {
+  const recipient = slots.recipient;
+  if (!recipient || typeof recipient !== 'object') return null;
+  const recipientRecord = recipient as Record<string, unknown>;
+  if (typeof recipientRecord.handle === 'string' && recipientRecord.handle.trim()) {
+    return recipientRecord.handle.trim();
+  }
+  if (typeof recipientRecord.address === 'string' && recipientRecord.address.trim()) {
+    return recipientRecord.address.trim();
+  }
+  return null;
+}
+
+function getAmountTextFromSlots(slots: Record<string, unknown>, key: 'amount' | 'total_amount' = 'amount'): string | null {
+  const amount = slots[key];
+  if (!amount || typeof amount !== 'object') return null;
+  const amountRecord = amount as Record<string, unknown>;
+  const value =
+    typeof amountRecord.value === 'number'
+      ? String(amountRecord.value)
+      : typeof amountRecord.value === 'string' && amountRecord.value.trim()
+        ? amountRecord.value.trim()
+        : '';
+  if (!value) return null;
+  const currency =
+    typeof amountRecord.currency === 'string' && amountRecord.currency.trim()
+      ? amountRecord.currency.trim().toUpperCase()
+      : 'USDC';
+  return `${value} ${currency}`;
+}
+
+function buildRouterContinuationReminder(state: RouterContinuationState): string {
+  const clarification = state.clarification.trim();
+  if (/how much/i.test(clarification)) {
+    return `${clarification}\n\nReply with a plain number like "5".`;
+  }
+  if (/who|recipient|handle|address|contact/i.test(clarification)) {
+    return `${clarification}\n\nReply with a .arc handle, saved contact name, or wallet address.`;
+  }
+  if (/how often|cadence/i.test(clarification)) {
+    return `${clarification}\n\nReply with something like "every week" or "monthly".`;
+  }
+  return clarification;
+}
+
+function tryBuildRouterContinuationMessage(
+  state: RouterContinuationState,
+  reply: string,
+): string | null {
+  const trimmedReply = reply.trim();
+  if (!trimmedReply) return null;
+
+  const amount = parseContinuationAmount(trimmedReply);
+  const recipient = parseContinuationRecipient(trimmedReply);
+  const contactName = parseContinuationContactName(trimmedReply);
+  const cadence = parseContinuationCadence(trimmedReply);
+  const slots = state.slots;
+  const recipientText = getRecipientTextFromSlots(slots);
+  const amountText = getAmountTextFromSlots(slots);
+  const totalAmountText = getAmountTextFromSlots(slots, 'total_amount');
+  const schedule = slots.schedule && typeof slots.schedule === 'object' ? (slots.schedule as Record<string, unknown>) : {};
+  const scheduleCadence =
+    typeof schedule.cadence === 'string' && schedule.cadence.trim() ? schedule.cadence.trim() : null;
+  const description =
+    typeof slots.description === 'string' && slots.description.trim() ? slots.description.trim() : null;
+  const remark = typeof slots.remark === 'string' && slots.remark.trim() ? slots.remark.trim() : null;
+
+  switch (state.intent) {
+    case AgentFlowIntentName.AgentpaySend:
+    case AgentFlowIntentName.AgentpayRequest:
+    case AgentFlowIntentName.AgentpayPaymentLink: {
+      const verb =
+        state.intent === AgentFlowIntentName.AgentpayRequest
+          ? 'request'
+          : state.intent === AgentFlowIntentName.AgentpayPaymentLink
+            ? 'payment link for'
+            : 'send';
+      if (state.slotsMissing.includes('amount.value') && amount && recipientText) {
+        const suffix = remark ? ` for ${remark}` : '';
+        return `${verb} ${recipientText} ${amount.value} ${amount.currency}${suffix}`;
+      }
+      if (state.slotsMissing.includes('recipient') && recipient && amountText) {
+        const recipientValue = recipient.handle ?? recipient.address!;
+        const suffix = remark ? ` for ${remark}` : '';
+        return `${verb} ${recipientValue} ${amountText}${suffix}`;
+      }
+      return null;
+    }
+    case AgentFlowIntentName.ContactsCreate: {
+      const name =
+        typeof slots.name === 'string' && slots.name.trim() ? slots.name.trim().toLowerCase() : null;
+      const fallbackName = name ?? parseContactNameFromRawMessage(state.rawMessage);
+      if (state.slotsMissing.includes('recipient') && fallbackName && recipient) {
+        const recipientValue = recipient.handle ?? recipient.address!;
+        return `save ${fallbackName} as ${recipientValue}`;
+      }
+      if (state.slotsMissing.includes('name') && contactName && recipientText) {
+        return `save ${contactName} as ${recipientText}`;
+      }
+      return null;
+    }
+    case AgentFlowIntentName.ContactsUpdate: {
+      const name =
+        typeof slots.name === 'string' && slots.name.trim() ? slots.name.trim().toLowerCase() : null;
+      const fallbackName = name ?? parseContactNameFromRawMessage(state.rawMessage);
+      if (state.slotsMissing.includes('recipient') && fallbackName && recipient) {
+        const recipientValue = recipient.handle ?? recipient.address!;
+        return `update ${fallbackName} to ${recipientValue}`;
+      }
+      if (state.slotsMissing.includes('name') && contactName && recipientText) {
+        return `update ${contactName} to ${recipientText}`;
+      }
+      return null;
+    }
+    case AgentFlowIntentName.ContactsDelete: {
+      const fallbackName = contactName ?? parseContactNameFromRawMessage(state.rawMessage);
+      if (state.slotsMissing.includes('name') && fallbackName) {
+        return `delete contact ${fallbackName}`;
+      }
+      return null;
+    }
+    case AgentFlowIntentName.ScheduleCreate: {
+      if (state.slotsMissing.includes('schedule.cadence') && cadence && recipientText && amountText) {
+        const suffix = remark ? ` for ${remark}` : '';
+        return `schedule ${amountText} to ${recipientText} ${cadence}${suffix}`;
+      }
+      if (state.slotsMissing.includes('amount.value') && amount && recipientText && scheduleCadence) {
+        const suffix = remark ? ` for ${remark}` : '';
+        return `schedule ${amount.value} ${amount.currency} to ${recipientText} ${scheduleCadence}${suffix}`;
+      }
+      if (state.slotsMissing.includes('recipient') && recipient && amountText && scheduleCadence) {
+        const recipientValue = recipient.handle ?? recipient.address!;
+        const suffix = remark ? ` for ${remark}` : '';
+        return `schedule ${amountText} to ${recipientValue} ${scheduleCadence}${suffix}`;
+      }
+      return null;
+    }
+    case AgentFlowIntentName.SplitExecute: {
+      const recipients = Array.isArray(slots.recipients) ? slots.recipients : [];
+      const recipientParts = recipients
+        .map((entry) => {
+          if (!entry || typeof entry !== 'object') return null;
+          const record = entry as Record<string, unknown>;
+          if (typeof record.handle === 'string' && record.handle.trim()) return record.handle.trim();
+          if (typeof record.address === 'string' && record.address.trim()) return record.address.trim();
+          return null;
+        })
+        .filter((value): value is string => Boolean(value));
+      if (state.slotsMissing.includes('total_amount.value') && amount && recipientParts.length >= 2) {
+        const suffix = remark ? ` for ${remark}` : '';
+        return `split ${amount.value} ${amount.currency} between ${recipientParts.join(', ')}${suffix}`;
+      }
+      return null;
+    }
+    case AgentFlowIntentName.InvoiceCreate: {
+      if (state.slotsMissing.includes('amount.value') && amount && recipientText && description) {
+        return `create invoice for ${recipientText} ${amount.value} ${amount.currency} for ${description}`;
+      }
+      if (state.slotsMissing.includes('recipient') && recipient && amountText && description) {
+        const recipientValue = recipient.handle ?? recipient.address!;
+        return `create invoice for ${recipientValue} ${amountText} for ${description}`;
+      }
+      if (state.slotsMissing.includes('description') && trimmedReply && recipientText && amountText) {
+        return `create invoice for ${recipientText} ${amountText} for ${trimmedReply}`;
+      }
+      return null;
+    }
+    case AgentFlowIntentName.BatchExecute: {
+      if (state.slotsMissing.some((slot) => slot.startsWith('payments'))) {
+        return /^batch\s+pay/i.test(trimmedReply) ? trimmedReply : `batch pay\n${trimmedReply}`;
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+async function loadRouterContinuationState(sessionId: string): Promise<RouterContinuationState | null> {
+  const raw = await getRedis().get(buildRouterContinuationKey(sessionId)).catch(() => null);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as RouterContinuationState;
+  } catch {
+    return null;
+  }
+}
+
+async function storeRouterContinuationState(sessionId: string, state: RouterContinuationState): Promise<void> {
+  await getRedis()
+    .set(buildRouterContinuationKey(sessionId), JSON.stringify(state), 'EX', 900)
+    .catch(() => null);
+}
+
+async function clearRouterContinuationState(sessionId: string): Promise<void> {
+  await getRedis().del(buildRouterContinuationKey(sessionId)).catch(() => null);
+}
+
+function extractPredictionMarketAddress(message: string): `0x${string}` | null {
+  const match = message.match(/\b0x[a-fA-F0-9]{40}\b/);
+  return match?.[0] ? (match[0] as `0x${string}`) : null;
+}
+
+type PredictionOutcomeChoice = {
+  index: number;
+  label: string;
+};
+
+function normalizePredictionOutcomeLabel(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function parseOutcomeOptionsFromSummaryLine(summaryLine: string): PredictionOutcomeChoice[] {
+  return summaryLine
+    .split(/\s*\/\s*/)
+    .map((segment, index) => {
+      const label = segment
+        .replace(/\s+\d+(?:\.\d+)?%.*$/i, '')
+        .replace(/\s+\([^)]*\)\s*$/i, '')
+        .trim();
+      if (!label) {
+        return null;
+      }
+      return {
+        index,
+        label,
+      } satisfies PredictionOutcomeChoice;
+    })
+    .filter((value): value is PredictionOutcomeChoice => value !== null);
+}
+
+function parseOutcomeOptionsFromDetailResult(result: string): PredictionOutcomeChoice[] {
+  const outcomesBlockMatch = result.match(/###\s+[^\n]*Outcomes\s*\n([\s\S]*?)(?:\n###\s|\n##\s|$)/i);
+  if (!outcomesBlockMatch) {
+    return [];
+  }
+
+  return outcomesBlockMatch[1]
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^-\s+/.test(line))
+    .map((line, index) => {
+      const label = line
+        .replace(/^-\s+/, '')
+        .replace(/:\s+[\s\S]*$/, '')
+        .trim();
+      if (!label) {
+        return null;
+      }
+      return {
+        index,
+        label,
+      } satisfies PredictionOutcomeChoice;
+    })
+    .filter((value): value is PredictionOutcomeChoice => value !== null);
+}
+
+function parseOutcomeOptionsForMarketFromListResult(
+  result: string,
+  marketAddress: `0x${string}`,
+): PredictionOutcomeChoice[] {
+  const sections = result.split(/\n(?=###\s+)/);
+  for (const section of sections) {
+    if (!section.includes(marketAddress)) {
+      continue;
+    }
+    const outcomesLineMatch = section.match(/- \*\*Outcomes:\*\* ([^\n]+)/i);
+    if (!outcomesLineMatch) {
+      continue;
+    }
+    const options = parseOutcomeOptionsFromSummaryLine(outcomesLineMatch[1]);
+    if (options.length) {
+      return options;
+    }
+  }
+  return [];
+}
+
+function extractPredictionOutcomeOptionsFromHistory(
+  history: BrainConversationMessage[] = [],
+  marketAddress: `0x${string}` | null = null,
+): PredictionOutcomeChoice[] {
+  for (let i = history.length - 1; i >= Math.max(0, history.length - 8); i -= 1) {
+    const content = history[i]?.content;
+    if (typeof content !== 'string' || !content.trim()) {
+      continue;
+    }
+    if (marketAddress) {
+      const listOptions = parseOutcomeOptionsForMarketFromListResult(content, marketAddress);
+      if (listOptions.length) {
+        return listOptions;
+      }
+    }
+    const detailOptions = parseOutcomeOptionsFromDetailResult(content);
+    if (detailOptions.length) {
+      return detailOptions;
+    }
+  }
+  return [];
+}
+
+function findOutcomeChoiceByLabel(
+  message: string,
+  options: PredictionOutcomeChoice[],
+): PredictionOutcomeChoice | null {
+  if (!options.length) {
+    return null;
+  }
+  const normalizedMessage = normalizePredictionOutcomeLabel(message);
+  const matches = options
+    .map((option) => ({
+      option,
+      normalizedLabel: normalizePredictionOutcomeLabel(option.label),
+    }))
+    .filter(
+      ({ normalizedLabel }) =>
+        normalizedLabel.length > 1 &&
+        normalizedMessage.includes(normalizedLabel),
+    )
+    .sort((left, right) => right.normalizedLabel.length - left.normalizedLabel.length);
+
+  if (!matches.length) {
+    return null;
+  }
+  if (
+    matches.length > 1 &&
+    matches[0].normalizedLabel === matches[1].normalizedLabel
+  ) {
+    return null;
+  }
+  return matches[0].option;
+}
+
+function formatPredictionOutcomePrompt(outcome: PredictionOutcomeChoice): string {
+  return `outcome ${outcome.index} (${outcome.label})`;
+}
+
+function extractPredictionOutcomeChoice(
+  message: string,
+  history: BrainConversationMessage[] = [],
+  marketAddress: `0x${string}` | null = null,
+): PredictionOutcomeChoice | null {
+  const outcomeIndexMatch = message.match(/\boutcome\s*(\d+)(?:\s*\(([^)]+)\))?/i);
+  if (outcomeIndexMatch) {
+    return {
+      index: Number(outcomeIndexMatch[1]),
+      label: outcomeIndexMatch[2]?.trim() || `Outcome ${outcomeIndexMatch[1]}`,
+    };
+  }
+
+  if (/\byes\b/i.test(message)) {
+    return { index: 0, label: 'Yes' };
+  }
+  if (/\bno\b/i.test(message)) {
+    return { index: 1, label: 'No' };
+  }
+
+  const historyOptions = extractPredictionOutcomeOptionsFromHistory(history, marketAddress);
+  return findOutcomeChoiceByLabel(message, historyOptions);
+}
+
+function extractRecentPredictionContextAddress(
+  history: BrainConversationMessage[] = [],
+): `0x${string}` | null {
+  const seen = new Set<string>();
+  for (let i = Math.max(0, history.length - 8); i < history.length; i += 1) {
+    const content = history[i]?.content;
+    if (typeof content !== 'string') continue;
+    const matches = content.match(/\b0x[a-fA-F0-9]{40}\b/g) || [];
+    for (const match of matches) {
+      seen.add(match);
+    }
+  }
+  return seen.size === 1 ? (Array.from(seen)[0] as `0x${string}`) : null;
+}
+
+function lastAssistantLooksLikePredmarketList(
+  lastAssistantMessage: string | null,
+): boolean {
+  if (!lastAssistantMessage) {
+    return false;
+  }
+  return /prediction markets on achmarket|show more markets|bet x usdc on/i.test(
+    lastAssistantMessage,
+  );
+}
+
+function buildPredictionAmountChoiceReply(
+  marketAddress: `0x${string}`,
+  outcome: PredictionOutcomeChoice,
+): DirectAgentFlowRoute {
+  const outcomePrompt = formatPredictionOutcomePrompt(outcome);
+  return {
+    type: 'reply',
+    text: `How much do you want to bet on ${outcome.label} for this market?\n\nChoose an amount below, or type a custom amount like \`bet 3 USDC on ${outcomePrompt} for ${marketAddress}\`.`,
+    quickActionGroups: [
+      {
+        title: outcome.label,
+        actions: [
+          {
+            label: '1 USDC',
+            prompt: `bet 1 USDC on ${outcomePrompt} for ${marketAddress}`,
+          },
+          {
+            label: '5 USDC',
+            prompt: `bet 5 USDC on ${outcomePrompt} for ${marketAddress}`,
+          },
+          {
+            label: '10 USDC',
+            prompt: `bet 10 USDC on ${outcomePrompt} for ${marketAddress}`,
+          },
+          {
+            label: 'Details',
+            prompt: `tell me about ${marketAddress}`,
+            tone: 'secondary',
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildPredictionOutcomeChoiceReply(
+  marketAddress: `0x${string}`,
+  amount: string | null,
+  outcomes: PredictionOutcomeChoice[],
+): DirectAgentFlowRoute {
+  const amountText = amount ? `for your ${amount} USDC bet` : 'for this market';
+  return {
+    type: 'reply',
+    text: `Which outcome do you want ${amountText}?\n\nChoose one below.`,
+    quickActionGroups: [
+      {
+        title: 'Pick an outcome',
+        actions: [
+          ...outcomes.map((outcome) => ({
+            label: outcome.label,
+            prompt: amount
+              ? `bet ${amount} USDC on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`
+              : `bet on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`,
+          })),
+          {
+            label: 'Details',
+            prompt: `tell me about ${marketAddress}`,
+            tone: 'secondary' as const,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildPredmarketCategoryActionGroups(): Array<{
+  title?: string;
+  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+}> {
+  return [
+    {
+      title: 'Browse categories',
+      actions: [
+        { label: 'All', prompt: 'show prediction markets', tone: 'secondary' },
+        { label: 'Crypto', prompt: 'show crypto markets' },
+        { label: 'Sports', prompt: 'show sports markets' },
+        { label: 'Politics', prompt: 'show politics markets' },
+        { label: 'Entertainment', prompt: 'show entertainment markets' },
+      ],
+    },
+  ];
+}
+
+function buildVaultListQuickActionGroups(): Array<{
+  title?: string;
+  actions: Array<{
+    label: string;
+    prompt: string;
+    actionId?: string;
+    tone?: 'primary' | 'secondary';
+  }>;
+}> {
+  return [
+    {
+      title: 'Choose vault',
+      actions: [
+        { label: 'Lunex USDC Vault', prompt: 'use luneUSDC vault' },
+        { label: 'Lunex EURC Vault', prompt: 'use luneEURC vault' },
+        {
+          label: 'My positions',
+          prompt: 'show my vault positions',
+          actionId: AgentFlowIntentName.VaultPosition,
+          tone: 'secondary',
+        },
+      ],
+    },
+  ];
+}
+
+function buildVaultAmountChoiceReply(vaultSymbol: 'luneUSDC' | 'luneEURC'): DirectAgentFlowRoute {
+  const assetSymbol = vaultSymbol === 'luneEURC' ? 'EURC' : 'USDC';
+  const vaultLabel = vaultSymbol === 'luneEURC' ? 'Lunex EURC Vault' : 'Lunex USDC Vault';
+  return {
+    type: 'reply',
+    text:
+      `How much ${assetSymbol} do you want to deposit into ${vaultLabel}?\n\n` +
+      `Choose an amount below or type a custom one like \`deposit 25 ${assetSymbol} to ${vaultSymbol}\`.`,
+    quickActionGroups: [
+      {
+        title: vaultLabel,
+        actions: [
+          { label: `1 ${assetSymbol}`, prompt: `deposit 1 ${assetSymbol} to ${vaultSymbol}` },
+          { label: `10 ${assetSymbol}`, prompt: `deposit 10 ${assetSymbol} to ${vaultSymbol}` },
+          { label: `100 ${assetSymbol}`, prompt: `deposit 100 ${assetSymbol} to ${vaultSymbol}` },
+        ],
+      },
+    ],
+  };
+}
+
+function hasClarifyCapability(
+  capabilityRouting: ReturnType<typeof analyzeCapabilityAwareRouting>,
+): boolean {
+  return (
+    capabilityRouting.bridge.routeToClarify ||
+    capabilityRouting.vault.routeToClarify ||
+    capabilityRouting.swap.routeToClarify
+  );
+}
+
+function buildBridgeClarifyReply(message: string): DirectAgentFlowRoute {
+  const normalized = message.trim();
+  const mentionsArbitrum = /\barbitrum\b/i.test(normalized);
+  const mentionsBase = /\bbase\b/i.test(normalized);
+  const researchPrompt =
+    mentionsArbitrum && mentionsBase
+      ? 'research Arbitrum vs Base bridge comparison'
+      : 'research bridge source chain comparison';
+
+  return {
+    type: 'reply',
+    text:
+      mentionsArbitrum && mentionsBase
+        ? 'Do you want a research comparison, or do you want to work with AgentFlow bridge sources?'
+        : 'Do you want research on bridge sources, or do you want to see the AgentFlow bridge sources you can use?',
+    quickActionGroups: [
+      {
+        title: 'Choose next step',
+        actions: [
+          { label: 'Research comparison', prompt: researchPrompt },
+          { label: 'Show bridge sources', prompt: 'show supported bridge source chains' },
+        ],
+      },
+    ],
+  };
+}
+
+function buildVaultClarifyReply(message: string): DirectAgentFlowRoute {
+  const normalized = message.trim();
+  const mentionsLunex = /\b(?:lunex|luneusdc|luneeurc)\b/i.test(normalized);
+  const researchPrompt = mentionsLunex
+    ? 'research DeFi yield vault comparison'
+    : 'research yield vault providers in DeFi';
+  const featurePrompt = mentionsLunex ? 'show me Lunex vault options' : 'show me vaults';
+
+  return {
+    type: 'reply',
+    text: mentionsLunex
+      ? 'Do you want research on Lunex yields, or do you want to browse AgentFlow vaults?'
+      : 'Do you want research comparing vault providers, or do you want to browse the vaults available in AgentFlow?',
+    quickActionGroups: [
+      {
+        title: 'Choose next step',
+        actions: [
+          { label: mentionsLunex ? 'Research yields' : 'Research providers', prompt: researchPrompt },
+          { label: mentionsLunex ? 'Show Lunex vaults' : 'Show vaults', prompt: featurePrompt },
+          {
+            label: 'My positions',
+            prompt: 'show my vault positions',
+            actionId: AgentFlowIntentName.VaultPosition,
+            tone: 'secondary',
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildSwapClarifyReply(): DirectAgentFlowRoute {
+  return {
+    type: 'reply',
+    text: 'Do you want a research comparison of swap fees, or do you want to get a live AgentFlow swap quote?',
+    quickActionGroups: [
+      {
+        title: 'Choose next step',
+        actions: [
+          { label: 'Research fees', prompt: 'research swap fees across DEX providers' },
+          { label: 'Get quote', prompt: 'swap 1 USDC to EURC' },
+        ],
+      },
+    ],
+  };
+}
+
+function buildPredmarketClarifyReply(): DirectAgentFlowRoute {
+  return {
+    type: 'reply',
+    text: 'What would you like to do with prediction markets?',
+    quickActionGroups: [
+      {
+        title: 'Choose next step',
+        actions: [
+          { label: 'Browse live markets', prompt: 'show prediction markets' },
+          { label: 'My positions', prompt: 'show my prediction market positions', tone: 'secondary' },
+          { label: 'How it works', prompt: 'how do prediction markets work?', tone: 'secondary' },
+        ],
+      },
+    ],
+  };
+}
+
+function buildCapabilityClarifyReply(
+  message: string,
+  capabilityRouting: ReturnType<typeof analyzeCapabilityAwareRouting>,
+): DirectAgentFlowRoute | null {
+  if (capabilityRouting.bridge.routeToClarify) {
+    return buildBridgeClarifyReply(message);
+  }
+  if (capabilityRouting.vault.routeToClarify) {
+    return buildVaultClarifyReply(message);
+  }
+  if (capabilityRouting.swap.routeToClarify) {
+    return buildSwapClarifyReply();
+  }
+  return null;
+}
+
+function userExplicitlyRequestedLiveState(message: string): boolean {
+  const mode = classifyAnswerMode(message);
+  return (
+    mode === 'balance_state' ||
+    mode === 'portfolio_state' ||
+    mode === 'payment_state' ||
+    mode === 'financial_advice'
+  );
+}
+
+function detectVaultSelectionReply(
+  normalized: string,
+  lastAssistantMessage: string | null,
+): 'luneUSDC' | 'luneEURC' | null {
+  const hasRecentVaultChooser =
+    !!lastAssistantMessage &&
+    /\b(yield vaults on arc testnet|choose vault|choose a vault|lunex usdc vault|lunex eurc vault)\b/i.test(
+      lastAssistantMessage,
+    );
+  if (!hasRecentVaultChooser) {
+    return null;
+  }
+  if (
+    /\b(lune\s*usdc|luneusdc|usdc vault|usdc one|the usdc one|first vault|first one|the first one)\b/i.test(
+      normalized,
+    )
+  ) {
+    return 'luneUSDC';
+  }
+  if (
+    /\b(lune\s*eurc|luneeurc|eurc vault|eurc one|the eurc one|second vault|second one|the second one)\b/i.test(
+      normalized,
+    )
+  ) {
+    return 'luneEURC';
+  }
+  return null;
+}
+
+function buildPredmarketResearchPrompt(
+  title: string,
+  marketAddress: `0x${string}`,
+  outcomes: PredictionOutcomeChoice[] = [],
+): string {
+  void marketAddress;
+  const safeTitle = title.trim() || 'this prediction market';
+  const outcomeLabels = outcomes
+    .map((outcome) => outcome.label.trim())
+    .filter(Boolean);
+
+  return [
+    `research the prediction market topic: ${safeTitle}`,
+    outcomeLabels.length
+      ? `Listed outcomes in AgentFlow: ${outcomeLabels.join(' / ')}.`
+      : null,
+    'Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function buildPredmarketTradeActionGroup(
+  title: string,
+  marketAddress: `0x${string}`,
+  outcomes: PredictionOutcomeChoice[] = [],
+): {
+  title?: string;
+  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+} {
+  const outcomeActions = outcomes.map((outcome) => ({
+    label: outcome.label,
+    prompt: `bet on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`,
+  }));
+  return {
+    title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
+    actions: [
+      ...(outcomeActions.length
+        ? outcomeActions
+        : [{ label: 'Trade', prompt: `tell me about ${marketAddress}` }]),
+      { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress, outcomes) },
+      { label: 'Details', prompt: `tell me about ${marketAddress}`, tone: 'secondary' },
+    ],
+  };
+}
+
+function buildPredmarketOutcomeActions(
+  marketAddress: `0x${string}`,
+  outcomes: PredictionOutcomeChoice[],
+): Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }> {
+  return outcomes.map((outcome) => ({
+    label: outcome.label,
+    prompt: `bet on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`,
+  }));
+}
+
+function extractPredmarketResearchContext(
+  task: string,
+) : { marketAddress: `0x${string}` | null; titleHint: string | null } | null {
+  const marketAddress = extractPredictionMarketAddress(task);
+  const withoutPrefix = task
+    .replace(/^research\s+(?:this\s+)?(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
+    .replace(/^research\s+the\s+(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
+    .replace(/\bListed outcomes in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bMarket address for AgentFlow trade routing only:[^\n]*/gi, '')
+    .replace(/\bDo not research the contract address itself[^\n]*/gi, '')
+    .replace(/\bFocus on the real-world event[^\n]*/gi, '')
+    .replace(/\(\s*0x[a-fA-F0-9]{40}\s*\)/g, '')
+    .replace(/\b0x[a-fA-F0-9]{40}\b/g, '')
+    .trim();
+
+  if (!marketAddress && !withoutPrefix) {
+    return null;
+  }
+
+  return {
+    marketAddress: marketAddress ?? null,
+    titleHint: withoutPrefix || null,
+  };
+}
+
+function buildPredmarketListQuickActionGroups(
+  result: string,
+): Array<{
+  title?: string;
+  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+}> {
+  const groups = buildPredmarketCategoryActionGroups();
+  const marketMatches = Array.from(
+    result.matchAll(
+      /###\s+[^\n]*?\s(.+?)\n[\s\S]*?- \*\*Outcomes:\*\* ([^\n]+)\n[\s\S]*?- \*\*Address:\*\* `?(0x[a-fA-F0-9]{40})`?/g,
+    ),
+  );
+
+  for (const match of marketMatches) {
+    const title = match[1]?.trim() || 'Market';
+    const outcomes = parseOutcomeOptionsFromSummaryLine(match[2] || '');
+    const address = match[3] as `0x${string}`;
+    groups.push(buildPredmarketTradeActionGroup(title, address, outcomes));
+  }
+
+  if (/show more markets/i.test(result) || /There are \d+ more markets/i.test(result)) {
+    groups.push({
+      title: 'More results',
+      actions: [
+        { label: 'Show more markets', prompt: 'show more markets' },
+        { label: 'Show all markets', prompt: 'show all markets', tone: 'secondary' },
+      ],
+    });
+  }
+
+  return groups;
+}
+
+function buildPredmarketDetailQuickActionGroups(
+  result: string,
+  marketAddress: `0x${string}`,
+): Array<{
+  title?: string;
+  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+}> {
+  const titleMatch = result.match(/^##\s+(.+)$/m);
+  const title = titleMatch?.[1]?.trim() || 'Prediction market';
+  const stageMatch = result.match(/- \*\*Stage:\*\*\s+([A-Za-z]+)/i);
+  const stage = (stageMatch?.[1] || '').trim().toLowerCase();
+  const outcomes = parseOutcomeOptionsFromDetailResult(result);
+  if (outcomes.length && stage !== 'resolved' && stage !== 'cancelled' && stage !== 'expired') {
+    return [
+      {
+        title: 'Trade this market',
+        actions: [
+          ...outcomes.map((outcome) => ({
+            label: outcome.label,
+            prompt: `bet on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`,
+          })),
+          { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress) },
+          { label: 'Show more markets', prompt: 'show more markets', tone: 'secondary' },
+        ],
+      },
+    ];
+  }
+  if (stage === 'resolved') {
+    return [
+      {
+        title: 'Resolved market',
+        actions: [
+          { label: 'Redeem', prompt: `redeem ${marketAddress}` },
+          { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress) },
+          { label: 'Show positions', prompt: 'show my prediction market positions', tone: 'secondary' },
+        ],
+      },
+    ];
+  }
+  if (stage === 'cancelled' || stage === 'expired') {
+    return [
+      {
+        title: 'Closed market',
+        actions: [
+          { label: 'Refund', prompt: `refund ${marketAddress}` },
+          { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress) },
+          { label: 'Show positions', prompt: 'show my prediction market positions', tone: 'secondary' },
+        ],
+      },
+    ];
+  }
+  return [
+    {
+      title: 'Next step',
+      actions: [
+        { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress) },
+        { label: 'Show prediction markets', prompt: 'show prediction markets' },
+        { label: 'Show more markets', prompt: 'show more markets', tone: 'secondary' },
+      ],
+    },
+  ];
+}
+
+function buildPredmarketPositionQuickActionGroups(
+  result: string,
+): Array<{
+  title?: string;
+  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+}> {
+  const groups: Array<{
+    title?: string;
+    actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+  }> = [];
+  const matches = Array.from(
+    result.matchAll(
+      /###\s+[^\n]*?\s(.+?)\n[\s\S]*?- \*\*Status:\*\* ([^\n]+)\n[\s\S]*?- \*\*Address:\*\* `?(0x[a-fA-F0-9]{40})`?/g,
+    ),
+  );
+
+  for (const match of matches) {
+    const title = match[1]?.trim() || 'Market';
+    const status = (match[2] || '').trim().toLowerCase();
+    const address = match[3] as `0x${string}`;
+
+    if (status.includes('redeemable now')) {
+      groups.push({
+        title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
+        actions: [
+          { label: 'Redeem', prompt: `redeem ${address}` },
+          { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
+          { label: 'Details', prompt: `tell me about ${address}`, tone: 'secondary' },
+        ],
+      });
+      continue;
+    }
+
+    if (status.includes('refundable now')) {
+      groups.push({
+        title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
+        actions: [
+          { label: 'Refund', prompt: `refund ${address}` },
+          { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
+          { label: 'Details', prompt: `tell me about ${address}`, tone: 'secondary' },
+        ],
+      });
+      continue;
+    }
+
+    groups.push({
+      title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
+      actions: [
+        { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
+        { label: 'Details', prompt: `tell me about ${address}` },
+      ],
+    });
+  }
+
+  const inlineMatches = Array.from(
+    result.matchAll(
+      /([^;\n]+?)\s+\((0x[a-fA-F0-9]{40})\):\s+[^;\n]*?\s+-\s+(Redeemable now|Refundable now|Stage:\s*[^;\n]+)/g,
+    ),
+  );
+
+  for (const match of inlineMatches) {
+    const title = match[1]?.replace(/^\*\*[^:]+:\*\*\s*/, '').trim() || 'Market';
+    const address = match[2] as `0x${string}`;
+    const status = (match[3] || '').trim().toLowerCase();
+    if (groups.some((group) => group.actions.some((action) => action.prompt.includes(address)))) {
+      continue;
+    }
+
+    if (status.includes('redeemable now')) {
+      groups.push({
+        title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
+        actions: [
+          { label: 'Redeem', prompt: `redeem ${address}` },
+          { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
+          { label: 'Details', prompt: `tell me about ${address}`, tone: 'secondary' },
+        ],
+      });
+      continue;
+    }
+
+    if (status.includes('refundable now')) {
+      groups.push({
+        title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
+        actions: [
+          { label: 'Refund', prompt: `refund ${address}` },
+          { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
+          { label: 'Details', prompt: `tell me about ${address}`, tone: 'secondary' },
+        ],
+      });
+      continue;
+    }
+  }
+
+  return groups;
+}
+
+async function buildPredmarketResearchQuickActionGroups(
+  task: string,
+): Promise<
+  | Array<{
+  title?: string;
+  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+    }>
+  | undefined
+> {
+  const context = extractPredmarketResearchContext(task);
+  if (!context) {
+    return undefined;
+  }
+
+  return buildPredmarketResearchQuickActionGroupsFromContext(context);
+}
+
+async function buildPredmarketResearchQuickActionGroupsFromContext(
+  context: { marketAddress: `0x${string}` | null; titleHint: string | null },
+): Promise<
+  Array<{
+    title?: string;
+    actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+  }>
+> {
+  const resolvedMarketAddress =
+    context.marketAddress ?? (await resolvePredmarketAddressFromTitle(context.titleHint));
+  const tradeTitle = context.titleHint ? `Trade ${context.titleHint}` : 'Trade this market';
+  if (!resolvedMarketAddress) {
+    return [
+      {
+        title: tradeTitle,
+        actions: [
+          { label: 'Show prediction markets', prompt: 'show prediction markets' },
+        ],
+      },
+    ];
+  }
+
+  try {
+    const detail = await getPredmarketDetail('achmarket', resolvedMarketAddress);
+    const outcomes = detail.outcomes.map((outcome, index) => ({
+      index,
+      label: outcome.label,
+    }));
+    if (outcomes.length) {
+      return [
+        {
+          title: tradeTitle,
+          actions: [
+            ...buildPredmarketOutcomeActions(resolvedMarketAddress, outcomes),
+            {
+              label: 'Show prediction markets',
+              prompt: 'show prediction markets',
+              tone: 'secondary',
+            },
+          ],
+        },
+      ];
+    }
+  } catch (error) {
+    console.warn('[predmarket] research quick actions detail lookup failed:', getErrorMessage(error));
+  }
+
+  return [
+    {
+      title: tradeTitle,
+      actions: [
+        { label: 'Trade', prompt: `tell me about ${resolvedMarketAddress}` },
+        { label: 'Show prediction markets', prompt: 'show prediction markets', tone: 'secondary' },
+      ],
+    },
+  ];
+}
+
+async function resolvePredmarketAddressFromTitle(
+  titleHint: string | null,
+): Promise<`0x${string}` | null> {
+  const normalizedTitle = titleHint?.trim().toLowerCase();
+  if (!normalizedTitle) {
+    return null;
+  }
+
+  try {
+    const markets = await listPredmarketMarkets();
+    const exactMatch = markets.find((market) => market.title.trim().toLowerCase() === normalizedTitle);
+    if (exactMatch) {
+      return exactMatch.address;
+    }
+    const looseMatch = markets.find((market) =>
+      market.title.trim().toLowerCase().includes(normalizedTitle) ||
+      normalizedTitle.includes(market.title.trim().toLowerCase()),
+    );
+    return looseMatch?.address ?? null;
+  } catch (error) {
+    console.warn('[predmarket] title-to-address lookup failed:', getErrorMessage(error));
+    return null;
+  }
 }
 
 /**
@@ -3776,59 +5772,62 @@ function shouldHandleAsSplitRequest(message: string): boolean {
  */
 const NON_RESEARCH_PHRASES =
   /^(good|ok|okay|thanks|thank you|got it|perfect|great|nice|cool|awesome|understood|noted|sure|yep|nope|no|yes|nice one|well done)\s*[.!]?\s*$/i;
+function looksLikeComparativeResearchQuery(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  if (!/\b(?:vs|versus|compare|comparison)\b/i.test(normalized)) return false;
+  if (/\b(?:pay|send|request|invoice|history|contact|schedule|wallet|portfolio)\b/i.test(normalized)) {
+    return false;
+  }
+  return normalized.split(/\s+/).filter(Boolean).length >= 3;
+}
 
-function shouldHandleAsResearchRequest(message: string): boolean {
+function shouldHandleAsResearchRequest(
+  message: string,
+  history: BrainConversationMessage[] = [],
+): boolean {
   if (!message.trim()) return false;
+  if (buildLowConfidenceClarifyRoute(message)) return false;
 
   const normalized = message.trim().toLowerCase();
+  const capabilityRouting = analyzeCapabilityAwareRouting(message);
 
   if (NON_RESEARCH_PHRASES.test(normalized)) return false;
+  if (hasClarifyCapability(capabilityRouting)) return false;
+  if (capabilityRouting.vault.routeToFeature && isVaultDiscoveryIntent(message)) return false;
+  if (capabilityRouting.bridge.routeToFeature && (isBridgeExecutionIntent(message) || /\bbridge\b/i.test(normalized))) {
+    return false;
+  }
+  if (capabilityRouting.swap.routeToFeature) return false;
+  if (capabilityRouting.predmarket.routeToFeature && isPredictionMarketBrowseIntent(message)) return false;
+  return (
+    isExplicitResearchRequest(message) ||
+    detectPortfolioImpactIntent(message) ||
+    looksLikeComparativeResearchQuery(message)
+  );
+}
 
-  if (
-    /\b(pay|send|swap|bridge|vault|deposit|withdraw|transfer)\b.*\b(usdc|eurc|usd|arc)\b/i.test(
-      normalized,
-    )
-  ) {
+function shouldHandleAsPublicCurrentInfoRequest(normalizedMessage: string): boolean {
+  if (!normalizedMessage.trim()) return false;
+  if (NON_RESEARCH_PHRASES.test(normalizedMessage)) return false;
+  if (/\b(agentflow|agentpay|my wallet|my payments|my portfolio|my balance)\b/i.test(normalizedMessage)) {
     return false;
   }
 
-  if (
-    /\b(research|deep\s+research|research\s+report|run\s+research|generate\s+report|analyze\s+and\s+report)\b/i.test(
-      normalized,
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    /\b(research\s+on|news\s+on|tell\s+me\s+about|what\s+is\s+happening\s+with|analyze|analysis\s+on|report\s+on|look\s+into|find\s+out\s+about)\b/i.test(
-      normalized,
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    /\b(price|market\s+cap|trading\s+volume|tvl|apy|how\s+is|how\s+are|what\s+is\s+the\s+price|current\s+price)\b.*\b(btc|eth|bitcoin|ethereum|usdc|eurc|sol|solana|arc|defi|crypto)\b/i.test(
-      normalized,
+  const asksIdentityOrCurrentRole =
+    /\b(who is|tell me about|what do you know about|latest|recent|current|information about)\b/i.test(
+      normalizedMessage,
     ) ||
-    /\b(btc|eth|bitcoin|ethereum|usdc|eurc|sol|solana|arc|defi|crypto)\b.*\b(price|market\s+cap|trading\s+volume|tvl|apy|how\s+is|how\s+are|what\s+is\s+the\s+price|current\s+price)\b/i.test(
-      normalized,
-    )
-  ) {
-    return true;
-  }
+    /\b(president|prime minister|ceo|founder|senator|governor|minister|chair|chairman|candidate)\b/i.test(
+      normalizedMessage,
+    );
 
-  if (
-    /\b(btc|bitcoin|ethereum|eth|solana|sol|defi|nft|dao|blockchain|crypto|web3|arc\s+network)\b/i.test(
-      normalized,
-    ) &&
-    normalized.split(/\s+/).filter(Boolean).length > 3
-  ) {
-    return true;
-  }
+  const publicFigureOrInstitution =
+    /\b(donald\s+trump|trump|joe\s+biden|biden|elon\s+musk|sam\s+altman|jerome\s+powell|president\s+of\s+(?:the\s+)?(?:usa|u\.s\.|united\s+states)|white\s+house|circle|openai|arc\s+network)\b/i.test(
+      normalizedMessage,
+    );
 
-  return false;
+  return asksIdentityOrCurrentRole && publicFigureOrInstitution;
 }
 
 function shouldBypassToResearchPipeline(message: string): boolean {
@@ -3862,6 +5861,434 @@ function buildResearchFailureReply(details: string): string {
   ].join('\n');
 }
 
+const RESEARCH_CONFIRM_REDIS_PREFIX = 'research:confirm:';
+const RESEARCH_CONFIRM_REDIS_TTL_SECONDS = 900;
+
+/** Assistant asked whether to run/deepen research instead of invoking the pipeline yet. */
+function looksLikeAssistantResearchConfirmationOffer(text: string): boolean {
+  const t = text.trim();
+  if (!/\?/.test(t)) return false;
+  if (/\bresearch\b/i.test(t)) {
+    if (/\bshould\s+i\s+(?:run|do|start|prepare)\b/i.test(t)) return true;
+    if (/\bwould\s+you\s+like\s+(?:me\s+to\s+)?(?:run|have|kick\s+off|start)/i.test(t)) return true;
+    if (/\bwant\s+me\s+to\s+(?:run|do|start|kick\s+off)\b/i.test(t)) return true;
+    if (/\b(?:run|generate|create|produce)\s+(?:a\s+)?(?:deep\s+)?research\s+report\b/i.test(t))
+      return true;
+    if (/\bresearch\s+report\s+(?:on|for|about)\b/i.test(t)) return true;
+  }
+  return false;
+}
+
+/** After “Should I run research…?”, YES should resume `/run` with the prior topic (not YES). */
+function resolveDeferredResearchTaskFromBrainHistory(
+  history: ReadonlyArray<{ role: string; content: string }>,
+): string | null {
+  for (let i = history.length - 1; i >= 1; i -= 1) {
+    const turn = history[i];
+    if (turn.role !== 'assistant' || !looksLikeAssistantResearchConfirmationOffer(turn.content)) {
+      continue;
+    }
+    for (let j = i - 1; j >= 0; j -= 1) {
+      const prior = history[j];
+      if (prior.role !== 'user') continue;
+      const candidate = typeof prior.content === 'string' ? prior.content.trim() : '';
+      if (!candidate) continue;
+      if (shouldHandleAsResearchRequest(candidate)) return candidate;
+      break;
+    }
+  }
+  return null;
+}
+
+async function persistResearchConfirmationOfferRedis(
+  actionScopeKey: string | undefined,
+  userMessage: string,
+  assistantMessage: string,
+): Promise<void> {
+  if (!actionScopeKey?.trim()) return;
+  if (!looksLikeAssistantResearchConfirmationOffer(assistantMessage)) return;
+  if (!shouldHandleAsResearchRequest(userMessage)) return;
+  await getRedis().set(
+    `${RESEARCH_CONFIRM_REDIS_PREFIX}${actionScopeKey.trim()}`,
+    JSON.stringify({ task: userMessage.trim() }),
+    'EX',
+    RESEARCH_CONFIRM_REDIS_TTL_SECONDS,
+  );
+  if (isAgentflowChatSessionTraceDebug()) {
+    console.info('[chat-session-trace]', {
+      research_confirm_saved: true,
+      scope: actionScopeKey.trim().slice(0, 128),
+    });
+  }
+}
+
+async function takeDeferredResearchConfirmTaskRedis(
+  actionScopeKey: string,
+): Promise<string | null> {
+  const key = `${RESEARCH_CONFIRM_REDIS_PREFIX}${actionScopeKey}`;
+  const raw = await getRedis().get(key).catch(() => null);
+  if (!raw) return null;
+  await getRedis().del(key).catch(() => null);
+  try {
+    const parsed = JSON.parse(String(raw)) as { task?: unknown };
+    const task = parsed.task != null ? String(parsed.task).trim() : '';
+    return task ? task : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Prefer thread-scoped key; fall back to wallet-only key for legacy offers. */
+async function takeDeferredResearchConfirmTaskRedisDual(
+  primaryScope: string,
+  fallbackScope: string,
+): Promise<string | null> {
+  const first = await takeDeferredResearchConfirmTaskRedis(primaryScope);
+  if (first) return first;
+  if (fallbackScope && fallbackScope !== primaryScope) {
+    return takeDeferredResearchConfirmTaskRedis(fallbackScope);
+  }
+  return null;
+}
+
+type BrainResearchPipelineChatOpts = {
+  res: Response;
+  memorySessionId: string;
+  persistUserTurn: string;
+  researchTask: string;
+  reasoningMode?: 'fast' | 'deep';
+  portfolioImpact?: boolean;
+  walletAddress: string;
+  brainEventId?: string;
+  /** Passed to Redis research-confirmation persistence for assistant replies in this pipeline. */
+  redisActionScopeKey?: string;
+  predmarketResearchContext?: {
+    marketAddress: `0x${string}` | null;
+    titleHint: string | null;
+  } | null;
+};
+
+async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineChatOpts): Promise<void> {
+  const {
+    res,
+    memorySessionId,
+    persistUserTurn,
+    researchTask,
+    reasoningMode: requestedReasoningMode,
+    portfolioImpact = false,
+    walletAddress,
+    brainEventId,
+    redisActionScopeKey,
+    predmarketResearchContext = null,
+  } = opts;
+
+  const syncToken = `sync:${randomUUID()}`;
+  let slotHeld = false;
+  const intermediate: string[] = [];
+  const pushStatus = (status: string) => {
+    intermediate.push(status);
+    res.write(`data: ${JSON.stringify({ delta: status })}\n\n`);
+  };
+
+  try {
+    const reasoningMode = inferResearchReasoningMode({
+      task: researchTask,
+      explicitMode: requestedReasoningMode,
+      defaultMode: 'fast',
+    });
+
+    const acquired = await tryAcquireResearchSlot(syncToken);
+    if (!acquired) {
+      const { jobId, position } = await enqueueResearch({
+        sessionId: memorySessionId,
+        walletAddress,
+        query: researchTask,
+        mode: 'fast',
+        reasoningMode,
+      });
+      const waitMsg = [
+        '📊 Our research pipeline is busy right now.',
+        'Your report will be queued and ready soon.',
+        '',
+        `Query: "${researchTask}"`,
+        `Position: #${position}`,
+        `Job ID: ${jobId}`,
+        '',
+        "You'll get a Telegram notification when it's done (if Telegram is linked).",
+        'The full report will also appear in this chat when polling completes.',
+        'Reports usually take 1-2 minutes.',
+      ].join('\n');
+      await appendBrainConversationTurn(
+        memorySessionId,
+        persistUserTurn,
+        waitMsg,
+        redisActionScopeKey,
+      );
+      if (brainEventId) {
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'research',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('research'),
+          hermes_model: 'fast',
+          final_response_summary: waitMsg,
+          outcome: 'success',
+          research_trajectory: {
+            query: researchTask,
+            sub_questions_generated: 0,
+            sources_count: 0,
+            claims_count: 0,
+            deep_or_fast_mode: reasoningMode,
+            queued: true,
+            total_cost: null,
+          },
+        });
+      }
+      res.write(
+        `data: ${JSON.stringify({
+          meta: { researchQueued: { jobId, position } },
+        })}\n\n`,
+      );
+      res.write(`data: ${JSON.stringify({ delta: waitMsg })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+    slotHeld = true;
+
+    pushStatus(
+      reasoningMode === 'deep'
+        ? 'Running deep research with source-registry retrieval, Firecrawl verification, analyst review, and writer synthesis. This can take a few minutes.\n\n'
+        : 'Running research -> analyst -> writer with Firecrawl + SearXNG live retrieval and source checks. This usually takes 1-2 minutes.\n\n',
+    );
+
+    const pipelineRes = await fetch(`http://127.0.0.1:${PUBLIC_PORT}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        task: researchTask,
+        userAddress: walletAddress,
+        portfolioImpact,
+        reasoningMode,
+        deepResearch: reasoningMode === 'deep',
+      }),
+    });
+
+    if (!pipelineRes.ok || !pipelineRes.body) {
+      throw new Error(`Research pipeline returned ${pipelineRes.status} ${pipelineRes.statusText}`);
+    }
+
+    const reader = pipelineRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let report = '';
+    let reportPayload: any = null;
+    let pipelineErr = '';
+    let eventCount = 0;
+    let pipelineReceipt: any = null;
+
+    const handlePipelineSseEvent = (ev: string) => {
+      if (!ev.trim()) return;
+      eventCount += 1;
+      for (const line of ev.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const raw = line.slice(5).trim();
+        if (!raw || raw === '[DONE]') continue;
+        let parsed: any;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          continue;
+        }
+        if (!parsed || typeof parsed !== 'object') continue;
+        if (typeof parsed.type === 'string') {
+          console.log(
+            '[research-consumer] event:',
+            parsed.type,
+            typeof parsed.step === 'string' ? parsed.step : '',
+          );
+        }
+        if (parsed.type === 'step_start' && typeof parsed.step === 'string') {
+          pushStatus(`- ${parsed.step} agent started\n`);
+        } else if (parsed.type === 'step_complete' && typeof parsed.step === 'string') {
+          pushStatus(`- ${parsed.step} agent complete\n`);
+        } else if (typeof parsed.delta === 'string' && parsed.delta) {
+          pushStatus(parsed.delta);
+        } else if (parsed.type === 'report' && typeof parsed.markdown === 'string') {
+          report = parsed.markdown;
+          reportPayload = parsed;
+        } else if (parsed.type === 'receipt') {
+          pipelineReceipt = parsed;
+        } else if (parsed.type === 'error' && typeof parsed.message === 'string') {
+          pipelineErr = parsed.message;
+        }
+      }
+    };
+
+    const drainCompleteSseBlocks = () => {
+      const normalized = buffer.replace(/\r\n/g, '\n');
+      const events = normalized.split('\n\n');
+      buffer = events.pop() ?? '';
+      for (const ev of events) {
+        handlePipelineSseEvent(ev);
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+      drainCompleteSseBlocks();
+      if (done) {
+        const tail = buffer.replace(/\r\n/g, '\n').trim();
+        buffer = '';
+        if (tail) {
+          handlePipelineSseEvent(tail);
+        }
+        break;
+      }
+    }
+
+    console.log('[research-consumer] done,', 'got report:', !!report, 'events:', eventCount);
+
+    if (!report && pipelineErr) {
+      const failureText = `Research pipeline failed: ${pipelineErr}`;
+      await appendBrainConversationTurn(memorySessionId, persistUserTurn, failureText, redisActionScopeKey);
+      res.write(`data: ${JSON.stringify({ delta: `\n${failureText}` })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+    if (!report) {
+      console.error('[research] no report markdown received');
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'error',
+          error: 'Report generation incomplete. Please try again.',
+        })}\n\n`,
+      );
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+
+    console.log('[research] report received, length:', report.length);
+
+    const paymentMeta = pipelineReceipt
+      ? {
+          entries:
+            Array.isArray(pipelineReceipt.entries) && pipelineReceipt.entries.length
+              ? pipelineReceipt.entries
+              : [
+                  {
+                    requestId: `${pipelineReceipt.pipelineRequestId ?? 'pipeline'}:research`,
+                    agent: 'research',
+                    price: pipelineReceipt.researchPrice ?? null,
+                    transactionRef: pipelineReceipt.researchTx ?? null,
+                    settlementTxHash: null,
+                    mode: 'dcw',
+                  },
+                  {
+                    requestId: `${pipelineReceipt.pipelineRequestId ?? 'pipeline'}:analyst`,
+                    agent: 'analyst',
+                    price: pipelineReceipt.analystPrice ?? null,
+                    transactionRef: pipelineReceipt.analystTx ?? null,
+                    settlementTxHash: null,
+                    mode: 'dcw',
+                  },
+                  {
+                    requestId: `${pipelineReceipt.pipelineRequestId ?? 'pipeline'}:writer`,
+                    agent: 'writer',
+                    price: pipelineReceipt.writerPrice ?? null,
+                    transactionRef: pipelineReceipt.writerTx ?? null,
+                    settlementTxHash: null,
+                    mode: 'dcw',
+                  },
+                ],
+        }
+      : null;
+    const liveData = reportPayload?.liveData && typeof reportPayload.liveData === 'object'
+      ? (reportPayload.liveData as Record<string, any>)
+      : {};
+    const sourcesCount =
+      Number(liveData.source_count) ||
+      (Array.isArray(liveData.sources) ? liveData.sources.length : 0) ||
+      0;
+    const claimsCount = Array.isArray(reportPayload?.analysis?.claims)
+      ? reportPayload.analysis.claims.length
+      : Array.isArray(reportPayload?.research?.claims)
+        ? reportPayload.research.claims.length
+        : 0;
+    const totalCost = pipelineReceipt?.total ? Number(pipelineReceipt.total) : null;
+
+    const finalText = `\n\n---\n\n${report}`;
+    await appendBrainConversationTurn(
+      memorySessionId,
+      persistUserTurn,
+      `${intermediate.join('')}${finalText}`,
+      redisActionScopeKey,
+    );
+    const researchQuickActionGroups = predmarketResearchContext
+      ? await buildPredmarketResearchQuickActionGroupsFromContext(predmarketResearchContext)
+      : await buildPredmarketResearchQuickActionGroups(researchTask);
+    res.write(
+      `data: ${JSON.stringify({
+        meta: {
+          eventId: brainEventId,
+          reportMeta: {
+            kind: 'research',
+            mode: reasoningMode,
+          },
+          ...(researchQuickActionGroups
+            ? { quickActionGroups: researchQuickActionGroups }
+            : {}),
+          ...(paymentMeta ? { paymentMeta } : {}),
+        },
+      })}\n\n`,
+    );
+    res.write(
+      `data: ${JSON.stringify({
+        type: 'report',
+        markdown: report,
+        research: reportPayload?.research ?? null,
+        analysis: reportPayload?.analysis ?? null,
+        liveData: reportPayload?.liveData ?? null,
+      })}\n\n`,
+    );
+    res.write(`data: ${JSON.stringify({ delta: finalText })}\n\n`);
+    if (brainEventId) {
+      await updateBrainEvent(brainEventId, {
+        intent_label: 'research',
+        intent_source: 'fastpath',
+        ...buildFastpathBrainEventFields('research'),
+        hermes_model: 'fast',
+        final_response_summary: report,
+        outcome: 'success',
+        research_trajectory: {
+          query: researchTask,
+          sub_questions_generated: 0,
+          sources_count: sourcesCount,
+          claims_count: claimsCount,
+          deep_or_fast_mode: reasoningMode,
+          total_cost: Number.isFinite(totalCost) ? totalCost : null,
+        },
+      });
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (researchErr) {
+    const msg = researchErr instanceof Error ? researchErr.message : String(researchErr);
+    console.warn('[chat/respond] research fast-path failed:', msg);
+    const failureReply = buildResearchFailureReply(msg);
+    await appendBrainConversationTurn(memorySessionId, persistUserTurn, failureReply, redisActionScopeKey);
+    res.write(`data: ${JSON.stringify({ delta: `\n${failureReply}` })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } finally {
+    if (slotHeld) {
+      await releaseResearchSlot(syncToken);
+    }
+  }
+}
+
 /**
  * Detect batch/payroll intent from chat message (text-only; no file attachments needed).
  */
@@ -3869,14 +6296,20 @@ function shouldHandleAsBatchPayment(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return false;
   if (/^(?:yes|no|confirm|cancel|y|n|yeah|yep|nope)$/i.test(normalized)) return false;
-  return /\b(batch\s+pay(?:ment)?|payroll|bulk\s+pay|pay\s+multiple|pay\s+everyone)\b/i.test(normalized);
+  return /\b(batch\s*pay(?:ment)?|payroll|bulk\s+pay|pay\s+multiple|pay\s+everyone)\b/i.test(normalized);
 }
 
 /**
  * Extract BatchPaymentRow[] from a chat message with inline CSV body.
  */
 function parseBatchMessage(message: string) {
-  return parseInlineCsvFromMessage(message);
+  return parseBatchPaymentsFromMessage(message);
+}
+
+function formatBatchParseError(error: string): string {
+  const example =
+    'Use this format:\nbatch pay\nalice.arc,100,salary\nbob.arc,100,salary\n\nOr say:\nbatch pay 1 USDC to alice.arc and bob.arc';
+  return error.includes('Use this format:') ? error : `${error}\n\n${example}`;
 }
 
 /**
@@ -3967,16 +6400,7 @@ function parsePaymentLinkRequest(
   const amtMatch = tail.match(/(?:\$\s*)?(\d+(?:\.\d+)?)\s*(?:usdc|usd|dollars?)?/i);
   if (amtMatch) amount = amtMatch[1];
 
-  let remark: string | undefined;
-  const remarkMatch = tail.match(/\bfor\s+([^\n]+?)\s*$/i);
-  if (remarkMatch) {
-    const candidate = remarkMatch[1].trim();
-    const looksLikeAmountOnly =
-      /^\d+(?:\.\d+)?(?:\s*(?:usdc|usd|dollars?))?$/i.test(candidate);
-    if (candidate && !looksLikeAmountOnly && candidate.length < 80) {
-      remark = candidate;
-    }
-  }
+  const remark = extractAgentpayRemark(tail, { maxLength: 80 });
 
   return { handle, amount, remark };
 }
@@ -3985,7 +6409,7 @@ function shouldHandleAsInvoiceRequest(message: string): boolean {
   const n = message.trim();
   if (!n) return false;
   if (/^(?:yes|no|confirm|cancel|y|n|yeah|yep|nope)$/i.test(n)) return false;
-  return /\bcreate\s+invoice\b|\bsend\s+invoice\b|\bbill\s+\w|\binvoice\s+for\b|\bmake\s+invoice\b/i.test(n);
+  return /\bcreate\s+invoice\b|\bsend\s+invoice\b|\binvoice\s+for\b|\bmake\s+invoice\b/i.test(n);
 }
 
 function shouldHandleAsInvoiceStatus(message: string): boolean {
@@ -4004,6 +6428,7 @@ function shouldHandleAsContactSave(message: string): boolean {
   const t = message.trim();
   return (
     /save\s+\w+\s+as\s+/i.test(t) ||
+    /^save\s+\w+$/i.test(t) ||
     /add\s+contact\s+/i.test(t) ||
     /\b\w+\s+is\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)\b/i.test(t)
   );
@@ -4017,37 +6442,149 @@ function shouldHandleAsContactDelete(message: string): boolean {
   return /remove\s+contact\s+|delete\s+contact\s+/i.test(message.trim());
 }
 
+function isBalanceIntent(message: string): boolean {
+  const normalized = normalizeDirectRouteMessage(message).toLowerCase();
+  if (!normalized) return false;
+  if (isVaultPositionIntent(normalized)) return false;
+  if (
+    /\b(?:swap|trade|convert|exchange|bridge|deposit|withdraw|stake|send|pay|invoice|request|schedule)\b/i.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    /^(?:what(?:'s| is)?\s+my\s+balance|show\s+my\s+balance|balance|how\s+much\s+do\s+i\s+have|what\s+funds\s+do\s+i\s+have)$/i.test(
+      normalized,
+    ) ||
+    /\b(?:current\s+balance|wallet\s+balance|my\s+balance|what(?:'s| is)?\s+balance|what(?:'s| is)?\s+my\s+usdc|how\s+much\s+usdc|how\s+much\s+eurc)\b/i.test(
+      normalized,
+    )
+  );
+}
+
 function parseInvoiceRequest(
   message: string,
 ): { vendorHandle: string; amount: string; description: string } | null {
-  const handleMatch = message.match(
-    /(?:for|to)\s+([a-z0-9]+\.arc|0x[a-fA-F0-9]{40}|[a-z0-9][a-z0-9_-]{0,63})/i,
+  const trimmed = message.trim();
+  const handlePattern = String.raw`([a-z0-9][a-z0-9-]*\.arc|0x[a-fA-F0-9]{40})`;
+
+  const descriptionFirst = trimmed.match(
+    new RegExp(
+      String.raw`(?:create|make|send)\s+(?:an?\s+)?invoice\s+for\s+(.+?)\s+for\s+${handlePattern}\s+for\s+(\d+(?:\.\d+)?)\s*(?:usdc|usd)?\b`,
+      'i',
+    ),
   );
-  const amountMatch =
-    message.match(/(\d+(?:\.\d+)?)\s*USDC/i) ||
-    message.match(/USDC\s*(\d+(?:\.\d+)?)/i) ||
-    message.match(/\b(\d+(?:\.\d+)?)\b/);
-  if (!handleMatch || !amountMatch) return null;
-  const descMatch =
-    message.match(/\d+\s*USDC\s+for\s+(.+)$/i) ||
-    message.match(/invoice\s+for\s+[a-z0-9.]+\s+\d+\s*(?:USDC)?\s+(?:for\s+)?(.+)$/i);
-  return {
-    vendorHandle: handleMatch[1].toLowerCase(),
-    amount: amountMatch[1],
-    description: descMatch?.[1]?.trim() || 'Services rendered',
-  };
+  if (descriptionFirst) {
+    return {
+      vendorHandle: descriptionFirst[2].toLowerCase(),
+      amount: descriptionFirst[3],
+      description: descriptionFirst[1].trim() || 'Services rendered',
+    };
+  }
+
+  const recipientFirst = trimmed.match(
+    new RegExp(
+      String.raw`(?:create|make|send)\s+(?:an?\s+)?invoice\s+for\s+${handlePattern}\s+(\d+(?:\.\d+)?)\s*(?:usdc|usd)?(?:\s+for\s+(.+))?$`,
+      'i',
+    ),
+  );
+  if (recipientFirst) {
+    return {
+      vendorHandle: recipientFirst[1].toLowerCase(),
+      amount: recipientFirst[2],
+      description: recipientFirst[3]?.trim() || 'Services rendered',
+    };
+  }
+
+  return null;
+}
+
+function isPredictionMarketLiveIntent(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    /\b(prediction markets?|markets?)\b/.test(normalized) &&
+    /\b(live|active|open|right now|at the moment|currently)\b/.test(normalized)
+  );
+}
+
+function isVisionCapabilityQuestion(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    /\b(screenshot|image|photo|picture)\b/.test(normalized) &&
+    /\b(read text|extract text|what does this say|ocr|analy[sz]e|upload)\b/.test(normalized)
+  );
+}
+
+function isBridgeWalkthroughIntent(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  if (!extractBridgeAmount(normalized) && !/\b(?:walk me through|how do i)\b/.test(normalized)) {
+    return false;
+  }
+  if (!extractBridgeAmount(normalized) && /\bcan we\b/.test(normalized)) {
+    return false;
+  }
+  return (
+    /\b(base|base sepolia)\b/.test(normalized) &&
+    /\barc\b/.test(normalized) &&
+    /\b(bridge|walk me through|how do i get|get funds|move funds)\b/.test(normalized)
+  );
 }
 
 function parseDirectAgentFlowRoute(
   message: string,
   history: BrainConversationMessage[] = [],
 ): DirectAgentFlowRoute | null {
+  if (isExplicitResearchRequest(message)) {
+    return null;
+  }
   const normalized = normalizeDirectRouteMessage(message);
   if (!normalized) {
     return null;
   }
-
-  if (hasAsciiArtIntent(normalized)) {
+  if (isAmbiguousPredictionMarketIntent(normalized)) {
+    return buildPredmarketClarifyReply();
+  }
+  const lowConfidenceClarify = buildLowConfidenceClarifyRoute(message);
+  if (lowConfidenceClarify) {
+    return lowConfidenceClarify;
+  }
+  if (isFinancialAdvisoryScopeIntent(normalized)) {
+    return null;
+  }
+  if (/\btelegram\b/i.test(normalized) && /\b(?:what works|supported|features|can i do)\b/i.test(normalized)) {
+    return {
+      type: 'reply',
+      text: buildTelegramCapabilitiesReply(),
+    };
+  }
+  if (/\btelegram\b/i.test(normalized) && /\b(?:connect|link|setup|set up|start)\b/i.test(normalized)) {
+    return {
+      type: 'reply',
+      text: buildTelegramSetupReply(),
+    };
+  }
+  if (isTelegramProductQuestion(normalized)) {
+    return buildTelegramHelpRoute();
+  }
+  const capabilityRouting = analyzeCapabilityAwareRouting(normalized);
+  const clarifyReply = buildCapabilityClarifyReply(normalized, capabilityRouting);
+  if (clarifyReply) {
+    return clarifyReply;
+  }
+  if (looksLikePredictionMarketResearch(normalized)) {
+    return null;
+  }
+  if (
+    capabilityRouting.bridge.routeToResearch ||
+    capabilityRouting.vault.routeToResearch ||
+    capabilityRouting.swap.routeToResearch ||
+    capabilityRouting.predmarket.routeToResearch
+  ) {
     return null;
   }
 
@@ -4055,6 +6592,7 @@ function parseDirectAgentFlowRoute(
     "(?:(?:please|can you|could you|would you|help me|i want to|let's)\\s+)?";
   const wantsPortfolioFollowup = hasPortfolioFollowupIntent(normalized);
   const lastAssistantMessage = getMostRecentAssistantMessage(history);
+  const recentPortfolioSnapshot = findRecentPortfolioSnapshotMessage(history);
 
   if (
     isShortReferentialFollowup(normalized) &&
@@ -4068,22 +6606,19 @@ function parseDirectAgentFlowRoute(
   }
 
   if (
-    /^(?:what(?:'s| is)? my balance|show my balance|balance|how much do i have|what funds do i have)$/i.test(
-      normalized,
-    )
+    isReferentialNoAntecedentQuestion(normalized) &&
+    !lastAssistantMessage
   ) {
     return {
-      type: 'tool',
-      tool: 'get_balance',
-      args: {},
+      type: 'reply',
+      text: buildMissingReferentReply(),
     };
   }
 
   if (
-    /^(?:show my portfolio|what(?:'s| is) my portfolio|portfolio|show my holdings|what do i own)$/i.test(
-      normalized,
-    ) ||
-    isPortfolioSnapshotIntent(normalized)
+    /^(?:yes|y|yeah|yep|sure|ok|okay|go ahead|do it|run it|check it)$/i.test(normalized) &&
+    /\bportfolio\b/i.test(lastAssistantMessage) &&
+    /\b(?:paid|run|read|check|confirm)\b/i.test(lastAssistantMessage)
   ) {
     return {
       type: 'tool',
@@ -4092,14 +6627,241 @@ function parseDirectAgentFlowRoute(
     };
   }
 
-  if (isVaultApyLookup(normalized)) {
+  if (
+    shouldClarifyPortfolioRequest(normalized) &&
+    recentPortfolioSnapshot
+  ) {
+    return {
+      type: 'reply',
+      text: buildPortfolioContextualFollowupReply(normalized),
+    };
+  }
+
+  if (
+    /^(?:where\s+can\s+i\s+(?:see|view|find|open|check)\s+it|where\s+is\s+it|how\s+do\s+i\s+(?:see|view|find|open|check)\s+it)\??$/i.test(
+      normalized,
+    ) &&
+    hasRecentPortfolioConversationContext(history)
+  ) {
+    return {
+      type: 'reply',
+      text: 'The portfolio report is in this chat above. Ask me to show your portfolio whenever you want a fresh live snapshot.',
+    };
+  }
+
+  if (shouldClarifyPortfolioRequest(normalized)) {
+    return {
+      type: 'reply',
+      text: buildPortfolioCheckClarificationReply(),
+    };
+  }
+
+  if (isBalanceIntent(normalized)) {
+    return {
+      type: 'tool',
+      tool: 'get_balance',
+      args: {},
+    };
+  }
+
+  if (isVaultPositionIntent(normalized)) {
     return {
       type: 'tool',
       tool: 'vault_action',
+      args: { action: 'position' },
+    };
+  }
+
+  if (isPredictionMarketPositionHowToIntent(normalized)) {
+    return {
+      type: 'reply',
+      text: 'To check your prediction market positions, ask `show my prediction market positions`. I will read your AgentFlow wallet positions and show any active, redeemable, or refundable markets.',
+      quickActionGroups: [
+        {
+          title: 'Prediction markets',
+          actions: [
+            { label: 'Show positions', prompt: 'show my prediction market positions' },
+            { label: 'Browse markets', prompt: 'show prediction markets', tone: 'secondary' },
+          ],
+        },
+      ],
+    };
+  }
+
+  const contextualVaultSelection = detectVaultSelectionReply(normalized, lastAssistantMessage);
+  if (contextualVaultSelection) {
+    return buildVaultAmountChoiceReply(contextualVaultSelection);
+  }
+
+  if (/\b(?:use|open|show|pick)\s+luneusdc\s+vault\b/i.test(normalized)) {
+    return buildVaultAmountChoiceReply('luneUSDC');
+  }
+
+  if (/\b(?:use|open|show|pick)\s+luneeurc\s+vault\b/i.test(normalized)) {
+    return buildVaultAmountChoiceReply('luneEURC');
+  }
+
+  if (
+    /\b(?:what|which)\b[\s\S]{0,40}\b(?:tokens?|pairs?|assets?)\b[\s\S]{0,40}\b(?:swap|swaps?)\b/i.test(normalized) ||
+    /\b(?:swap|swaps?)\b[\s\S]{0,40}\b(?:supports?|available|available on agentflow|tokens?|pairs?)\b/i.test(normalized)
+  ) {
+    return {
+      type: 'reply',
+      text: formatSwapOverviewReply(),
+      quickActionGroups: [
+        {
+          title: 'Try a swap',
+          actions: [
+            { label: 'Quote 1 USDC to EURC', prompt: 'swap 1 USDC to EURC' },
+            { label: 'Quote 1 EURC to USDC', prompt: 'swap 1 EURC to USDC' },
+          ],
+        },
+      ],
+    };
+  }
+
+  if (
+    capabilityRouting.vault.routeToFeature &&
+    !/\b(?:stake|deposit|withdraw|redeem|unstake|remove|park|allocate|fund|put|move|stash)\b/i.test(normalized)
+  ) {
+    return {
+      type: 'reply',
+      text: formatVaultOverviewReply(),
+      quickActionGroups: buildVaultListQuickActionGroups(),
+    };
+  }
+
+  if (capabilityRouting.swap.routeToFeature && !isSwapExecutionIntent(normalized)) {
+    return {
+      type: 'reply',
+      text: formatSwapOverviewReply(),
+      quickActionGroups: [
+        {
+          title: 'Try a swap',
+          actions: [
+            { label: 'Quote 1 USDC to EURC', prompt: 'swap 1 USDC to EURC' },
+            { label: 'Quote 1 EURC to USDC', prompt: 'swap 1 EURC to USDC' },
+          ],
+        },
+      ],
+    };
+  }
+
+  const requestMatch = normalized.match(
+    /^(?:please\s+)?request\s+(\d+(?:\.\d+)?)\s*(?:USDC\s+)?from\s+(\S+)(.*)$/i,
+  );
+  if (requestMatch) {
+    const remark = requestMatch[3]?.trim();
+    return {
+      type: 'tool',
+      tool: 'agentpay_request',
       args: {
-        action: 'check_apy',
-        confirmed: true,
+        amount: requestMatch[1],
+        from: requestMatch[2],
+        ...(remark ? { remark } : {}),
       },
+    };
+  }
+
+  const billMatch = normalized.match(
+    /^(?:please\s+)?bill\s+(\S+)\s+(\d+(?:\.\d+)?)\s*(?:USDC)?(.*)$/i,
+  );
+  if (billMatch) {
+    const remark = billMatch[3]?.trim();
+    return {
+      type: 'tool',
+      tool: 'agentpay_request',
+      args: {
+        from: billMatch[1],
+        amount: billMatch[2],
+        ...(remark ? { remark } : {}),
+      },
+    };
+  }
+
+  const askToPayMatch = normalized.match(
+    /^(?:please\s+)?ask\s+(\S+)\s+to\s+pay\s+(\d+(?:\.\d+)?)\s*(?:USDC)?(.*)$/i,
+  );
+  if (askToPayMatch) {
+    const remark = askToPayMatch[3]?.trim();
+    return {
+      type: 'tool',
+      tool: 'agentpay_request',
+      args: {
+        from: askToPayMatch[1],
+        amount: askToPayMatch[2],
+        ...(remark ? { remark } : {}),
+      },
+    };
+  }
+
+  if (
+    /^(?:show|list|browse)\s+(?:all\s+|the\s+all\s+)?(?:prediction\s+)?markets?$/i.test(normalized) ||
+    /^all\s+(?:prediction\s+)?markets$/i.test(normalized) ||
+    /^show\s+all\s+markets$/i.test(normalized) ||
+    /^list\s+all\s+markets$/i.test(normalized) ||
+    /^browse\s+all\s+markets$/i.test(normalized)
+  ) {
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: { action: 'list', listMode: 'all' },
+    };
+  }
+
+  if (isPredictionMarketBrowseIntent(normalized) && capabilityRouting.predmarket.routeToFeature) {
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: { action: 'list' },
+    };
+  }
+
+  const categoryMatch = normalized.match(
+    /^(?:show|browse|list)\s+(crypto|sports|politics|entertainment)\s+(?:prediction\s+)?markets$/i,
+  );
+  if (categoryMatch) {
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: {
+        action: 'list',
+        filter: { category: categoryMatch[1] },
+      },
+    };
+  }
+
+  if (
+    capabilityRouting.predmarket.routeToFeature &&
+    (lastAssistantLooksLikePredmarketList(lastAssistantMessage) &&
+      /^(?:show\s+more|more|next|next\s+page|more\s+markets|show\s+more\s+markets|next\s+markets)$/i.test(
+        normalized,
+      )) ||
+    /^(?:show\s+more|more|next|next\s+page|next\s+markets|show\s+more\s+markets)\s*(?:prediction\s+)?markets?$/i.test(
+      normalized,
+    ) ||
+    /^show\s+more$/i.test(normalized)
+  ) {
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: { action: 'list', listMode: 'next' },
+    };
+  }
+
+  if (isPredictionMarketPositionIntent(normalized)) {
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: { action: 'position' },
+    };
+  }
+
+  if (isPortfolioSnapshotIntent(normalized)) {
+    return {
+      type: 'tool',
+      tool: 'get_portfolio',
+      args: {},
     };
   }
 
@@ -4114,6 +6876,215 @@ function parseDirectAgentFlowRoute(
     };
   }
 
+  const predictionMarketAddress =
+    extractPredictionMarketAddress(message) ?? extractRecentPredictionContextAddress(history);
+  const predictionOutcome = extractPredictionOutcomeChoice(
+    message,
+    history,
+    predictionMarketAddress,
+  );
+  if (
+    /\bhow\b[\s\S]{0,80}\bredeem\b/i.test(normalized) ||
+    /\bwhen\b[\s\S]{0,80}\bredeem\b/i.test(normalized) ||
+    /\bcan\b[\s\S]{0,80}\bredeem\b/i.test(normalized) ||
+    /\bwhat\b[\s\S]{0,80}\bhappens?\b[\s\S]{0,80}\b(?:win|winning|won)\b[\s\S]{0,80}\bredeem\b/i.test(
+      normalized,
+    )
+  ) {
+    return {
+      type: 'reply',
+      text: [
+        'If your outcome wins and the market is resolved, you redeem from your winning position.',
+        '',
+        'Use `redeem <market address>` to preview whether that market is claimable for your wallet.',
+        'If the market is not resolved yet, redeem stays unavailable until the result is posted.',
+        'If you do not hold the winning side, there is nothing to redeem for that wallet.',
+      ].join('\n'),
+    };
+  }
+  if (
+    predictionMarketAddress &&
+    /^(?:bet|buy)\s+on\b/i.test(normalized) &&
+    predictionOutcome
+  ) {
+    return buildPredictionAmountChoiceReply(predictionMarketAddress, predictionOutcome);
+  }
+  if (
+    predictionMarketAddress &&
+    /^(?:tell me about|details? on|show details? for|show me|what is|what's)\b/i.test(normalized)
+  ) {
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: {
+        action: 'detail',
+        marketAddress: predictionMarketAddress,
+        provider: 'achmarket',
+      },
+    };
+  }
+  const buyMatch = normalized.match(
+    new RegExp(
+      `^${politePrefix}(?:bet|buy)\\s+(\\d+(?:\\.\\d+)?)\\s*USDC(?:\\s+on[\\s\\S]*)?$`,
+      'i',
+    ),
+  );
+  const flexibleBuyMatch = normalized.match(
+    new RegExp(
+      `^${politePrefix}(?:bet|buy)\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC|\\$)(?:\\s+on[\\s\\S]*)?$`,
+      'i',
+    ),
+  );
+  const amountWithoutOutcomeMatch = normalized.match(
+    new RegExp(
+      `^${politePrefix}(?:bet|buy)\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC|\\$)(?:[\\s\\S]*)$`,
+      'i',
+    ),
+  );
+  const resolvedBuyMatch = buyMatch || flexibleBuyMatch;
+  if (resolvedBuyMatch) {
+    if (!predictionOutcome) {
+      if (predictionMarketAddress) {
+        const knownOutcomes = extractPredictionOutcomeOptionsFromHistory(
+          history,
+          predictionMarketAddress,
+        );
+        if (knownOutcomes.length) {
+          return buildPredictionOutcomeChoiceReply(
+            predictionMarketAddress,
+            resolvedBuyMatch[1],
+            knownOutcomes,
+          );
+        }
+        return {
+          type: 'reply',
+          text: 'Tell me about that market first so I can show the available outcomes.',
+        };
+      }
+      return {
+        type: 'reply',
+        text: 'Which market? Share the market address, or ask me to show prediction markets first.',
+      };
+    }
+    if (!predictionMarketAddress) {
+      return {
+        type: 'reply',
+        text: 'Which market? Share the market address, or ask me to show prediction markets first.',
+      };
+    }
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: {
+        action: 'buy',
+        amount: resolvedBuyMatch[1],
+        marketAddress: predictionMarketAddress,
+        outcomeIdx: predictionOutcome.index,
+        provider: 'achmarket',
+        confirmed: false,
+      },
+    };
+  }
+
+  if (amountWithoutOutcomeMatch && predictionMarketAddress) {
+    const knownOutcomes = extractPredictionOutcomeOptionsFromHistory(
+      history,
+      predictionMarketAddress,
+    );
+    if (knownOutcomes.length) {
+      return buildPredictionOutcomeChoiceReply(
+        predictionMarketAddress,
+        amountWithoutOutcomeMatch[1],
+        knownOutcomes,
+      );
+    }
+    return {
+      type: 'reply',
+      text: 'Tell me about that market first so I can show the available outcomes.',
+    };
+  }
+
+  const sellMatch = normalized.match(
+    new RegExp(
+      `^${politePrefix}sell\\s+(\\d+(?:\\.\\d+)?)\\s+shares?(?:\\s+of)?(?:[\\s\\S]*)$`,
+      'i',
+    ),
+  );
+  if (sellMatch) {
+    if (!predictionOutcome) {
+      return {
+        type: 'reply',
+        text: 'Which outcome shares do you want to sell?',
+      };
+    }
+    if (!predictionMarketAddress) {
+      return {
+        type: 'reply',
+        text: 'Which market? Share the market address, or ask me to show prediction markets first.',
+      };
+    }
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: {
+        action: 'sell',
+        sharesWad: sellMatch[1],
+        marketAddress: predictionMarketAddress,
+        outcomeIdx: predictionOutcome.index,
+        provider: 'achmarket',
+        confirmed: false,
+      },
+    };
+  }
+
+  if (/^redeem\b/i.test(normalized) && predictionMarketAddress) {
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: {
+        action: 'redeem',
+        marketAddress: predictionMarketAddress,
+        provider: 'achmarket',
+        confirmed: false,
+      },
+    };
+  }
+
+  if (/^refund\b/i.test(normalized) && predictionMarketAddress) {
+    return {
+      type: 'tool',
+      tool: 'predict_action',
+      args: {
+        action: 'refund',
+        marketAddress: predictionMarketAddress,
+        provider: 'achmarket',
+        confirmed: false,
+      },
+    };
+  }
+
+  if (isVisionCapabilityQuestion(normalized)) {
+    return {
+      type: 'reply',
+      text: 'Yes. If you upload a screenshot or image, AgentFlow can analyze it and pull out visible text or key details here in chat.',
+    };
+  }
+
+  if (isBridgeWalkthroughIntent(normalized)) {
+    return {
+      type: 'reply',
+      text: [
+        'To bridge funds onto Arc:',
+        '1. Pick a supported source chain where your connected wallet holds USDC.',
+        '2. Enter the amount you want to bridge to Arc.',
+        '3. Review the preview, approve USDC if needed, and sign from the source wallet.',
+        '4. After the bridge completes, the USDC lands in your AgentFlow wallet on Arc.',
+        '',
+        'If you want, I can show the supported source chains next or you can tell me the source chain you want to use.',
+      ].join('\n'),
+    };
+  }
+
   const explicitSwapPortfolioMatch = normalized.match(
     new RegExp(
       `\\b(?:swap|trade|exchange|convert)\\s*(\\d+(?:\\.\\d+)?)\\s*(USDC|EURC)\\s*(?:to|for)?\\s*(USDC|EURC)\\b`,
@@ -4122,6 +7093,7 @@ function parseDirectAgentFlowRoute(
   );
   if (
     explicitSwapPortfolioMatch &&
+    isSwapExecutionIntent(normalized) &&
     hasSequentialIntentCue(normalized) &&
     /\b(?:portfolio|holdings|positions|wallet|funds)\b/i.test(normalized) &&
     /\b(?:show|explain|review|summary|summar(?:y|ize)|report|analysis|analy(?:s|z)e|break\s*down|walk\s+me\s+through)\b/i.test(
@@ -4157,6 +7129,7 @@ function parseDirectAgentFlowRoute(
   );
   if (
     compoundSwapMatch &&
+    isSwapExecutionIntent(normalized) &&
     wantsPortfolioFollowup
   ) {
     const [, amount, tokenIn, tokenOut] = compoundSwapMatch;
@@ -4192,7 +7165,7 @@ function parseDirectAgentFlowRoute(
         'i',
       ),
     );
-  if (swapMatch) {
+  if (swapMatch && isSwapExecutionIntent(normalized) && capabilityRouting.swap.routeToFeature) {
     const [, amount, tokenIn, tokenOut] = swapMatch;
     if (tokenIn.toUpperCase() === tokenOut.toUpperCase()) {
       return {
@@ -4215,18 +7188,32 @@ function parseDirectAgentFlowRoute(
   const compoundDepositMatch = wantsPortfolioFollowup
     ? normalized.match(
         new RegExp(
-          `^${politePrefix}(?:stake|deposit|vault\\s+deposit|move)\\s*(\\d+(?:\\.\\d+)?)\\s*(?:USDC)?\\b[\\s\\S]*(?:vault|yield|portfolio|report|holdings)[\\s\\S]*$`,
+          `^${politePrefix}(?:stake|deposit|vault\\s+deposit|move|put|park|allocate|stash)\\s*(\\d+(?:\\.\\d+)?)\\s*(?:USDC|EURC)?\\b[\\s\\S]*(?:vault|yield|portfolio|report|holdings|passive income|earn)[\\s\\S]*$`,
           'i',
         ),
       )
     : null;
   if (compoundDepositMatch) {
+    const tokenSym =
+      /eurc/i.test(normalized) ? 'EURC' :
+      /usdc/i.test(normalized) ? 'USDC' :
+      null;
+    const detectedVaultSymbol =
+      tokenSym === 'USDC' ? 'luneUSDC' :
+      tokenSym === 'EURC' ? 'luneEURC' :
+      undefined;
+    if (!detectedVaultSymbol) {
+      return null;
+    }
     return {
       type: 'tool',
       tool: 'vault_action',
       args: {
         action: 'deposit',
         amount: compoundDepositMatch[1],
+        provider: /lunex/i.test(normalized) ? 'lunex' : undefined,
+        vaultSymbol: detectedVaultSymbol,
+        amountTokenHint: tokenSym,
         confirmed: false,
       },
       postActionNote: portfolioA2aPostActionNote('vault agent'),
@@ -4236,20 +7223,43 @@ function parseDirectAgentFlowRoute(
   const depositMatch =
     normalized.match(
       new RegExp(
-        `^${politePrefix}(?:stake|deposit)\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC)?(?:\\s+(?:into|to)\\s+(?:the\\s+)?vault)?(?:\\s+for\\s+me)?\\s*$`,
+        `^${politePrefix}(?:stake|deposit|park|allocate|fund)\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC|EURC)?(?:\\b[\\s\\S]*)$`,
         'i',
       ),
     ) ||
     normalized.match(
-      new RegExp(`^${politePrefix}vault\\s+deposit\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC)?\\s*$`, 'i'),
+      new RegExp(
+        `^${politePrefix}vault\\s+deposit\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC|EURC)?(?:\\b[\\s\\S]*)$`,
+        'i',
+      ),
+    ) ||
+    normalized.match(
+      new RegExp(
+        `^${politePrefix}(?:put|move|stash)\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC|EURC)?\\b[\\s\\S]*(?:into|to)?\\s*(?:vault|yield|earn|passive income)[\\s\\S]*$`,
+        'i',
+      ),
     );
-  if (depositMatch) {
+  if (depositMatch && capabilityRouting.vault.routeToFeature) {
+    const tokenSym =
+      /eurc/i.test(normalized) ? 'EURC' :
+      /usdc/i.test(normalized) ? 'USDC' :
+      null;
+    const detectedVaultSymbol =
+      tokenSym === 'USDC' ? 'luneUSDC' :
+      tokenSym === 'EURC' ? 'luneEURC' :
+      undefined;
+    if (!detectedVaultSymbol) {
+      return null;
+    }
     return {
       type: 'tool',
       tool: 'vault_action',
       args: {
         action: 'deposit',
         amount: depositMatch[1],
+        provider: /lunex/i.test(normalized) ? 'lunex' : undefined,
+        vaultSymbol: detectedVaultSymbol,
+        amountTokenHint: tokenSym,
         confirmed: false,
       },
     };
@@ -4258,18 +7268,45 @@ function parseDirectAgentFlowRoute(
   const compoundWithdrawMatch = wantsPortfolioFollowup
     ? normalized.match(
         new RegExp(
-          `^${politePrefix}(?:withdraw|unstake|remove|take\\s+out|vault\\s+withdraw)\\s*(\\d+(?:\\.\\d+)?)\\s*(?:USDC)?\\b[\\s\\S]*(?:vault|portfolio|report|holdings)[\\s\\S]*$`,
+          `^${politePrefix}(?:withdraw|unstake|remove|take\\s+out|pull\\s+out|vault\\s+withdraw)\\s*(\\d+(?:\\.\\d+)?)\\s*(?:USDC|EURC)?\\b[\\s\\S]*(?:vault|portfolio|report|holdings|yield|earn)[\\s\\S]*$`,
           'i',
         ),
       )
     : null;
   if (compoundWithdrawMatch) {
+    const tokenSym =
+      /eurc/i.test(normalized) ? 'EURC' :
+      /usdc/i.test(normalized) ? 'USDC' :
+      null;
+    const detectedVaultSymbol =
+      tokenSym === 'USDC' ? 'luneUSDC' :
+      tokenSym === 'EURC' ? 'luneEURC' :
+      undefined;
+    if (!detectedVaultSymbol && /\bfrom my vault\b/i.test(normalized)) {
+      return {
+        type: 'tool',
+        tool: 'vault_action',
+        args: {
+          action: 'withdraw',
+          amount: compoundWithdrawMatch[1],
+          provider: /lunex/i.test(normalized) ? 'lunex' : undefined,
+          confirmed: false,
+        },
+        postActionNote: portfolioA2aPostActionNote('vault agent'),
+      };
+    }
+    if (!detectedVaultSymbol) {
+      return null;
+    }
     return {
       type: 'tool',
       tool: 'vault_action',
       args: {
         action: 'withdraw',
         amount: compoundWithdrawMatch[1],
+        provider: /lunex/i.test(normalized) ? 'lunex' : undefined,
+        vaultSymbol: detectedVaultSymbol,
+        amountTokenHint: tokenSym,
         confirmed: false,
       },
       postActionNote: portfolioA2aPostActionNote('vault agent'),
@@ -4279,21 +7316,94 @@ function parseDirectAgentFlowRoute(
   const withdrawMatch =
     normalized.match(
       new RegExp(
-        `^${politePrefix}(?:withdraw|unstake|remove|take out)\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC)?(?:\\s+from\\s+(?:the\\s+)?vault)?(?:\\s+for\\s+me)?\\s*$`,
+        `^${politePrefix}(?:withdraw|unstake|remove|take out|pull out)\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC|EURC)?(?:\\b[\\s\\S]*)$`,
         'i',
       ),
     ) ||
     normalized.match(
-      new RegExp(`^${politePrefix}vault\\s+withdraw\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC)?\\s*$`, 'i'),
+      new RegExp(
+        `^${politePrefix}vault\\s+withdraw\\s+(\\d+(?:\\.\\d+)?)\\s*(?:USDC|EURC)?(?:\\b[\\s\\S]*)$`,
+        'i',
+      ),
     );
-  if (withdrawMatch) {
+  if (withdrawMatch && capabilityRouting.vault.routeToFeature) {
+    const tokenSym =
+      /eurc/i.test(normalized) ? 'EURC' :
+      /usdc/i.test(normalized) ? 'USDC' :
+      null;
+    const detectedVaultSymbol =
+      tokenSym === 'USDC' ? 'luneUSDC' :
+      tokenSym === 'EURC' ? 'luneEURC' :
+      undefined;
+    if (!detectedVaultSymbol && /\bfrom my vault\b/i.test(normalized)) {
+      return {
+        type: 'tool',
+        tool: 'vault_action',
+        args: {
+          action: 'withdraw',
+          amount: withdrawMatch[1],
+          provider: /lunex/i.test(normalized) ? 'lunex' : undefined,
+          confirmed: false,
+        },
+      };
+    }
+    if (!detectedVaultSymbol) {
+      return null;
+    }
     return {
       type: 'tool',
       tool: 'vault_action',
       args: {
         action: 'withdraw',
         amount: withdrawMatch[1],
+        provider: /lunex/i.test(normalized) ? 'lunex' : undefined,
+        vaultSymbol: detectedVaultSymbol,
+        amountTokenHint: tokenSym,
         confirmed: false,
+      },
+    };
+  }
+
+  const sendMatch = normalized.match(
+    /^(?:please\s+)?send\s+(\d+(?:\.\d+)?)\s*(?:USDC\s+)?to\s+(\S+)$/i,
+  );
+  if (sendMatch) {
+    return {
+      type: 'tool',
+      tool: 'agentpay_send',
+      args: {
+        amount: sendMatch[1],
+        to: sendMatch[2],
+      },
+    };
+  }
+
+  const payMatch = normalized.match(
+    /^(?:please\s+)?pay\s+(\S+)\s+(\d+(?:\.\d+)?)\s*(?:USDC)?(.*)$/i,
+  );
+  if (payMatch) {
+    const remark = typeof payMatch[3] === 'string' ? payMatch[3].trim() : '';
+    return {
+      type: 'tool',
+      tool: 'agentpay_send',
+      args: {
+        to: payMatch[1],
+        amount: payMatch[2],
+        ...(remark ? { remark } : {}),
+      },
+    };
+  }
+
+  const transferMatch = normalized.match(
+    /^(?:please\s+)?transfer\s+(\d+(?:\.\d+)?)\s*(?:USDC\s+)?to\s+(\S+)$/i,
+  );
+  if (transferMatch) {
+    return {
+      type: 'tool',
+      tool: 'agentpay_send',
+      args: {
+        amount: transferMatch[1],
+        to: transferMatch[2],
       },
     };
   }
@@ -4312,20 +7422,60 @@ function parseDirectAgentFlowRoute(
   ) {
     return {
       type: 'reply',
-      text:
-        'No. AgentFlow does not expose a manual EOA bridge in the Funding page anymore. Funding is for moving Arc USDC between your EOA, your Agent wallet, and your Gateway reserve. If you want to bridge to Arc inside AgentFlow, use the sponsored Bridge agent in chat.',
+      text: formatBridgeExecutionReply(),
     };
   }
 
-  if (isBridgeCostOrSponsorshipQuestion(normalized)) {
+  if (isBridgeCostOrSponsorshipQuestion(normalized) && !looksLikeBridgeResearch(normalized)) {
     return {
       type: 'reply',
       text: formatBridgeCostOrSponsorshipReply(),
     };
   }
 
-  const bridgeSourceChain = parseSupportedBridgeSourceChain(normalized);
+  if (capabilityRouting.bridge.routeToFeature && isBridgeSpecificChainSelectionPrompt(normalized)) {
+    return {
+      type: 'reply',
+      text: [
+        'Got it. Which source chain do you want to bridge from?',
+        '',
+        'You can reply with the chain name, like Base Sepolia, Ethereum Sepolia, or Arbitrum Sepolia. After that I will ask how much USDC you want to bridge.',
+      ].join('\n'),
+    };
+  }
+
+  if (
+    capabilityRouting.bridge.routeToFeature &&
+    !isBridgeExecutionIntent(normalized) &&
+    !isBridgePrecheckIntent(normalized)
+  ) {
+    const bridgeSourcesIntent =
+      /\b(?:source|sources?|chains?|supported|arbitrum|base|ethereum|optimism|polygon|avalanche|linea|unichain)\b/i.test(
+        normalized,
+      ) || /\b(?:compare|vs|versus|best)\b/i.test(normalized);
+    return {
+      type: 'reply',
+      text: bridgeSourcesIntent ? formatBridgeSourcesReply() : formatBridgeOverviewReply(),
+      quickActionGroups: buildBridgeChoiceQuickActionGroups(),
+    };
+  }
+
+  const bridgeSourceChain = detectSupportedBridgeSourceChain(normalized);
   const bridgeAmount = extractBridgeAmount(normalized);
+  if (
+    bridgeSourceChain &&
+    !bridgeAmount &&
+    /\b(?:can we|get funds|move funds|onto arc|to arc)\b/i.test(normalized)
+  ) {
+    return {
+      type: 'tool',
+      tool: 'bridge_precheck',
+      args: {
+        sourceChain: bridgeSourceChain,
+      },
+      quickActionGroups: buildBridgeChoiceQuickActionGroups(),
+    };
+  }
   if (
     isBridgePrecheckIntent(normalized) ||
     (isBareSupportedBridgeChainReply(normalized) && recentBridgeContextWantsPrecheck(history))
@@ -4337,34 +7487,41 @@ function parseDirectAgentFlowRoute(
         ...(bridgeSourceChain ? { sourceChain: bridgeSourceChain } : {}),
         ...(bridgeAmount ? { amount: bridgeAmount } : {}),
       },
+      quickActionGroups: buildBridgeChoiceQuickActionGroups(),
     };
   }
 
-  if (/\bbridge\b/i.test(normalized)) {
+  if (
+    capabilityRouting.bridge.routeToFeature &&
+    (isBridgeExecutionIntent(normalized) || isBridgePrecheckIntent(normalized))
+  ) {
     if (!bridgeSourceChain) {
       return {
-        type: 'reply',
-        text:
-          'Supported bridge source chains right now: Ethereum Sepolia and Base Sepolia. Tell me the source chain and amount when you want a live bridge estimate.',
+        type: 'tool',
+        tool: 'bridge_precheck',
+        args: {},
+        quickActionGroups: buildBridgeChoiceQuickActionGroups(),
       };
     }
 
     if (!bridgeAmount) {
       return {
-        type: 'reply',
-        text:
-          'Tell me how much USDC you want to bridge, for example: bridge 0.1 USDC from Ethereum Sepolia. If you want a readiness check first, ask me to check gas and USDC on that source chain.',
+        type: 'tool',
+        tool: 'bridge_precheck',
+        args: {
+          sourceChain: bridgeSourceChain,
+        },
+        quickActionGroups: buildBridgeChoiceQuickActionGroups(),
       };
     }
     return {
       type: 'tool',
-      tool: 'bridge_usdc',
+      tool: 'bridge_precheck',
       args: {
-        amount: bridgeAmount,
         sourceChain: bridgeSourceChain,
-        confirmed: false,
+        amount: bridgeAmount,
       },
-      postActionNote: wantsPortfolioFollowup ? portfolioA2aPostActionNote('bridge agent') : undefined,
+      quickActionGroups: buildBridgeChoiceQuickActionGroups(),
     };
   }
 
@@ -4372,866 +7529,7 @@ function parseDirectAgentFlowRoute(
 }
 
 function buildBrainInputMessage(message: string): string {
-  const normalized = normalizeDirectRouteMessage(message);
-  if (!normalized) {
-    return message;
-  }
-
-  if (hasAsciiArtIntent(normalized)) {
-    return `${message}
-
-[AgentFlow routing note: This is an ASCII art request. Before replying, you MUST call skill_view(name="creative/ascii-art") and follow that skill's decision flow. Do not use the old direct-route ASCII fallback. If the user asked for block art, shaded art, or a stronger style, prefer that style from the ASCII skill. If they asked for a subject like "cat", produce art of that subject instead of turning a filler word like "a" into a banner. If they asked for a name, word, phrase, or banner, render that exact text.]`;
-  }
-
   return message;
-}
-
-function readAsciiTaskField(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function extractAsciiAgentTask(input: unknown): string {
-  if (!input || typeof input !== 'object') {
-    return '';
-  }
-
-  const record = input as Record<string, unknown>;
-  const direct =
-    readAsciiTaskField(record.task) ||
-    readAsciiTaskField(record.prompt) ||
-    readAsciiTaskField(record.message) ||
-    readAsciiTaskField(record.input);
-  if (direct) {
-    return direct;
-  }
-
-  const text = readAsciiTaskField(record.text);
-  const subject = readAsciiTaskField(record.subject);
-  const style = readAsciiTaskField(record.style);
-  const mode = readAsciiTaskField(record.mode);
-
-  if (text) {
-    return `Create ${style ? `${style} ` : ''}ASCII art banner for "${text}"${mode ? ` in ${mode} mode` : ''}.`;
-  }
-  if (subject) {
-    return `Create ${style ? `${style} ` : ''}ASCII art of ${subject}${mode ? ` in ${mode} mode` : ''}.`;
-  }
-
-  return '';
-}
-
-type ParsedAsciiRequest = {
-  mode: 'scene' | 'banner';
-  value: string;
-  font: string;
-  styleLabel: string;
-};
-
-const ASCII_SCENE_SUBJECTS: Record<string, string> = {
-  dog: 'dog',
-  puppy: 'dog',
-  cat: 'cat',
-  kitty: 'cat',
-  kitten: 'cat',
-  dragon: 'dragon',
-  coffee: 'coffee',
-  robot: 'robot',
-  owl: 'owl',
-  fish: 'fish',
-  rabbit: 'rabbit',
-  bird: 'bird',
-  turtle: 'turtle',
-  skull: 'skull',
-  tree: 'tree',
-  flower: 'flower',
-  ship: 'ship',
-  boat: 'ship',
-  car: 'car',
-  rocket: 'rocket',
-  guitar: 'guitar',
-  computer: 'computer',
-  house: 'house',
-  castle: 'castle',
-  heart: 'valentine',
-  valentine: 'valentine',
-};
-
-const ASCII_CREATIVE_FALLBACKS: Record<string, string> = {
-  dog: [
-    '        / \\__',
-    '       (    @\\___',
-    '       /         O',
-    '      /   (_____/',
-    '     /_____/   U',
-  ].join('\n'),
-  cat: [
-    '      /\\_/\\',
-    '     ( o.o )',
-    '      > ^ <',
-    '    /       \\',
-    '   /_/     \\_\\',
-  ].join('\n'),
-  robot: [
-    '      .-----.',
-    '     | o o |',
-    '     |  ^  |',
-    '     | \\_/ |',
-    '   __|_____|__',
-    '  /  /|   |\\  \\',
-    ' /__/ |___| \\__\\',
-  ].join('\n'),
-  coffee: [
-    '       ( (',
-    '        ) )',
-    '     ........',
-    '     |      |]',
-    '     \\      /',
-    '      `----`',
-  ].join('\n'),
-  rocket: [
-    '        /\\',
-    '       /  \\',
-    '      |    |',
-    '      |NASA|',
-    '      |    |',
-    '     /|/\\|\\',
-    '    /_||||_\\',
-  ].join('\n'),
-  tree: [
-    '        /\\',
-    '       /**\\',
-    '      /****\\',
-    '     /******\\',
-    '        ||',
-    '        ||',
-    '      __||__',
-  ].join('\n'),
-  car: [
-    '        ______',
-    '   ____/|_||_\\`.__',
-    '  (   _        _ _\\',
-    "  =`-(_)--(_)-'",
-  ].join('\n'),
-  house: [
-    '        /\\',
-    '       /  \\',
-    '      /____\\',
-    '      | [] |',
-    '      | __ |',
-    '      ||  ||',
-  ].join('\n'),
-  valentine: [
-    '    **     **',
-    '  ****** ******',
-    ' ***************',
-    '  *************',
-    '    *********',
-    '      *****',
-    '        *',
-  ].join('\n'),
-};
-
-function extractQuotedAsciiText(task: string): string | null {
-  const match = task.match(/["'`]+([^"'`\n]{1,40})["'`]+/);
-  const value = match?.[1]?.trim();
-  return value || null;
-}
-
-function inferAsciiFont(task: string): { font: string; styleLabel: string } {
-  const normalized = task.toLowerCase();
-  if (/\b(block|bold|heavy|doom)\b/i.test(normalized)) {
-    return { font: 'Doom', styleLabel: 'Block' };
-  }
-  if (/\b(shadow|shade|shaded|3d|three[- ]d)\b/i.test(normalized)) {
-    return { font: '3-D', styleLabel: 'Shaded' };
-  }
-  if (/\b(small|compact|mini)\b/i.test(normalized)) {
-    return { font: 'Small', styleLabel: 'Compact' };
-  }
-  if (/\b(big|large|wide|banner)\b/i.test(normalized)) {
-    return { font: 'Banner3', styleLabel: 'Wide' };
-  }
-  return { font: 'Slant', styleLabel: 'Classic' };
-}
-
-function sanitizeAsciiBannerText(value: string): string {
-  return value
-    .replace(/[^a-zA-Z0-9 ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 24);
-}
-
-function extractAsciiSceneSubjectFromPrompt(task: string): string {
-  const normalized = task
-    .replace(/\b(?:make|create|generate|draw|render|give me|show me|please)\b/gi, ' ')
-    .replace(/\b(?:an?|the|some|creative|cool|nice|proper|good|detailed)\b/gi, ' ')
-    .replace(/\b(?:ascii|text)\s+art\b/gi, ' ')
-    .replace(/\bascii\b/gi, ' ')
-    .replace(/\bart\b/gi, ' ')
-    .replace(/\b(?:of|for|about)\b/gi, ' ')
-    .replace(/[^a-zA-Z0-9 ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  return normalized.slice(0, 48) || 'creative subject';
-}
-
-function detectAsciiSceneSubject(task: string): string | null {
-  const normalized = task.toLowerCase();
-  for (const [alias, subject] of Object.entries(ASCII_SCENE_SUBJECTS)) {
-    if (new RegExp(`\\b${alias}\\b`, 'i').test(normalized)) {
-      return subject;
-    }
-  }
-  return null;
-}
-
-function parseAsciiRequest(task: string): ParsedAsciiRequest {
-  const quoted = extractQuotedAsciiText(task);
-  const fontInfo = inferAsciiFont(task);
-  const normalized = task.toLowerCase();
-  const sceneSubject = detectAsciiSceneSubject(task);
-  const explicitTextArt = Boolean(
-    quoted ||
-      /\b(?:my\s+name|the\s+word|word|name|spell|spelling|letters?|text|banner|logo|that\s+says|saying)\b/i.test(
-        normalized,
-      ),
-  );
-
-  if (explicitTextArt) {
-    const text =
-      sanitizeAsciiBannerText(
-        quoted ||
-          task
-            .replace(
-              /^.*?\b(?:word|name|spell(?:ing)?|letters?|text|logo|banner|saying|that says)\b/i,
-              '',
-            )
-            .replace(/^(?:of|for)\s+/i, '')
-            .trim(),
-      ) || 'ASCII';
-    return {
-      mode: 'banner',
-      value: text,
-      font: fontInfo.font,
-      styleLabel: fontInfo.styleLabel,
-    };
-  }
-
-  if (sceneSubject) {
-    return {
-      mode: 'scene',
-      value: sceneSubject,
-      font: '',
-      styleLabel: 'Scene',
-    };
-  }
-
-  if (/\b(?:any|some|random)\s+ascii(?:\s+art)?\b/i.test(normalized)) {
-    return {
-      mode: 'scene',
-      value: 'dog',
-      font: '',
-      styleLabel: 'Scene',
-    };
-  }
-
-  return {
-    mode: 'scene',
-    value: extractAsciiSceneSubjectFromPrompt(task),
-    font: '',
-    styleLabel: 'Hermes Creative',
-  };
-}
-
-function unescapeHtmlEntities(text: string): string {
-  return text
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
-
-function isLikelyAsciiSceneSegment(segment: string, subject: string): boolean {
-  const trimmed = segment.trim();
-  if (!trimmed || trimmed.length < 40) {
-    return false;
-  }
-  if (/ascii character codes|>>\s*\w+\s*<</i.test(trimmed)) {
-    return false;
-  }
-
-  const lines = trimmed.split('\n').filter((line) => line.trim());
-  if (lines.length < 3 || lines.length > 45) {
-    return false;
-  }
-
-  const maxWidth = lines.reduce((max, line) => Math.max(max, line.length), 0);
-  if (maxWidth > 110) {
-    return false;
-  }
-
-  const nonWhitespace = trimmed.replace(/\s+/g, '');
-  const alphaChars = (nonWhitespace.match(/[a-z]/gi) || []).length;
-  const symbolChars = (nonWhitespace.match(/[\\\/(){}\[\]_=*^'"`~<>|:-]/g) || []).length;
-  const alphaRatio = nonWhitespace.length > 0 ? alphaChars / nonWhitespace.length : 1;
-  if (symbolChars < 8) {
-    return false;
-  }
-  if (alphaRatio > 0.68 && !new RegExp(`\\b${subject}\\b`, 'i').test(trimmed)) {
-    return false;
-  }
-
-  return true;
-}
-
-function scoreAsciiSceneSegment(segment: string): number {
-  const lines = segment.split('\n').filter((line) => line.trim());
-  const symbolChars = (segment.match(/[\\\/(){}\[\]_=*^'"`~<>|:-]/g) || []).length;
-  return lines.length * 12 + symbolChars;
-}
-
-async function fetchAsciiSceneArt(subject: string): Promise<string | null> {
-  const response = await fetch(`https://ascii.co.uk/art/${encodeURIComponent(subject)}`, {
-    signal: AbortSignal.timeout(12_000),
-  });
-  const html = await response.text();
-  if (!response.ok || !html.trim()) {
-    return null;
-  }
-
-  const preBlocks = Array.from(html.matchAll(/<pre[^>]*>([\s\S]*?)<\/pre>/gi)).map(
-    (match) => match[1],
-  );
-
-  const segments = preBlocks
-    .flatMap((block) =>
-      unescapeHtmlEntities(block)
-        .replace(/\r\n/g, '\n')
-        .split(/\n\s*\n\s*\n+/)
-        .map((segment) => segment.trim())
-        .filter(Boolean),
-    )
-    .filter((segment) => isLikelyAsciiSceneSegment(segment, subject))
-    .sort((left, right) => scoreAsciiSceneSegment(right) - scoreAsciiSceneSegment(left));
-
-  return segments[0] || null;
-}
-
-async function fetchAsciiBannerArt(text: string, font: string): Promise<string | null> {
-  const url = new URL('https://asciified.thelicato.io/api/v2/ascii');
-  url.searchParams.set('text', text);
-  url.searchParams.set('font', font);
-  const response = await fetch(url.toString(), {
-    signal: AbortSignal.timeout(12_000),
-  });
-  const art = (await response.text()).replace(/\r\n/g, '\n').trim();
-  if (!response.ok || !art || containsNonAsciiPrintable(art)) {
-    return null;
-  }
-  return art;
-}
-
-const ASCII_BLOCK_FONT: Record<string, string[]> = {
-  A: [' ### ', '#   #', '#####', '#   #', '#   #'],
-  B: ['#### ', '#   #', '#### ', '#   #', '#### '],
-  C: [' ####', '#    ', '#    ', '#    ', ' ####'],
-  D: ['#### ', '#   #', '#   #', '#   #', '#### '],
-  E: ['#####', '#    ', '#### ', '#    ', '#####'],
-  F: ['#####', '#    ', '#### ', '#    ', '#    '],
-  G: [' ####', '#    ', '#  ##', '#   #', ' ####'],
-  H: ['#   #', '#   #', '#####', '#   #', '#   #'],
-  I: ['#####', '  #  ', '  #  ', '  #  ', '#####'],
-  J: ['#####', '   # ', '   # ', '#  # ', ' ##  '],
-  K: ['#   #', '#  # ', '###  ', '#  # ', '#   #'],
-  L: ['#    ', '#    ', '#    ', '#    ', '#####'],
-  M: ['#   #', '## ##', '# # #', '#   #', '#   #'],
-  N: ['#   #', '##  #', '# # #', '#  ##', '#   #'],
-  O: [' ### ', '#   #', '#   #', '#   #', ' ### '],
-  P: ['#### ', '#   #', '#### ', '#    ', '#    '],
-  Q: [' ### ', '#   #', '# # #', '#  # ', ' ## #'],
-  R: ['#### ', '#   #', '#### ', '#  # ', '#   #'],
-  S: [' ####', '#    ', ' ### ', '    #', '#### '],
-  T: ['#####', '  #  ', '  #  ', '  #  ', '  #  '],
-  U: ['#   #', '#   #', '#   #', '#   #', ' ### '],
-  V: ['#   #', '#   #', '#   #', ' # # ', '  #  '],
-  W: ['#   #', '#   #', '# # #', '## ##', '#   #'],
-  X: ['#   #', ' # # ', '  #  ', ' # # ', '#   #'],
-  Y: ['#   #', ' # # ', '  #  ', '  #  ', '  #  '],
-  Z: ['#####', '   # ', '  #  ', ' #   ', '#####'],
-  0: [' ### ', '#  ##', '# # #', '##  #', ' ### '],
-  1: ['  #  ', ' ##  ', '  #  ', '  #  ', ' ### '],
-  2: [' ### ', '#   #', '   # ', '  #  ', '#####'],
-  3: ['#### ', '    #', ' ### ', '    #', '#### '],
-  4: ['#   #', '#   #', '#####', '    #', '    #'],
-  5: ['#####', '#    ', '#### ', '    #', '#### '],
-  6: [' ### ', '#    ', '#### ', '#   #', ' ### '],
-  7: ['#####', '   # ', '  #  ', ' #   ', ' #   '],
-  8: [' ### ', '#   #', ' ### ', '#   #', ' ### '],
-  9: [' ### ', '#   #', ' ####', '    #', ' ### '],
-  ' ': ['  ', '  ', '  ', '  ', '  '],
-};
-
-function renderLocalBlockAsciiText(text: string, shaded: boolean): string {
-  const chars = sanitizeAsciiBannerText(text).toUpperCase().split('');
-  const rows = Array.from({ length: 5 }, (_, row) =>
-    chars
-      .map((char) => ASCII_BLOCK_FONT[char]?.[row] ?? ASCII_BLOCK_FONT[' ']![row])
-      .join('  ')
-      .trimEnd(),
-  );
-
-  if (!shaded) {
-    return rows.join('\n');
-  }
-
-  return rows
-    .map((line, index) => {
-      const shadow = ' '.repeat(index + 1) + line.replace(/#/g, '/');
-      return `${line}\n${shadow}`;
-    })
-    .join('\n');
-}
-
-function formatAsciiArtResponse(request: ParsedAsciiRequest, art: string): string {
-  const label =
-    request.mode === 'scene'
-      ? `Style: ${request.styleLabel} (${request.value})`
-      : `Style: ${request.styleLabel} (${request.font})`;
-  return `${label}\n\n\`\`\`text\n${art.trimEnd()}\n\`\`\``;
-}
-
-async function generateAsciiArtFromRemoteSources(task: string): Promise<string | null> {
-  const request = parseAsciiRequest(task);
-  if (request.mode !== 'banner') {
-    return null;
-  }
-
-  const art = await fetchAsciiBannerArt(request.value, request.font);
-  if (!art) {
-    return null;
-  }
-  return formatAsciiArtResponse(request, art);
-}
-
-async function generateAsciiTextFastPath(request: ParsedAsciiRequest): Promise<string> {
-  const remote = await fetchAsciiBannerArt(request.value, request.font).catch(() => null);
-  if (remote && !containsNonAsciiPrintable(remote)) {
-    return formatAsciiArtResponse(request, remote);
-  }
-
-  const shaded = /shade|shadow|3-d|3d/i.test(`${request.styleLabel} ${request.font}`);
-  const local = renderLocalBlockAsciiText(request.value, shaded);
-  return formatAsciiArtResponse(
-    {
-      ...request,
-      font: shaded ? 'Local Shadow' : 'Local Block',
-      styleLabel: shaded ? 'Shaded' : 'Block',
-    },
-    local,
-  );
-}
-
-function extractAsciiCodeBlock(text: string): string {
-  const match = text.match(/```(?:text)?\s*\n([\s\S]*?)```/i);
-  return match?.[1]?.trim() || text.trim();
-}
-
-function containsNonAsciiPrintable(text: string): boolean {
-  for (const char of text) {
-    const code = char.charCodeAt(0);
-    const isAllowedControl = code === 9 || code === 10 || code === 13;
-    const isPrintableAscii = code >= 32 && code <= 126;
-    if (!isAllowedControl && !isPrintableAscii) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function wantsStrictAsciiBanner(task: string): boolean {
-  return /\b(block|shade|shaded|shadow|banner|doom|figlet|font)\b/i.test(task);
-}
-
-function asciiBrainOutputLooksInvalid(task: string, output: string): boolean {
-  const normalized = output.trim();
-  if (!normalized) {
-    return true;
-  }
-
-  if (!/```(?:text)?\s*\n[\s\S]*?```/i.test(normalized)) {
-    return true;
-  }
-
-  if (
-    /\b(?:research report|professional analysis|key developments|why it matters|latin america|would you like me to expand)\b/i.test(
-      normalized,
-    )
-  ) {
-    return true;
-  }
-
-  const artBody = extractAsciiCodeBlock(normalized);
-  if (!artBody || artBody.split('\n').filter((line) => line.trim()).length < 2) {
-    return true;
-  }
-
-  if (containsNonAsciiPrintable(artBody)) {
-    return true;
-  }
-
-  if (
-    /\b(?:cat|dog|coffee|dragon|robot|heart|ship|owl|fish)\b/i.test(task) &&
-    /["'`](?:a|an|any|the)["'`]\s+as ascii/i.test(normalized)
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-function normalizeAsciiCreativeOutput(request: ParsedAsciiRequest, output: string): string | null {
-  const normalized = output.replace(/\r\n/g, '\n').trim();
-  if (!normalized) {
-    return null;
-  }
-
-  if (
-    /\b(?:research report|professional analysis|key developments|why it matters|latin america|would you like|tools used)\b/i.test(
-      normalized,
-    )
-  ) {
-    return null;
-  }
-
-  const artBody = extractAsciiCodeBlock(normalized).trim();
-  if (!artBody || containsNonAsciiPrintable(artBody)) {
-    return null;
-  }
-
-  const nonEmptyLines = artBody.split('\n').filter((line) => line.trim());
-  if (nonEmptyLines.length < 2 || nonEmptyLines.length > 60) {
-    return null;
-  }
-
-  const maxWidth = nonEmptyLines.reduce((max, line) => Math.max(max, line.length), 0);
-  if (maxWidth > 140) {
-    return null;
-  }
-
-  const nonWhitespace = artBody.replace(/\s+/g, '');
-  const alphaChars = (nonWhitespace.match(/[a-z]/gi) || []).length;
-  const symbolChars = (nonWhitespace.match(/[\\\/(){}\[\]_=*^'"`~<>|:;.,-]/g) || []).length;
-  const alphaRatio = nonWhitespace.length > 0 ? alphaChars / nonWhitespace.length : 1;
-  if (symbolChars < 4 || alphaRatio > 0.72) {
-    return null;
-  }
-
-  return formatAsciiArtResponse(request, artBody);
-}
-
-function buildGenericAsciiFallback(subject: string): string {
-  const label = subject
-    .replace(/[^a-zA-Z0-9 ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 28)
-    .toUpperCase();
-  const width = Math.max(16, label.length + 6);
-  const top = `.${'-'.repeat(width)}.`;
-  const middle = `|${label.padStart(Math.floor((width + label.length) / 2)).padEnd(width)}|`;
-  return [
-    `   ${top}`,
-    `  / ${' '.repeat(width)} \\`,
-    ` /  ${middle}  \\`,
-    ` \\  ${' '.repeat(width)}  /`,
-    `  \\_${'_'.repeat(width)}_/`,
-    '      /|\\',
-    '     /_|_\\',
-  ].join('\n');
-}
-
-async function generateAsciiCreativeFallback(request: ParsedAsciiRequest): Promise<string> {
-  const remote = await fetchAsciiSceneArt(request.value).catch(() => null);
-  if (remote && !containsNonAsciiPrintable(remote)) {
-    return formatAsciiArtResponse(
-      {
-        ...request,
-        styleLabel: 'Scene fallback',
-      },
-      remote,
-    );
-  }
-
-  const local = ASCII_CREATIVE_FALLBACKS[request.value.toLowerCase()] || buildGenericAsciiFallback(request.value);
-  return formatAsciiArtResponse(
-    {
-      ...request,
-      styleLabel: 'Local fallback',
-    },
-    local,
-  );
-}
-
-async function collectAsciiBrainOutput(
-  task: string,
-  request: ParsedAsciiRequest,
-  strictRetry = false,
-): Promise<string> {
-  const message = [
-    'Create creative ASCII scene/object art for the following request.',
-    `User request: ${task}`,
-    `Creative subject: ${request.value}`,
-    '',
-    'Mandatory rules:',
-    '- MUST call skill_view(name="creative/ascii-art") before replying.',
-    '- Use only printable ASCII characters (32-126) plus newlines.',
-    '- Never use Unicode, emoji, kaomoji, CJK characters, or box-drawing characters.',
-    '- This is NOT a text banner request. Do not spell words as large letters.',
-    '- Draw the requested subject or scene itself.',
-    '- Use recognizable silhouette/detail. For animals, include face/body cues; for objects, include shape/details.',
-    '- Return exactly two parts: one short label line naming the chosen style, then one fenced code block using ```text.',
-    '- Do not add extra explanation before or after the art.',
-    strictRetry
-      ? '- This is a retry because the previous answer was invalid. Be strict: pure ASCII only, no Unicode at all.'
-      : '',
-  ]
-    .filter(Boolean)
-    .join('\n');
-
-  let output = '';
-  for await (const chunk of runAgentBrain(
-    message,
-    [],
-    {
-      walletAddress: '',
-    },
-    createRunId('ascii'),
-  )) {
-    if (chunk.type === 'delta') {
-      output += chunk.delta;
-    }
-  }
-
-  return output.trim();
-}
-
-async function generateAsciiAgentResult(task: string): Promise<string> {
-  const parsed = parseAsciiRequest(task);
-  if (parsed.mode === 'banner') {
-    return generateAsciiTextFastPath(parsed);
-  }
-
-  const firstPass = await collectAsciiBrainOutput(task, parsed, false);
-  const firstNormalized = normalizeAsciiCreativeOutput(parsed, firstPass);
-  if (firstNormalized) {
-    return firstNormalized;
-  }
-  console.warn('[ascii] Hermes creative output rejected', {
-    subject: parsed.value,
-    pass: 'first',
-    sample: firstPass.slice(0, 240),
-  });
-
-  const secondPass = await collectAsciiBrainOutput(task, parsed, true);
-  const secondNormalized = normalizeAsciiCreativeOutput(parsed, secondPass);
-  if (secondNormalized) {
-    return secondNormalized;
-  }
-  console.warn('[ascii] Hermes creative output rejected', {
-    subject: parsed.value,
-    pass: 'retry',
-    sample: secondPass.slice(0, 240),
-  });
-
-  return generateAsciiCreativeFallback(parsed);
-}
-
-function buildAsciiFastPathMeta(
-  status: 'started' | 'completed' | 'failed',
-): BrainMessageMeta {
-  if (status === 'completed') {
-    return {
-      title: 'AgentFlow',
-      trace: [
-        'ASCII Agent loaded the ASCII art skill',
-        'ASCII Agent validated the requested style',
-        'ASCII art is ready',
-      ],
-      activityMeta: {
-        mode: 'brain',
-        clusters: ['ASCII Agent'],
-        stageBars: [34, 48, 62, 12, 12, 12],
-      },
-    };
-  }
-
-  if (status === 'failed') {
-    return {
-      title: 'AgentFlow',
-      trace: [
-        'ASCII Agent loaded the ASCII art skill',
-        'ASCII Agent rejected an invalid generator response',
-      ],
-      activityMeta: {
-        mode: 'brain',
-        clusters: ['ASCII Agent'],
-        stageBars: [34, 48, 12, 12, 12, 12],
-      },
-    };
-  }
-
-  return {
-    title: 'AgentFlow',
-    trace: [
-      'ASCII Agent is loading the ASCII art skill',
-      'ASCII Agent is validating the requested style',
-    ],
-    activityMeta: {
-      mode: 'brain',
-      clusters: ['ASCII Agent'],
-      stageBars: [34, 48, 12, 12, 12, 12],
-    },
-  };
-}
-
-function buildAsciiFailureReply(details: string): string {
-  const cleaned = details.trim();
-  return [
-    'I could not generate valid ASCII art for that request.',
-    cleaned
-      ? `Reason: ${cleaned}`
-      : 'Reason: the ASCII skill returned an invalid result.',
-    '',
-    'I stopped instead of faking an answer or switching into research.',
-  ].join('\n');
-}
-
-type DcwPaidConfirmResult<TData> = {
-  status: number;
-  data: TData;
-  payment: {
-    mode: 'DCW';
-    payer: Address;
-    agent: string;
-    price: string;
-    requestId: string;
-    transaction: string | null;
-    settlement: Record<string, unknown> | null;
-  };
-};
-
-async function ensureUserPaidExecutionLedger(input: {
-  payer: Address;
-  agent: string;
-  price: string;
-  requestId: string;
-  settlement?: Record<string, unknown> | null;
-  transaction?: string | null;
-}): Promise<void> {
-  const requestRef = input.requestId || input.transaction || '';
-  if (!requestRef) {
-    return;
-  }
-
-  const { data: existing, error: existingError } = await adminDb
-    .from('transactions')
-    .select('id')
-    .eq('buyer_agent', 'user_dcw')
-    .eq('seller_agent', input.agent)
-    .eq('request_id', requestRef)
-    .limit(1)
-    .maybeSingle();
-
-  if (existingError) {
-    console.warn(`[ledger] ${input.agent} user-paid lookup failed:`, existingError.message);
-  }
-  if (existing?.id) {
-    return;
-  }
-
-  const agentOwner = await loadAgentOwnerWallet(input.agent);
-  const ledger = await insertAgentToAgentLedger({
-    fromWallet: input.payer,
-    toWallet: agentOwner.address,
-    amount: Number(String(input.price).replace(/^\$/, '')) || 0,
-    settlement: (input.settlement as any) || undefined,
-    remark: `User DCW -> ${input.agent} Agent`,
-    agentSlug: input.agent,
-    buyerAgent: 'user_dcw',
-    sellerAgent: input.agent,
-    requestId: requestRef,
-    context: `user_dcw->${input.agent}`,
-  });
-
-  if (!ledger.ok) {
-    console.warn(`[ledger] ${input.agent} user-paid insert failed:`, ledger.error);
-  }
-}
-
-async function runDcwPaidConfirm<TData>(
-  input: {
-    walletAddress: string;
-    agent: string;
-    price: string;
-    url: string;
-    body?: Record<string, unknown>;
-    requestId: string;
-  },
-): Promise<DcwPaidConfirmResult<TData>> {
-  const normalizedWallet = getAddress(input.walletAddress);
-  const executionWallet = await getOrCreateUserAgentWallet(normalizedWallet);
-  const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-  const headers: Record<string, string> = internalKey
-    ? { 'x-agentflow-paid-internal': internalKey }
-    : { Authorization: `Bearer ${generateJWT(normalizedWallet)}` };
-
-  const result = await payProtectedResourceServer<TData, Record<string, unknown>>({
-    url: input.url,
-    method: 'POST',
-    body: {
-      ...(input.body ?? {}),
-      walletAddress: normalizedWallet,
-      executionTarget: 'DCW',
-    },
-    circleWalletId: executionWallet.wallet_id,
-    payer: getAddress(executionWallet.address),
-    chainId: CHAIN_ID,
-    headers,
-    requestId: input.requestId,
-    idempotencyKey: input.requestId,
-  });
-
-  await ensureUserPaidExecutionLedger({
-    payer: getAddress(executionWallet.address),
-    agent: input.agent,
-    price: input.price,
-    requestId: result.requestId,
-    transaction: result.transactionRef ?? null,
-    settlement:
-      result.transaction && typeof result.transaction === 'object'
-        ? (result.transaction as Record<string, unknown>)
-        : null,
-  });
-
-  return {
-    status: result.status,
-    data: result.data,
-    payment: {
-      mode: 'DCW',
-      payer: getAddress(executionWallet.address),
-      agent: input.agent,
-      price: input.price,
-      requestId: result.requestId,
-      transaction: result.transactionRef ?? null,
-      settlement:
-        result.transaction && typeof result.transaction === 'object'
-          ? (result.transaction as Record<string, unknown>)
-          : null,
-    },
-  };
 }
 
 async function buildBrainWalletCtx(
@@ -5280,27 +7578,15 @@ async function buildBrainWalletCtx(
   return walletCtx;
 }
 
-function shouldIncludePortfolioContext(task: string): boolean {
-  return /\b(?:portfolio|holdings?|positions?|wallet\s+tokens|asset\s+allocation|exposure|what\s+i\s+hold)\b/i.test(
-    task,
-  );
-}
-
 function numericOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 async function buildResearchWalletContext(params: {
-  task: string;
   ownerWalletAddress: string;
   executionWalletAddress: string;
   executionTarget?: 'DCW' | 'EOA';
 }): Promise<ResearchWalletContext | null> {
-  const shouldScanPortfolio = shouldIncludePortfolioContext(params.task);
-  if (!shouldScanPortfolio) {
-    return null;
-  }
-
   const ownerWalletAddress = isAddress(params.ownerWalletAddress)
     ? getAddress(params.ownerWalletAddress)
     : params.ownerWalletAddress;
@@ -5495,10 +7781,20 @@ function buildPortfolioExposureSummary(context: ResearchWalletContext): {
   };
 }
 
-function formatWalletContextReportSection(liveData: Record<string, unknown> | null): string {
+function formatWalletContextReportSection(
+  liveData: Record<string, unknown> | null,
+  portfolioImpact = false,
+): string {
+  if (!portfolioImpact) {
+    return '';
+  }
   const walletContext = liveData?.wallet_context;
   if (!walletContext || typeof walletContext !== 'object') {
-    return '';
+    return [
+      '## Your Portfolio Impact',
+      '',
+      'AgentFlow could not load your portfolio snapshot for this run, so I am avoiding personalized holdings or exposure claims instead of guessing.',
+    ].join('\n');
   }
 
   const context = walletContext as ResearchWalletContext;
@@ -5527,25 +7823,49 @@ function formatWalletContextReportSection(liveData: Record<string, unknown> | nu
 }
 
 function stripExistingPortfolioImpactSection(markdown: string): string {
-  const normalized = markdown.replace(/\r\n/g, '\n');
-  const headingPattern = /^#{2,3}\s+(?:Your Portfolio Impact|Personalized Portfolio Impact|Portfolio Impact|Portfolio Implications)\b.*$/gim;
-  const match = headingPattern.exec(normalized);
-  if (!match || match.index === undefined) {
-    return normalized;
+  let normalized = markdown.replace(/\r\n/g, '\n');
+
+  const headingPattern =
+    /^#{2,3}\s+(?:Your Portfolio Impact|Personalized Portfolio Impact|Portfolio Impact|Portfolio Implications)\b.*$/im;
+  while (true) {
+    const match = headingPattern.exec(normalized);
+    if (!match || match.index === undefined) break;
+
+    const start = match.index;
+    const rest = normalized.slice(start + match[0].length);
+    const nextHeading = rest.search(/\n#{2,3}\s+\S/gm);
+    if (nextHeading < 0) {
+      normalized = normalized.slice(0, start).trimEnd();
+      break;
+    }
+    const end = start + match[0].length + nextHeading;
+    normalized = `${normalized.slice(0, start).trimEnd()}\n\n${normalized.slice(end).trimStart()}`.trim();
   }
 
-  const start = match.index;
-  const rest = normalized.slice(start + match[0].length);
-  const nextHeading = rest.search(/\n#{2,3}\s+\S/gm);
-  if (nextHeading < 0) {
-    return normalized.slice(0, start).trimEnd();
+  const inlinePattern =
+    /(?:^|\n)(?:\*\*)?(?:Portfolio Impact|Implications for Your Portfolio|Current Economic Situation impacts for your portfolio)(?:\*\*)?:\s*[\s\S]*?(?=\n\s*\n|\n#{2,3}\s+\S|$)/im;
+  while (true) {
+    const match = inlinePattern.exec(normalized);
+    if (!match || match.index === undefined) break;
+    const start = match.index;
+    const end = start + match[0].length;
+    const prefix = normalized.slice(0, start).trimEnd();
+    const suffix = normalized.slice(end).trimStart();
+    normalized = prefix && suffix ? `${prefix}\n\n${suffix}` : `${prefix}${suffix}`.trim();
   }
-  const end = start + match[0].length + nextHeading;
-  return `${normalized.slice(0, start).trimEnd()}\n\n${normalized.slice(end).trimStart()}`.trim();
+
+  return normalized.trim();
 }
 
-function ensureWalletContextInReport(markdown: string, liveData: Record<string, unknown> | null): string {
-  const section = formatWalletContextReportSection(liveData);
+function ensureWalletContextInReport(
+  markdown: string,
+  liveData: Record<string, unknown> | null,
+  portfolioImpact = false,
+): string {
+  if (!portfolioImpact) {
+    return stripExistingPortfolioImpactSection(markdown);
+  }
+  const section = formatWalletContextReportSection(liveData, portfolioImpact);
   if (!section) {
     return markdown;
   }
@@ -5559,19 +7879,36 @@ function ensureWalletContextInReport(markdown: string, liveData: Record<string, 
   return `${cleanedMarkdown.trim()}\n\n${section}`;
 }
 
-function streamStaticSseReply(res: Response, text: string): void {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  // @ts-ignore
-  res.flushHeaders?.();
+function streamStaticSseReply(
+  res: Response,
+  text: string,
+  meta?: Record<string, unknown>,
+): void {
+  if (!res.headersSent) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    // @ts-ignore
+    res.flushHeaders?.();
+  }
 
+  if (meta) {
+    res.write(`data: ${JSON.stringify({ meta })}\n\n`);
+  }
   for (const chunk of text.match(/[\s\S]{1,120}/g) ?? [text]) {
     res.write(`data: ${JSON.stringify({ delta: chunk })}\n\n`);
   }
   res.write('data: [DONE]\n\n');
   res.end();
+}
+
+function truncateIntentDispatchMessage(message: string, maxLength = 200): string {
+  const normalized = message.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 3)}...`;
 }
 
 function isReportRenderingComplaint(message: string): boolean {
@@ -5599,6 +7936,330 @@ function findLatestStoredResearchReport(history: BrainConversationMessage[]): st
     const report = extractStoredResearchReport(item.content);
     if (report) return report;
   }
+  return null;
+}
+
+function hasRecentStoredResearchReport(history: BrainConversationMessage[]): boolean {
+  return Boolean(findLatestStoredResearchReport(history));
+}
+
+function looksLikeReportMetaFollowup(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+
+  return (
+    /\b(?:is this|is that|was this|was that|this is|that is)\s+report\b/i.test(normalized) ||
+    /\b(?:already|just)\s+(?:generated|made|gave|sent|showed)\s+(?:a\s+)?report\b/i.test(
+      normalized,
+    ) ||
+    /\byou already\b[\s\S]{0,40}\breport\b/i.test(normalized) ||
+    /\breport\b[\s\S]{0,40}\b(?:unfinished|incomplete|cut off|truncated|partial|broken)\b/i.test(
+      normalized,
+    ) ||
+    /\b(?:unfinished|incomplete|cut off|truncated|partial|broken)\b[\s\S]{0,40}\breport\b/i.test(
+      normalized,
+    ) ||
+    /\b(?:looks|looked)\s+(?:unfinished|incomplete|cut off|truncated|partial|broken)\b/i.test(
+      normalized,
+    ) ||
+    /\bwhat are you talking\b/i.test(normalized) ||
+    /\bare you crazy\b/i.test(normalized) ||
+    /\bwhy (?:are|did)\s+you\b[\s\S]{0,60}\breport\b/i.test(normalized)
+  );
+}
+
+function looksLikeReportFollowupQuestion(
+  message: string,
+  history: BrainConversationMessage[],
+): boolean {
+  if (!hasRecentStoredResearchReport(history)) {
+    return false;
+  }
+
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  if (looksLikeReportMetaFollowup(message)) return true;
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length > 18) {
+    return false;
+  }
+
+  const explicitNewResearch =
+    /\b(?:new|another|fresh|rerun|regenerate|generate|create|make)\b[\s\S]{0,30}\breport\b/i.test(
+      normalized,
+    ) ||
+    /\b(?:research|analy[sz]e|look into|investigate|deep dive)\b/i.test(normalized);
+  if (explicitNewResearch) {
+    return false;
+  }
+
+  return /\b(?:this|that|it|they|them|those|these|why|how|what about|so|then|does that|is that|from that|on that|in that)\b/i.test(
+    normalized,
+  );
+}
+
+function buildReportFollowupGuardReply(previousReportExists: boolean): string {
+  return previousReportExists
+    ? "You're right — the previous completed assistant message was already the report. I shouldn't start a new research run from that kind of follow-up. Ask me a specific follow-up about that report and I'll answer from it instead of regenerating."
+    : "You're right to call that out. That follow-up should stay attached to the report context, not trigger a fresh research run.";
+}
+
+function buildReportFollowupGroundedReply(
+  message: string,
+  previousReportExists: boolean,
+): string {
+  const normalized = message.trim().toLowerCase();
+  const asksAboutCompletion =
+    /\b(?:is|was)\s+(?:this|that)\s+report\b/i.test(normalized) ||
+    /\b(?:looks|looked)\s+(?:unfinished|incomplete|cut off|truncated|partial|broken)\b/i.test(
+      normalized,
+    ) ||
+    /\b(?:unfinished|incomplete|cut off|truncated|partial|broken)\s+report\b/i.test(normalized);
+
+  if (asksAboutCompletion) {
+    return previousReportExists
+      ? "The safe answer is: the previous completed assistant message was already the report. I should not have started a new research run from that follow-up, and I should not claim a specific pipeline stop-point unless the recorded step events actually prove it."
+      : "The safe answer is: I can't verify a specific pipeline stop-point from that follow-up alone. I should not invent a story about the writer or analyst stage without explicit step-state evidence.";
+  }
+
+  return previousReportExists
+    ? "You're right - the previous completed assistant message was already the report. I shouldn't start a new research run from that kind of follow-up. Ask me a specific follow-up about that report and I'll answer from it instead of regenerating."
+    : "You're right to call that out. That follow-up should stay attached to the report context, not trigger a fresh research run.";
+}
+
+const REPORT_FOLLOWUP_SYSTEM_PROMPT = `You are answering a follow-up to an already generated research report.
+
+Rules:
+- Treat the provided report as the active conversation context.
+- Answer from the report only. Do not invent new facts, new sources, or internal pipeline state.
+- Do not start or suggest a new research run unless the user explicitly asks to rerun, regenerate, refresh, or update the report.
+- If the user is giving positive feedback or acknowledgment, respond naturally and briefly.
+- If the user asks "which source says that?" or a similar referential question and the referenced claim is ambiguous, ask one short clarification question instead of guessing.
+- If the answer is not supported by the report, say that plainly.
+- Never narrate hidden agent/pipeline internals unless they are explicitly present in the report text.
+- Keep the answer concise and conversational.`;
+
+function extractMarkdownSection(markdown: string, headings: string[]): string | null {
+  const normalized = markdown.replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  const headingSet = new Set(headings.map((heading) => heading.trim().toLowerCase()));
+  let startIndex = -1;
+  let headingLevel = 0;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^(#{1,6})\s+(.+?)\s*$/.exec(lines[index]);
+    if (!match) continue;
+    const title = match[2].trim().toLowerCase();
+    if (headingSet.has(title)) {
+      startIndex = index + 1;
+      headingLevel = match[1].length;
+      break;
+    }
+  }
+
+  if (startIndex < 0) return null;
+
+  const collected: string[] = [];
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const line = lines[index];
+    const match = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
+    if (match && match[1].length <= headingLevel) break;
+    collected.push(line);
+  }
+
+  const section = collected.join('\n').trim();
+  return section || null;
+}
+
+function extractReportSourceBullets(report: string): string[] {
+  const section = extractMarkdownSection(report, ['Sources']);
+  if (!section) return [];
+  return section
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^[-*•⠂]/.test(line))
+    .map((line) => line.replace(/^[-*•⠂]\s*/, '').trim())
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function matchReportSourceByMessage(report: string, message: string): string | null {
+  const sources = extractReportSourceBullets(report);
+  const normalized = message.trim().toLowerCase();
+  if (!sources.length || !normalized) return null;
+
+  const findSource = (pattern: RegExp) => sources.find((source) => pattern.test(source));
+
+  if (/\b(?:price|market cap|trading volume|coin gecko|coingecko)\b/i.test(normalized)) {
+    return findSource(/\bcoingecko\b/i) ?? null;
+  }
+  if (/\b(?:tvl|defillama)\b/i.test(normalized)) {
+    return findSource(/\bdefillama\b/i) ?? null;
+  }
+  if (/\b(?:bottom|60k|k33|bear market|coindesk)\b/i.test(normalized)) {
+    return findSource(/\bcoindesk\b/i) ?? null;
+  }
+  if (/\b(?:quantum|computing risk|vulnerab|ccn)\b/i.test(normalized)) {
+    return findSource(/\bccn\b/i) ?? null;
+  }
+
+  return null;
+}
+
+function isExplicitReportRerunRequest(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    /\b(?:rerun|regenerate|regenerate it|run again|refresh|update)\b/i.test(normalized) ||
+    /\b(?:new|another|fresh)\s+(?:report|research)\b/i.test(normalized) ||
+    /\b(?:do|make|generate)\b[\s\S]{0,30}\b(?:new|fresh)\b[\s\S]{0,20}\b(?:report|research)\b/i.test(
+      normalized,
+    )
+  );
+}
+
+function shouldUseReportContextTurn(
+  message: string,
+  previousReport: string | null,
+): boolean {
+  if (!previousReport) return false;
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  if (isExplicitReportRerunRequest(normalized)) return false;
+  if (/\b(?:research|deep research|analy[sz]e|investigate|look into|generate report|make a report)\b/i.test(normalized)) {
+    return false;
+  }
+  if (normalized.length > 280) return false;
+
+  if (NON_RESEARCH_PHRASES.test(normalized)) return true;
+  if (/\?$/.test(normalized)) return true;
+  const referential =
+    /\b(?:that|this|it|these|those|report|claim|claims|sentence|line|point)\b/i.test(normalized);
+  if (/\b(?:report|citation|citations|claim|claims|mean|means|bearish|bullish|why|how|what|which|unfinished|incomplete|cut off|truncated|good|great|nice|helpful|thanks|thank you)\b/i.test(normalized) && referential) {
+    return true;
+  }
+  if (/\b(?:source|sources)\b/i.test(normalized) && referential) {
+    return true;
+  }
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  return words.length <= 8;
+}
+
+function buildReportFollowupModelInput(report: string, userMessage: string): string {
+  const summary =
+    extractMarkdownSection(report, ['Summary', 'Overview', 'Executive Summary']) ??
+    report.slice(0, 1200);
+  const takeaway = extractMarkdownSection(report, ['Takeaway']);
+  const sources = extractReportSourceBullets(report);
+
+  return [
+    'ACTIVE REPORT:',
+    report,
+    '',
+    'REPORT SUMMARY:',
+    summary,
+    '',
+    takeaway ? `REPORT TAKEAWAY:\n${takeaway}\n` : '',
+    sources.length ? `REPORT SOURCES:\n- ${sources.join('\n- ')}\n` : '',
+    `USER FOLLOW-UP:\n${userMessage}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function extractReportClaimCandidates(report: string): string[] {
+  const sections = [
+    extractMarkdownSection(report, ['Summary', 'Overview', 'Executive Summary']),
+    extractMarkdownSection(report, ['Takeaway']),
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(' ');
+
+  const normalized = sections.replace(/\s+/g, ' ').trim();
+  if (!normalized) return [];
+
+  const sentences = normalized
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length >= 20)
+    .slice(0, 4);
+
+  return sentences.map((sentence) =>
+    sentence.length > 120 ? `${sentence.slice(0, 117).trimEnd()}...` : sentence,
+  );
+}
+
+function classifyReportContextTurn(
+  message: string,
+): 'ack' | 'source_lookup' | 'explanation' | 'general' {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return 'general';
+
+  if (
+    /\b(?:good|great|nice|helpful|useful|solid|perfect|awesome)\b/i.test(normalized) ||
+    /\b(?:thanks|thank you)\b/i.test(normalized)
+  ) {
+    return 'ack';
+  }
+
+  if (
+    /\b(?:which source|what source|source says|where (?:does|did) that come from|citation|cite|cites|cited|source)\b/i.test(
+      normalized,
+    )
+  ) {
+    return 'source_lookup';
+  }
+
+  if (/\b(?:why|how|what does|what did|what about|is that|does that|bearish|bullish|mean|means)\b/i.test(normalized)) {
+    return 'explanation';
+  }
+
+  return 'general';
+}
+
+function buildReportAcknowledgementReply(): string {
+  return "Glad it helped. Ask me about any claim, implication, or source in that report and I'll stay grounded in the report itself.";
+}
+
+function buildReportSourceLookupReply(report: string): string {
+  const sources = extractReportSourceBullets(report);
+  if (sources.length === 0) {
+    return "I can only ground that in the report itself, and this report doesn't expose a clean source list. Point me to the exact claim you want sourced and I'll tell you whether the report actually supports it.";
+  }
+
+  const preview = sources.slice(0, 4).map((source) => `- ${source}`).join('\n');
+  return `Which claim do you want sourced specifically? This report's listed sources are:\n${preview}\n\nIf you point to the exact sentence or claim, I'll map it to the closest source in the report instead of guessing.`;
+}
+
+function buildMatchedReportSourceReply(report: string, message: string): string | null {
+  const matched = matchReportSourceByMessage(report, message);
+  if (!matched) return null;
+  return `Based on the report's own source list, the closest supporting source for that claim is: ${matched}`;
+}
+
+function buildReportExplanationClarifier(report: string): string | null {
+  const claims = extractReportClaimCandidates(report);
+  if (claims.length < 2) return null;
+  const preview = claims.slice(0, 3).map((claim) => `- ${claim}`).join('\n');
+  return `I can explain it, but there are a few plausible claims in that report. Which one do you mean?\n${preview}`;
+}
+
+function buildMatchedReportExplanationReply(message: string): string | null {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return null;
+
+  if (/\b(?:quantum|computing risk|vulnerab)\b/i.test(normalized)) {
+    return "Within the report's framing, that reads as bearish because it points to a potential security risk for Bitcoin holders. The report is saying that even with strong current price and market-cap numbers, a material technology risk could weigh on confidence.";
+  }
+  if (/\b(?:bottom|60k|bear market|k33)\b/i.test(normalized)) {
+    return "Within the report's framing, the $60k bottom thesis is only partially bearish. It implies Bitcoin may already have gone through significant downside, but it also frames that weakness as possibly stabilizing rather than accelerating.";
+  }
+  if (/\b(?:narrow current snapshot|snapshot|not a full long-form|not a full thesis)\b/i.test(normalized)) {
+    return "It means the report should be read as a limited current snapshot, not a comprehensive Bitcoin thesis. In other words, it covers a few current signals and sources, but not the full macro, regulatory, on-chain, or long-term adoption picture.";
+  }
+
   return null;
 }
 
@@ -5724,7 +8385,6 @@ function getAgentUrl(step: OrchestratorStep): string {
 function parseDcwPaidAgentSlug(value: string): DcwPaidAgentSlug | null {
   const normalized = value.trim().toLowerCase();
   if (
-    normalized === 'ascii' ||
     normalized === 'swap' ||
     normalized === 'vault' ||
     normalized === 'portfolio' ||
@@ -5738,8 +8398,6 @@ function parseDcwPaidAgentSlug(value: string): DcwPaidAgentSlug | null {
 
 function getDcwPaidAgentUrl(slug: DcwPaidAgentSlug): string {
   switch (slug) {
-    case 'ascii':
-      return ASCII_URL;
     case 'swap':
       return SWAP_URL;
     case 'vault':
@@ -5755,8 +8413,6 @@ function getDcwPaidAgentUrl(slug: DcwPaidAgentSlug): string {
 
 function getDcwPaidAgentPrice(slug: DcwPaidAgentSlug): string {
   switch (slug) {
-    case 'ascii':
-      return `${asciiPrice} USDC`;
     case 'swap':
       return `${swapPrice} USDC`;
     case 'vault':
@@ -5766,14 +8422,12 @@ function getDcwPaidAgentPrice(slug: DcwPaidAgentSlug): string {
     case 'vision':
       return `${parsePrice(process.env.VISION_AGENT_PRICE, '0.004')} USDC`;
     case 'transcribe':
-      return `${parsePrice(process.env.TRANSCRIBE_AGENT_PRICE, '0.002')} USDC`;
+      return '0 USDC';
   }
 }
 
 function getPaidAgentUrlBySlug(slug: string): string | null {
   switch (slug.toLowerCase()) {
-    case 'ascii':
-      return ASCII_URL;
     case 'research':
       return RESEARCH_URL;
     case 'analyst':
@@ -6081,6 +8735,7 @@ function createAgentApp(
   price: string,
   timeoutMs: number,
   run: (req: Request) => Promise<Record<string, unknown>>,
+  options: { internalOnly?: boolean } = {},
 ): express.Express {
   const app = express();
   app.use(express.json());
@@ -6115,8 +8770,22 @@ function createAgentApp(
     res.status(200).json({ status: 'ok', agent: name });
   });
 
-  app.get('/run', gateway.require(price), handler);
-  app.post('/run', gateway.require(price), handler);
+  const requireInternalKey = (req: Request, res: Response, next: NextFunction) => {
+    if (!options.internalOnly) {
+      next();
+      return;
+    }
+    const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
+    const reqKey = (req.headers['x-agentflow-brain-internal'] as string | undefined)?.trim();
+    if (internalKey && reqKey === internalKey) {
+      next();
+      return;
+    }
+    res.status(404).json({ error: 'Not found' });
+  };
+
+  app.get('/run', requireInternalKey, gateway.require(price), handler);
+  app.post('/run', requireInternalKey, gateway.require(price), handler);
 
   return app;
 }
@@ -6130,15 +8799,19 @@ function createPublicApp(): express.Express {
   app.use('/api/auth', authApiRouter);
   app.use('/api/wallet', walletApiRouter);
   app.use('/api/settings', settingsApiRouter);
-  app.use('/api/telegram', telegramApiRouter);
   app.use('/api/extension', extensionApiRouter);
   app.use('/api/business', businessApiRouter);
   app.use('/api/pay', payApiRouter);
-  // Agent Store API (legacy path /api/marketplace retained for backwards compatibility)
-  app.use('/api/marketplace', marketplaceApiRouter);
-  app.use('/api/agent-store', marketplaceApiRouter);
+  // Agent Store API
+  app.use('/api/agent-store', agentStoreApiRouter);
+  app.use('/api/agent-economy-ledger', agentEconomyLedgerApiRouter);
   app.use('/api/portfolio', portfolioApiRouter);
-  app.use('/api/funds', fundsApiRouter);
+  app.use('/api/funds', (req: Request, res: Response, next: NextFunction) => {
+    if (!fundsFeatureEnabled()) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    return fundsApiRouter(req, res, next);
+  });
 
   app.get('/api/stats', async (_req: Request, res: Response) => {
     try {
@@ -6176,473 +8849,11 @@ function createPublicApp(): express.Express {
     }
   });
 
-  app.get('/api/economy', async (_req: Request, res: Response) => {
-    try {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const todayIso = today.toISOString();
-      const sixHoursAgoIso = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
-      const coreAgentSpecs = CORE_AGENT_SPECS.map((spec) => ({
-        slug: spec.slug,
-        name: spec.name,
-        category: spec.category,
-        priceUsdc: parseAmount(process.env[spec.envPriceKey] ?? spec.fallbackPrice),
-      }));
-      const coreAgentSlugs = coreAgentSpecs.map((spec) => spec.slug);
-
-      const [
-        todayStatsResult,
-        latestTxsResult,
-        recentA2aResult,
-        hourlyDataResult,
-        agentWalletsResult,
-        allTimeSettlementsResult,
-        allTimeTasksResult,
-        allTimeUsdc,
-        allTimeA2aCountResult,
-      ] = await Promise.all([
-        adminDb
-          .from('transactions')
-          .select(
-            'amount, action_type, payment_rail, buyer_agent, seller_agent, agent_slug, created_at, arc_tx_id',
-          )
-          .eq('status', 'complete')
-          .gte('created_at', todayIso),
-        adminDb
-          .from('transactions')
-          .select('*')
-          .eq('status', 'complete')
-          .neq('action_type', 'agent_to_agent_payment')
-          .order('created_at', { ascending: false })
-          .limit(20),
-        adminDb
-          .from('transactions')
-          .select(
-            'id, buyer_agent, seller_agent, amount, payment_rail, arc_tx_id, gateway_transfer_id, request_id, created_at, remark',
-          )
-          .eq('status', 'complete')
-          .eq('action_type', 'agent_to_agent_payment')
-          .order('created_at', { ascending: false })
-          .limit(50),
-        adminDb
-          .from('transactions')
-          .select('agent_slug, seller_agent, created_at')
-          .eq('status', 'complete')
-          .gte('created_at', sixHoursAgoIso)
-          .order('created_at', { ascending: true }),
-        adminDb
-          .from('wallets')
-          .select('agent_slug, wallet_id, address')
-          .eq('purpose', 'owner')
-          .in('agent_slug', coreAgentSlugs),
-        adminDb
-          .from('transactions')
-          .select('*', { count: 'exact', head: true })
-          .eq('status', 'complete'),
-        adminDb
-          .from('transactions')
-          .select('*', { count: 'exact', head: true })
-          .eq('status', 'complete')
-          .neq('action_type', 'agent_to_agent_payment'),
-        sumCompletedTransactionAmounts(),
-        adminDb
-          .from('transactions')
-          .select('*', { count: 'exact', head: true })
-          .eq('action_type', 'agent_to_agent_payment')
-          .eq('status', 'complete')
-          .in('buyer_agent', coreAgentSlugs)
-          .in('seller_agent', coreAgentSlugs),
-      ]);
-      const treasuryStats = await getTreasuryStats().catch((error) => {
-        console.warn('[economy] treasury stats skipped:', getErrorMessage(error));
-        return null;
-      });
-
-      for (const query of [
-        todayStatsResult,
-        latestTxsResult,
-        recentA2aResult,
-        hourlyDataResult,
-        agentWalletsResult,
-        allTimeSettlementsResult,
-        allTimeTasksResult,
-        allTimeA2aCountResult,
-      ]) {
-        if (query.error) {
-          throw new Error(query.error.message);
-        }
-      }
-
-      const coreAgentSlugSet = new Set(coreAgentSlugs);
-      const isCoreAgent = (
-        value: string | null | undefined,
-      ): value is (typeof coreAgentSlugs)[number] =>
-        typeof value === 'string' && coreAgentSlugSet.has(value as (typeof coreAgentSlugs)[number]);
-
-      const totalStats = todayStatsResult.data ?? [];
-      const totalTasks = totalStats.filter(
-        (tx) => tx.action_type !== 'agent_to_agent_payment',
-      ).length;
-      const totalUsdc = totalStats.reduce((sum, tx) => sum + parseAmount(tx.amount), 0);
-      const a2aTxs = totalStats.filter(
-        (tx) =>
-          tx.action_type === 'agent_to_agent_payment' &&
-          isCoreAgent(tx.buyer_agent) &&
-          isCoreAgent(tx.seller_agent),
-      );
-      const recentA2aPayments = (recentA2aResult.data ?? [])
-        .filter((tx) => isCoreAgent(tx.buyer_agent) && isCoreAgent(tx.seller_agent))
-        .slice(0, 20);
-      const allTimeA2aCount = allTimeA2aCountResult.count ?? 0;
-      const todayArcGas = await estimateArcGasPaidUsd(
-        totalStats.map((tx) => (typeof tx.arc_tx_id === 'string' ? tx.arc_tx_id : null)),
-      );
-
-      const sellerAddresses = (agentWalletsResult.data ?? [])
-        .map((wallet) => wallet?.address)
-        .filter((address): address is string => typeof address === 'string' && isAddress(address))
-        .map((address) => getAddress(address));
-      const batcherEnv = process.env.ARC_GATEWAY_BATCHER_ADDRESS?.trim();
-      const batcherAddress =
-        batcherEnv && isAddress(batcherEnv) ? getAddress(batcherEnv) : undefined;
-
-      const attributedArcGas = await fetchAttributedArcBatcherGas(sellerAddresses, {
-        batcherAddress,
-      });
-
-      const fallbackGasTxCount = totalStats.filter((tx) => shouldCountFallbackArcGas(tx)).length;
-      const fallbackGasPerTx =
-        Number.isFinite(ECONOMY_ARC_FALLBACK_GAS_PER_TX_USD) && ECONOMY_ARC_FALLBACK_GAS_PER_TX_USD > 0
-          ? ECONOMY_ARC_FALLBACK_GAS_PER_TX_USD
-          : 0.000001;
-      const usingAttributedGas = attributedArcGas.totalUsd > 0;
-      const fallbackGasUsd = usingAttributedGas ? 0 : fallbackGasTxCount * fallbackGasPerTx;
-      const combinedArcGasUsd =
-        todayArcGas.totalUsd + attributedArcGas.totalUsd + fallbackGasUsd;
-      const combinedArcGasTxCount =
-        todayArcGas.countedTxs +
-        attributedArcGas.ourTransferCount +
-        (usingAttributedGas ? 0 : fallbackGasTxCount);
-      const todayNetMarginPercent = computeNetMarginPercent(totalUsdc, combinedArcGasUsd);
-
-      const agentEarnings: Record<
-        string,
-        { earned: number; spent: number; tasks: number }
-      > = Object.fromEntries(
-        coreAgentSpecs.map((spec) => [spec.slug, { earned: 0, spent: 0, tasks: 0 }]),
-      );
-
-      for (const tx of totalStats) {
-        const amount = parseAmount(tx.amount);
-        const seller = tx.seller_agent || tx.agent_slug;
-        const participants = new Set<string>();
-
-        if (seller) {
-          if (!agentEarnings[seller]) {
-            agentEarnings[seller] = { earned: 0, spent: 0, tasks: 0 };
-          }
-          agentEarnings[seller].earned += amount;
-          participants.add(seller);
-        }
-
-        const buyer = tx.buyer_agent;
-        if (buyer) {
-          if (!agentEarnings[buyer]) {
-            agentEarnings[buyer] = { earned: 0, spent: 0, tasks: 0 };
-          }
-          agentEarnings[buyer].spent += amount;
-          participants.add(buyer);
-        }
-
-        for (const agent of participants) {
-          if (!agentEarnings[agent]) {
-            agentEarnings[agent] = { earned: 0, spent: 0, tasks: 0 };
-          }
-          agentEarnings[agent].tasks += 1;
-        }
-      }
-
-      const chains: Record<string, number> = {};
-      for (const tx of a2aTxs) {
-        if (tx.buyer_agent && tx.seller_agent) {
-          const key = `${tx.buyer_agent}->${tx.seller_agent}`;
-          chains[key] = (chains[key] || 0) + 1;
-        }
-      }
-
-      const nowMs = Date.now();
-      const hourlyActivity: Record<string, number[]> = Object.fromEntries(
-        coreAgentSpecs.map((spec) => [spec.slug, [0, 0, 0, 0, 0, 0]]),
-      );
-
-      for (const tx of hourlyDataResult.data ?? []) {
-        const agent = tx.seller_agent || tx.agent_slug;
-        if (!agent) {
-          continue;
-        }
-
-        const createdAtRaw = String(tx.created_at ?? '');
-        const createdAtIso = /(?:[zZ]|[+-]\d{2}:\d{2})$/.test(createdAtRaw)
-          ? createdAtRaw
-          : `${createdAtRaw}Z`;
-        const createdAtMs = Date.parse(createdAtIso);
-        if (!Number.isFinite(createdAtMs)) {
-          continue;
-        }
-
-        const hoursAgo = Math.floor((nowMs - createdAtMs) / (60 * 60 * 1000));
-        if (hoursAgo < 0 || hoursAgo >= 6) {
-          continue;
-        }
-
-        if (!hourlyActivity[agent]) {
-          hourlyActivity[agent] = [0, 0, 0, 0, 0, 0];
-        }
-
-        hourlyActivity[agent][5 - hoursAgo] += 1;
-      }
-
-      const gatewayBalances: Record<string, number> = Object.fromEntries(
-        coreAgentSpecs.map((spec) => [spec.slug, 0]),
-      );
-
-      await Promise.all(
-        (agentWalletsResult.data ?? []).map(async (wallet) => {
-          if (!wallet.agent_slug || !wallet.address || !isAddress(wallet.address)) {
-            return;
-          }
-
-          try {
-            const balance = await fetchGatewayBalanceForAddress(
-              getAddress(wallet.address),
-            );
-            gatewayBalances[wallet.agent_slug] = parseAmount(balance.available);
-          } catch {
-            gatewayBalances[wallet.agent_slug] = 0;
-          }
-        }),
-      );
-
-      return res.json({
-        today: {
-          settlements: totalStats.length,
-          tasks: totalTasks,
-          usdc: totalUsdc.toFixed(6),
-          a2a_payments: a2aTxs.length,
-          arc_gas_paid: combinedArcGasUsd.toFixed(8),
-          arc_gas_attribution: usingAttributedGas
-            ? 'batcher_onchain'
-            : todayArcGas.totalUsd > 0
-              ? 'direct_onchain'
-              : combinedArcGasUsd > 0
-                ? 'placeholder'
-                : 'none',
-          arc_gas_buyer_onchain_usd: todayArcGas.totalUsd.toFixed(8),
-          arc_gas_batcher_attributed_usd: attributedArcGas.totalUsd.toFixed(8),
-          arc_gas_attributed_tx_count: attributedArcGas.batchTxCount,
-          arc_gas_attributed_transfer_count: attributedArcGas.ourTransferCount,
-          net_margin: formatPercent(todayNetMarginPercent),
-        },
-        all_time: {
-          settlements: allTimeSettlementsResult.count ?? 0,
-          tasks: allTimeTasksResult.count ?? 0,
-          usdc: allTimeUsdc.toFixed(6),
-          a2a_payments: allTimeA2aCount,
-        },
-        agent_specs: coreAgentSpecs,
-        agent_earnings: agentEarnings,
-        a2a_chains: chains,
-        hourly_activity: hourlyActivity,
-        gateway_balances: gatewayBalances,
-        treasury: treasuryStats
-          ? {
-              total_dcw: treasuryStats.totalDcw.toFixed(2),
-              total_gateway: treasuryStats.totalGateway.toFixed(2),
-              agents_needing_topup: treasuryStats.agentsNeedingTopUp,
-              agents: treasuryStats.agents.map((agent) => ({
-                slug: agent.slug,
-                dcw: agent.dcwBalance.toFixed(3),
-                gateway: agent.gatewayBalance.toFixed(3),
-                status: agent.needsTopUp ? 'low' : 'ok',
-              })),
-            }
-          : null,
-        latest_transactions: latestTxsResult.data ?? [],
-        recent_a2a_payments: recentA2aPayments,
-        arc_vs_ethereum: buildArcVsEthereumStats(
-          combinedArcGasUsd,
-          combinedArcGasTxCount,
-        ),
-      });
-    } catch (e: unknown) {
-      console.warn('[economy] failed:', getErrorMessage(e));
-      return res.status(500).json({ error: 'Failed to fetch economy stats' });
-    }
-  });
-
-  app.post('/api/treasury/topup', authMiddleware, async (_req: Request, res: Response) => {
-    try {
-      await runTreasuryTopUp();
-      const stats = await getTreasuryStats();
-      return res.json({
-        ok: true,
-        message: 'Treasury top-up complete',
-        stats,
-      });
-    } catch (e) {
-      return res.status(500).json({
-        error: e instanceof Error ? e.message : 'failed',
-      });
-    }
-  });
-
-  app.post('/api/economy/benchmark', authMiddleware, async (req: Request, res: Response) => {
-    const auth = (req as any).auth as JWTPayload | undefined;
-    if (!auth?.walletAddress || !isAddress(auth.walletAddress)) {
-      return res.status(400).json({ error: 'Invalid wallet address' });
-    }
-
-    try {
-      const normalizedWalletAddress = getAddress(auth.walletAddress);
-      const existing = Array.from(economyBenchmarkJobs.values()).find(
-        (job) =>
-          job.walletAddress.toLowerCase() === normalizedWalletAddress.toLowerCase() &&
-          (job.status === 'queued' || job.status === 'running'),
-      );
-
-      if (existing) {
-        return res.status(202).json(serializeEconomyBenchmarkJob(existing));
-      }
-
-      const startedAt = new Date().toISOString();
-      const jobId = randomUUID();
-      const job: EconomyBenchmarkJob = {
-        jobId,
-        walletAddress: normalizedWalletAddress,
-        status: 'queued',
-        startedAt,
-        updatedAt: startedAt,
-        completedAt: null,
-        progress: {
-          completed: 0,
-          total: benchmarkProgressTotal(),
-          successful: 0,
-          failed: 0,
-          currentAgent: null,
-        },
-        result: null,
-        error: null,
-      };
-
-      economyBenchmarkJobs.set(jobId, job);
-      void runEconomyBenchmarkJob(jobId, normalizedWalletAddress);
-
-      return res.status(202).json(serializeEconomyBenchmarkJob(job));
-    } catch (e: unknown) {
-      console.warn('[economy] benchmark failed:', getErrorMessage(e));
-      return res.status(500).json({
-        error: e instanceof Error ? e.message : 'Benchmark failed',
-      });
-    }
-  });
-
-  app.get('/api/economy/benchmark/:jobId', authMiddleware, async (req: Request, res: Response) => {
-    const auth = (req as any).auth as JWTPayload | undefined;
-    if (!auth?.walletAddress || !isAddress(auth.walletAddress)) {
-      return res.status(400).json({ error: 'Invalid wallet address' });
-    }
-
-    const normalizedWalletAddress = getAddress(auth.walletAddress);
-    const job = economyBenchmarkJobs.get(String(req.params.jobId ?? '').trim());
-    if (!job) {
-      return res.status(404).json({ error: 'Benchmark job not found' });
-    }
-    if (job.walletAddress.toLowerCase() !== normalizedWalletAddress.toLowerCase()) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    return res.json(serializeEconomyBenchmarkJob(job));
-  });
-
-  app.use('/api', paymentsApiRouter);
 
   const paidAgentGateway = createGatewayMiddleware({
     sellerAddress,
     facilitatorUrl: FACILITATOR_URL,
   });
-
-  const asciiInternalKeyMiddleware = (req: Request, res: Response, next: NextFunction) => {
-    const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-    const reqKey = (req.headers['x-agentflow-brain-internal'] as string | undefined)?.trim();
-    if (internalKey && reqKey === internalKey) {
-      (req as any)._asciiInternalAuth = true;
-    }
-    next();
-  };
-
-  const asciiGatewayMiddleware = (req: Request, res: Response, next: NextFunction) => {
-    if ((req as any)._asciiInternalAuth) {
-      next();
-      return;
-    }
-    return paidAgentGateway.require(asciiPrice)(req, res, next);
-  };
-
-  const asciiAgentHandler = async (req: Request, res: Response) => {
-    const task = extractAsciiAgentTask(req.method === 'GET' ? req.query : req.body);
-    if (!task) {
-      return res.status(400).json({
-        error: 'task is required for the ASCII agent.',
-      });
-    }
-
-    if (req.body?.benchmark === true || req.query?.benchmark === 'true') {
-      console.log('[benchmark] ascii short-circuit');
-      return res.json({
-        ok: true,
-        benchmark: true,
-        agent: 'ascii',
-        result: 'Benchmark mode - payment logged',
-      });
-    }
-
-    const requestId = createRunId('ascii');
-    const start = Date.now();
-
-    try {
-      const result = await withTimeout(
-        generateAsciiAgentResult(task),
-        AGENT_TIMEOUT_MS,
-        'ascii agent',
-      );
-      console.log(`[Agent ascii ${requestId}] done in ${Date.now() - start}ms`);
-      void incrementTxCount('ascii').catch((err) =>
-        console.warn('[tx-counter] increment failed for ascii:', err),
-      );
-      return res.json({
-        success: true,
-        slug: 'ascii',
-        source: 'hermes-skill',
-        requestId,
-        result,
-      });
-    } catch (error) {
-      const details = getErrorMessage(error);
-      const status = details.includes('timed out') ? 504 : 500;
-      console.error(`[Agent ascii ${requestId}] failed`, error);
-      return res.status(status).json({
-        error: 'ascii agent failed',
-        details,
-        requestId,
-      });
-    }
-  };
-
-  app.get('/agent/ascii/health', (_req, res) => {
-    res.status(200).json({ status: 'ok', agent: 'ascii' });
-  });
-  app.get('/agent/ascii/run', asciiInternalKeyMiddleware, asciiGatewayMiddleware, asciiAgentHandler);
-  app.post('/agent/ascii/run', asciiInternalKeyMiddleware, asciiGatewayMiddleware, asciiAgentHandler);
 
   app.get('/api/research/status/:jobId', authMiddleware, async (req: Request, res: Response) => {
     try {
@@ -6732,14 +8943,25 @@ function createPublicApp(): express.Express {
     const { confirmId } = req.params;
     const walletAddress = auth.walletAddress;
     try {
-      const result = await runDcwPaidConfirm<{ success: boolean; message: string }>({
-        walletAddress,
+      const result = await executeDcwPaidAgentViaX402<{ success: boolean; message: string }>({
+        userWalletAddress: walletAddress,
         agent: 'schedule',
         price: schedulePrice,
         url: `${SCHEDULE_AGENT_BASE_URL}/confirm/${encodeURIComponent(confirmId)}`,
         requestId: `schedule_confirm_${confirmId}_${Date.now()}`,
       });
-      res.status(result.status).json({ ...result.data, payment: result.payment });
+      res.status(result.status).json({
+        ...result.data,
+        payment: {
+          mode: result.payment.mode,
+          payer: result.payment.payer,
+          agent: result.payment.agent,
+          price: result.payment.price,
+          requestId: result.payment.requestId,
+          transaction: result.payment.transaction,
+          settlement: result.payment.settlement,
+        },
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(503).json({ success: false, message: `Schedule agent unavailable: ${msg}` });
@@ -6751,6 +8973,7 @@ function createPublicApp(): express.Express {
     const auth = (req as any).auth as JWTPayload;
     const walletAddress = auth.walletAddress;
     const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
+
     try {
       const agentRes = await fetch(`${SPLIT_AGENT_BASE_URL}/run`, {
         method: 'POST',
@@ -6775,12 +8998,12 @@ function createPublicApp(): express.Express {
     const walletAddress = auth.walletAddress;
     try {
       const requestedPortfolioA2a = await takeRequestedPortfolioA2a(confirmId);
-      const result = await runDcwPaidConfirm<{
+      const result = await executeDcwPaidAgentViaX402<{
         action?: string;
         message?: string;
         results?: unknown;
       }>({
-        walletAddress,
+        userWalletAddress: walletAddress,
         agent: 'split',
         price: splitPrice,
         url: `${SPLIT_AGENT_BASE_URL}/confirm/${encodeURIComponent(confirmId)}`,
@@ -6801,7 +9024,18 @@ function createPublicApp(): express.Express {
           sessionId: confirmId,
         });
       }
-      res.status(result.status).json({ ...data, payment: result.payment });
+      res.status(result.status).json({
+        ...data,
+        payment: {
+          mode: result.payment.mode,
+          payer: result.payment.payer,
+          agent: result.payment.agent,
+          price: result.payment.price,
+          requestId: result.payment.requestId,
+          transaction: result.payment.transaction,
+          settlement: result.payment.settlement,
+        },
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(503).json({ action: 'error', message: `Split agent unavailable: ${msg}` });
@@ -6852,12 +9086,8 @@ function createPublicApp(): express.Express {
     const walletAddress = auth.walletAddress;
     try {
       const requestedPortfolioA2a = await takeRequestedPortfolioA2a(confirmId);
-      const result = await runDcwPaidConfirm<{
-        action?: string;
-        message?: string;
-        results?: unknown;
-      }>({
-        walletAddress,
+      const result = await executeDcwPaidAgentViaX402<Record<string, unknown>>({
+        userWalletAddress: walletAddress,
         agent: 'batch',
         price: batchPrice,
         url: `${BATCH_AGENT_BASE_URL}/confirm/${encodeURIComponent(confirmId)}`,
@@ -6878,7 +9108,18 @@ function createPublicApp(): express.Express {
           sessionId: confirmId,
         });
       }
-      res.status(result.status).json({ ...data, payment: result.payment });
+      res.status(result.status).json({
+        ...data,
+        payment: {
+          mode: result.payment.mode,
+          payer: result.payment.payer,
+          agent: result.payment.agent,
+          price: result.payment.price,
+          requestId: result.payment.requestId,
+          transaction: result.payment.transaction,
+          settlement: result.payment.settlement,
+        },
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(503).json({ action: 'error', message: `Batch agent unavailable: ${msg}` });
@@ -6905,11 +9146,11 @@ function createPublicApp(): express.Express {
         invoiceNumber: string;
       };
 
-      const result = await runDcwPaidConfirm<{
+      const result = await executeDcwPaidAgentViaX402<{
         invoiceId?: string;
         error?: string;
       }>({
-        walletAddress: pending.walletAddress,
+        userWalletAddress: pending.walletAddress,
         agent: 'invoice',
         price: invoicePrice,
         url: `${INVOICE_AGENT_BASE_URL}/run`,
@@ -6969,7 +9210,15 @@ function createPublicApp(): express.Express {
         invoiceNumber: pending.invoiceNumber,
         paymentRequestId: result.data.invoiceId ?? null,
         message,
-        payment: result.payment,
+        payment: {
+          mode: result.payment.mode,
+          payer: result.payment.payer,
+          agent: result.payment.agent,
+          price: result.payment.price,
+          requestId: result.payment.requestId,
+          transaction: result.payment.transaction,
+          settlement: result.payment.settlement,
+        },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -6981,22 +9230,32 @@ function createPublicApp(): express.Express {
   app.get('/health', (_req, res) => {
     res.json({
       status: 'ok',
-      agents: ['ascii', 'research', 'analyst', 'writer', 'vision', 'transcribe'],
+      agents: ['research', 'analyst', 'writer', 'vision', 'transcribe'],
       network: NETWORK_NAME,
       chainId: CHAIN_ID,
     });
   });
 
-  app.get('/health/stack', (_req, res) => {
+  app.get('/health/stack', async (_req, res) => {
+    const [facilitator, research, analyst, writer, bridge, vision, transcribe] = await Promise.all([
+      checkHttpHealth(resolveFacilitatorHealthUrl()),
+      isAgentHealthy('research'),
+      isAgentHealthy('analyst'),
+      isAgentHealthy('writer'),
+      isAgentHealthy('bridge'),
+      isAgentHealthy('vision'),
+      isAgentHealthy('transcribe'),
+    ]);
+
     res.json({
-      ok: true,
-      facilitator: true,
-      ascii: true,
-      research: true,
-      analyst: true,
-      writer: true,
-      vision: true,
-      transcribe: true,
+      ok: facilitator.ok && research && analyst && writer && bridge && vision && transcribe,
+      facilitator: facilitator.ok,
+      research,
+      analyst,
+      writer,
+      bridge,
+      vision,
+      transcribe,
     });
   });
 
@@ -7009,7 +9268,7 @@ function createPublicApp(): express.Express {
 
     const targetUrl =
       mode === 'dcw'
-        ? (['ascii', 'swap', 'vault', 'portfolio', 'vision', 'transcribe'].includes(slug)
+        ? (['swap', 'vault', 'portfolio', 'vision'].includes(slug)
             ? getDcwPaidAgentUrl(slug as DcwPaidAgentSlug)
             : null)
         : getPaidAgentUrlBySlug(slug);
@@ -7131,6 +9390,169 @@ function createPublicApp(): express.Express {
     }
   });
 
+  app.get('/api/internal/access/memory', adminAuthMiddleware, async (req: Request, res: Response) => {
+    return res.json({
+      ok: true,
+      walletAddress: ((req as any).auth as JWTPayload | undefined)?.walletAddress ?? null,
+    });
+  });
+
+  app.get('/api/memory/metrics', adminAuthMiddleware, async (_req: Request, res: Response) => {
+    try {
+      const report = await buildSemanticMemoryMetricsReport();
+      return res.json(report);
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/internal/memory/metrics', adminAuthMiddleware, async (_req: Request, res: Response) => {
+    try {
+      const report = await buildSemanticMemoryMetricsReport();
+      return res.json(report);
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/memory/review-cases', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : Number.NaN;
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 20;
+      const cases = await buildSemanticMemoryReviewCases(limit);
+      return res.json({ cases });
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/internal/memory/review-cases', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : Number.NaN;
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 20;
+      const cases = await buildSemanticMemoryReviewCases(limit);
+      return res.json({ cases });
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.patch('/api/memory/review-cases/:caseId', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const caseId = String(req.params.caseId ?? '').trim();
+      const label = String(req.body?.label ?? '').trim();
+      const note = typeof req.body?.note === 'string' ? req.body.note : null;
+      if (!caseId) {
+        return res.status(400).json({ error: 'caseId is required.' });
+      }
+      if (!/^(correct|needs_profile|needs_episodic|needs_routing|needs_clarification|ignore)$/.test(label)) {
+        return res.status(400).json({ error: 'Valid review label is required.' });
+      }
+      await saveSemanticMemoryReviewLabel(caseId, label as any, note);
+      return res.json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.patch('/api/internal/memory/review-cases/:caseId', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const caseId = String(req.params.caseId ?? '').trim();
+      const label = String(req.body?.label ?? '').trim();
+      const note = typeof req.body?.note === 'string' ? req.body.note : null;
+      if (!caseId) {
+        return res.status(400).json({ error: 'caseId is required.' });
+      }
+      if (!/^(correct|needs_profile|needs_episodic|needs_routing|needs_clarification|ignore)$/.test(label)) {
+        return res.status(400).json({ error: 'Valid review label is required.' });
+      }
+      await saveSemanticMemoryReviewLabel(caseId, label as any, note);
+      return res.json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/memory/review-cases/export', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const labeledOnly = String(req.query.labeledOnly ?? '1').trim() !== '0';
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : Number.NaN;
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 200;
+      const dataset = await buildSemanticMemoryReviewDataset({ labeledOnly, limit });
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="semantic-memory-review-dataset-${labeledOnly ? 'labeled' : 'all'}.json"`,
+      );
+      return res.status(200).send(JSON.stringify(dataset, null, 2));
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/internal/memory/review-cases/export', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const labeledOnly = String(req.query.labeledOnly ?? '1').trim() !== '0';
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : Number.NaN;
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 200;
+      const dataset = await buildSemanticMemoryReviewDataset({ labeledOnly, limit });
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="semantic-memory-review-dataset-${labeledOnly ? 'labeled' : 'all'}.json"`,
+      );
+      return res.status(200).send(JSON.stringify(dataset, null, 2));
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/internal/review/cases', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : Number.NaN;
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 24;
+      const cases = await buildConversationReviewCases(limit);
+      return res.json({ cases });
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.patch('/api/internal/review/cases/:caseId', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const caseId = String(req.params.caseId ?? '').trim();
+      const label = String(req.body?.label ?? '').trim();
+      const note = typeof req.body?.note === 'string' ? req.body.note : null;
+      if (!caseId) {
+        return res.status(400).json({ error: 'caseId is required.' });
+      }
+      if (!/^(correct|wrong_intent|needs_clarification|should_use_tool|bad_fallback|infra_failure|ignore)$/.test(label)) {
+        return res.status(400).json({ error: 'Valid review label is required.' });
+      }
+      await saveConversationReviewLabel(caseId, label as any, note);
+      return res.json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/internal/review/cases/export', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const labeledOnly = String(req.query.labeledOnly ?? '1').trim() !== '0';
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : Number.NaN;
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 200;
+      const dataset = await buildConversationReviewDataset({ labeledOnly, limit });
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="conversation-review-dataset-${labeledOnly ? 'labeled' : 'all'}.json"`,
+      );
+      return res.status(200).send(JSON.stringify(dataset, null, 2));
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
   app.get('/api/brain/balance', async (req: Request, res: Response) => {
     try {
       const walletAddress = resolveBrainWalletAddress(
@@ -7145,9 +9567,7 @@ function createPublicApp(): express.Express {
         typeof req.query.sessionId === 'string' && req.query.sessionId.trim()
           ? req.query.sessionId.trim()
           : walletAddress;
-      const executionTarget =
-        (await resolveBrainExecutionTarget(req.query.executionTarget, sessionId)) || 'EOA';
-      const walletCtx = await buildBrainWalletCtx(walletAddress, executionTarget);
+      const walletCtx = await buildBrainWalletCtx(walletAddress, 'DCW');
       const result = await executeTool('get_balance', {}, walletCtx, sessionId);
       return res.json({ result });
     } catch (err) {
@@ -7169,9 +9589,7 @@ function createPublicApp(): express.Express {
         typeof req.query.sessionId === 'string' && req.query.sessionId.trim()
           ? req.query.sessionId.trim()
           : walletAddress;
-      const executionTarget =
-        (await resolveBrainExecutionTarget(req.query.executionTarget, sessionId)) || 'EOA';
-      const walletCtx = await buildBrainWalletCtx(walletAddress, executionTarget);
+      const walletCtx = await buildBrainWalletCtx(walletAddress, 'DCW');
       const result = await executeTool('get_portfolio', {}, walletCtx, sessionId);
       return res.json({ result });
     } catch (err) {
@@ -7284,38 +9702,12 @@ function createPublicApp(): express.Express {
     }
   });
 
-  app.post('/api/brain/bridge', async (req: Request, res: Response) => {
+  app.post('/api/brain/bridge', async (_req: Request, res: Response) => {
     try {
-      const { confirmed } = req.body ?? {};
-      const walletAddress = resolveBrainWalletAddress(
-        req.body?.walletAddress,
-        req.body?.sessionId,
-      );
-      if (!walletAddress) {
-        return res.status(400).json({ error: 'Valid walletAddress or sessionId is required.' });
-      }
-
-      const sessionId =
-        typeof req.body?.sessionId === 'string' && req.body.sessionId.trim()
-          ? req.body.sessionId.trim()
-          : walletAddress;
-      const walletCtx = await buildBrainWalletCtx(walletAddress);
-      if (confirmed === true) {
-        return res.json({
-          result: 'Bridge execution blocked. Use chat YES to confirm.',
-        });
-      }
-      const result = await executeTool(
-        'bridge_usdc',
-        {
-          amount: req.body?.amount,
-          sourceChain: req.body?.sourceChain,
-          confirmed: Boolean(req.body?.confirmed),
-        },
-        walletCtx,
-        sessionId,
-      );
-      return res.json({ result });
+      return res.status(410).json({
+        result:
+          'The legacy backend bridge endpoint has been removed. Use the web app native Circle BridgeKit flow to bridge USDC to Arc.',
+      });
     } catch (err) {
       return res.status(500).json({ error: getErrorMessage(err) });
     }
@@ -7335,9 +9727,7 @@ function createPublicApp(): express.Express {
         typeof req.body?.sessionId === 'string' && req.body.sessionId.trim()
           ? req.body.sessionId.trim()
           : walletAddress;
-      const executionTarget =
-        (await resolveBrainExecutionTarget(req.body?.executionTarget, sessionId)) || 'EOA';
-      const walletCtx = await buildBrainWalletCtx(walletAddress, executionTarget);
+      const walletCtx = await buildBrainWalletCtx(walletAddress, 'EOA');
       const result = await executeTool(
         'bridge_precheck',
         {
@@ -7380,7 +9770,17 @@ function createPublicApp(): express.Express {
 
   app.post('/api/chat/respond', async (req: Request, res: Response) => {
     const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    const quickActionIntent = parseQuickActionIntent(
+      req.body?.quickActionContext?.actionId,
+      message,
+    );
     console.log('[route] message:', message);
+    if (quickActionIntent) {
+      console.info('[QUICK_ACTION_CONTEXT]', {
+        action_id: quickActionIntent.intent,
+        routed_as: quickActionIntent.intent,
+      });
+    }
     console.log('[route] shouldResearch:', shouldBypassToResearchPipeline(message));
     console.log('[route] shouldResearch after fix:', shouldHandleAsResearchRequest(message));
     const walletAddress =
@@ -7406,22 +9806,224 @@ function createPublicApp(): express.Express {
           .slice(-15)
       : [];
 
-    if (!message) {
-      return res.status(400).json({ error: 'message is required' });
-    }
-
     const requestSessionId =
       typeof req.headers['x-session-id'] === 'string'
         ? req.headers['x-session-id'].trim()
         : '';
     const sessionId = requestSessionId || walletAddress || `anon-${Date.now()}`;
-    const actionSessionId = walletAddress ? `wallet-${walletAddress.toLowerCase()}` : sessionId;
-    const memorySessionId = walletAddress ? actionSessionId : requestSessionId || actionSessionId;
+    // Keep action/pending state scoped to the active chat thread when the client provides
+    // x-session-id. This avoids one vague follow-up inheriting a stale pending action from
+    // another chat thread on the same wallet.
+    const actionSessionId =
+      requestSessionId || (walletAddress ? `wallet-${walletAddress.toLowerCase()}` : sessionId);
+    const memorySessionId = deriveBrainMemorySessionId(walletAddress, requestSessionId, actionSessionId);
+    // True only when the caller supplied a per-thread session id (web always does:
+    // `wallet-<addr>-chat-<uuid>`). When false, `memorySessionId` collapses to the
+    // wallet-global key, whose persisted history mixes every prior thread for this
+    // wallet. We still store under that key, but we must NOT merge it into the
+    // routing/referential history — otherwise an old portfolio/research report from
+    // another thread leaks in and the brain answers "you already checked it above".
+    // Persisted long-term memory remains available to the brain as enrichment only.
+    const hasThreadScopedSession =
+      requestSessionId.length > 0 &&
+      (!walletAddress ||
+        requestSessionId.toLowerCase().startsWith(`wallet-${walletAddress.toLowerCase()}-`));
+    const responseStartedAt = Date.now();
+    let brainEventId = '';
+    const brainToolsTelemetry: BrainToolTelemetry[] = [];
+    let brainTelemetryFinalized = false;
 
-    const productReply = buildAgentFlowProductReply(message);
-    if (productReply) {
-      await appendBrainConversationTurn(memorySessionId, message, productReply);
-      streamStaticSseReply(res, productReply);
+    maybeLogInputFilterDebug(message);
+    const earlyRouterContinuationState = await loadRouterContinuationState(actionSessionId).catch(() => null);
+    const inputValidation = validateChatInputForBrain(message);
+    const allowShortRouterContinuationReply =
+      !inputValidation.ok &&
+      inputValidation.reason === 'too_short' &&
+      Boolean(earlyRouterContinuationState) &&
+      /^\d+(?:\.\d+)?$/.test(message.trim());
+    if (!inputValidation.ok && !allowShortRouterContinuationReply) {
+      console.warn('[INPUT_REJECTED]', { reason: inputValidation.reason });
+      brainEventId = await logBrainEvent({
+        session_id: memorySessionId,
+        wallet_address: walletAddress || 'anonymous',
+        user_input: message,
+        intent_source: 'unclear',
+        outcome: 'gibberish_rejected',
+        failure_reason: inputValidation.reason,
+        total_latency_ms: Date.now() - responseStartedAt,
+        final_response_summary: "I didn't catch that, could you rephrase?",
+      });
+      streamStaticSseReply(res, "I didn't catch that, could you rephrase?", {
+        eventId: brainEventId,
+      });
+      return;
+    }
+
+    await markPossibleBrainCorrection(memorySessionId, message).catch((error) => {
+      console.warn('[brain-telemetry] correction capture failed:', getErrorMessage(error));
+    });
+    await maybeCaptureSemanticCorrection(walletAddress, memorySessionId, message).catch((error) => {
+      console.warn('[semantic-memory] correction capture failed:', getErrorMessage(error));
+    });
+    brainEventId = await logBrainEvent({
+      session_id: memorySessionId,
+      wallet_address: walletAddress || 'anonymous',
+      user_input: message,
+      intent_source: 'unclear',
+      tools_called: brainToolsTelemetry,
+    });
+    res.on('finish', () => {
+      if (!brainEventId || brainTelemetryFinalized) {
+        return;
+      }
+      void updateBrainEvent(brainEventId, {
+        outcome: 'success',
+        total_latency_ms: Date.now() - responseStartedAt,
+      });
+    });
+
+    const browserTimeZone = normalizeBrowserTimeZone(req.body?.browserTimeZone);
+    const browserLocale = normalizeBrowserLocale(req.body?.browserLocale);
+
+    const lastAssistantMessage = [...messages]
+      .reverse()
+      .find((item) => item.role === 'assistant')?.content ?? '';
+    const confirmsAgentPayHistoryScan =
+      /^(?:yes|y|yeah|yep|sure|ok|okay|go ahead|do it)$/i.test(message.trim()) &&
+      /payment history requires manual address lookups|scan your wallet for transactions/i.test(
+        lastAssistantMessage,
+      );
+    if (confirmsAgentPayHistoryScan && walletAddress) {
+      try {
+        const rows = await fetchPayHistoryForBrain(walletAddress, 10);
+        const responseText = formatAgentPayHistoryForChat(rows as Array<Record<string, any>>, {
+          requestedLimit: 10,
+          browserTimeZone,
+          browserLocale,
+        });
+        await appendBrainConversationTurn(memorySessionId, message, responseText);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'agentpay.history',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('agentpay.history'),
+          final_response_summary: responseText,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        streamStaticSseReply(res, responseText, { eventId: brainEventId });
+        return;
+      } catch (historyErr) {
+        const msg = historyErr instanceof Error ? historyErr.message : String(historyErr);
+        const responseText = `I tried to check AgentPay payment history, but the history read failed: ${msg}`;
+        await appendBrainConversationTurn(memorySessionId, message, responseText);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'agentpay.history',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('agentpay.history'),
+          final_response_summary: responseText,
+          outcome: 'tool_error',
+          failure_reason: responseText,
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        streamStaticSseReply(res, responseText, { eventId: brainEventId });
+        return;
+      }
+    }
+
+    const rawUserBodyField =
+      typeof req.body?.rawUserMessage === 'string' ? req.body.rawUserMessage : undefined;
+    const capabilityProbe = resolveCapabilityRoutingProbe(rawUserBodyField, message);
+
+    /*
+     * Fast-path routing intent (payments & confirmations are handled elsewhere in this route):
+     * 1) Hard confirmations / pending executions (invoice, YES, Redis) — unchanged order below
+     * 2) Scripted product actions / wallet intents — try blocks below
+     * 3) Standalone product FAQ — routing probe only, shallow conversation (no portfolio tails)
+     * 4) Hermes brain fallback via SSE streaming
+     */
+    const capabilityThreadCtx = buildCapabilityThreadContext(messages);
+    const earlyPreviousReport = findLatestStoredResearchReport(
+      messages as BrainConversationMessage[],
+    );
+    const reserveForReportContext = shouldUseReportContextTurn(message, earlyPreviousReport);
+    const earlyPortfolioHistory = messages as BrainConversationMessage[];
+    const earlyPortfolioSnapshot = findRecentPortfolioSnapshotMessage(earlyPortfolioHistory);
+    const earlyPortfolioClarificationReply =
+      shouldClarifyPortfolioRequest(message)
+        ? earlyPortfolioSnapshot
+          ? buildPortfolioContextualFollowupReply(message)
+          : buildPortfolioCheckClarificationReply()
+        : /^(?:where\s+can\s+i\s+(?:see|view|find|open|check)\s+it|where\s+is\s+it|how\s+do\s+i\s+(?:see|view|find|open|check)\s+it)\??$/i.test(
+              message,
+            ) && hasRecentPortfolioConversationContext(earlyPortfolioHistory)
+          ? 'The portfolio report is in this chat above. Ask me to show your portfolio whenever you want a fresh live snapshot.'
+          : null;
+
+    if (earlyPortfolioClarificationReply) {
+      await appendBrainConversationTurn(memorySessionId, message, earlyPortfolioClarificationReply);
+      await updateBrainEvent(brainEventId, {
+        intent_label: 'general.chat',
+        intent_source: 'fastpath',
+        ...buildFastpathBrainEventFields('general.chat'),
+        final_response_summary: earlyPortfolioClarificationReply,
+        outcome: 'success',
+        total_latency_ms: Date.now() - responseStartedAt,
+      });
+      brainTelemetryFinalized = true;
+      recentBrainEventsBySession.set(memorySessionId, {
+        eventId: brainEventId,
+        assistantAt: Date.now(),
+      });
+      streamStaticSseReply(res, earlyPortfolioClarificationReply, { eventId: brainEventId });
+      return;
+    }
+
+    const externalPersonUnknownReply = buildExternalPersonUnknownReply(capabilityProbe);
+    if (externalPersonUnknownReply) {
+      await appendBrainConversationTurn(memorySessionId, message, externalPersonUnknownReply);
+      await updateBrainEvent(brainEventId, {
+        intent_label: 'general.chat',
+        intent_source: 'fastpath',
+        ...buildFastpathBrainEventFields('general.chat'),
+        final_response_summary: externalPersonUnknownReply,
+        outcome: 'success',
+        total_latency_ms: Date.now() - responseStartedAt,
+      });
+      brainTelemetryFinalized = true;
+      recentBrainEventsBySession.set(memorySessionId, {
+        eventId: brainEventId,
+        assistantAt: Date.now(),
+      });
+      streamStaticSseReply(res, externalPersonUnknownReply, { eventId: brainEventId });
+      return;
+    }
+
+    if (
+      isBridgeWordingFollowup(capabilityProbe) &&
+      isBridgeOverviewReply(getMostRecentAssistantMessage(messages))
+    ) {
+      const responseText = buildBridgeWordingFollowupReply();
+      await appendBrainConversationTurn(memorySessionId, message, responseText);
+      await updateBrainEvent(brainEventId, {
+        intent_label: 'bridge.wording_followup',
+        intent_source: 'fastpath',
+        ...buildFastpathBrainEventFields('bridge.wording_followup'),
+        final_response_summary: responseText,
+        outcome: 'success',
+        total_latency_ms: Date.now() - responseStartedAt,
+      });
+      brainTelemetryFinalized = true;
+      recentBrainEventsBySession.set(memorySessionId, {
+        eventId: brainEventId,
+        assistantAt: Date.now(),
+      });
+      streamStaticSseReply(res, responseText, { eventId: brainEventId });
       return;
     }
 
@@ -7429,8 +10031,20 @@ function createPublicApp(): express.Express {
       const pending = await loadPendingAction(actionSessionId);
       if (pending && isPendingActionFollowup(message)) {
         const responseText = formatPendingActionFollowup(pending);
+        await updateBrainEvent(brainEventId, {
+          intent_label: pending.tool,
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields(pending.tool),
+          final_response_summary: responseText,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
         await appendBrainConversationTurn(memorySessionId, message, responseText);
-        streamStaticSseReply(res, responseText);
+        streamStaticSseReply(res, responseText, { eventId: brainEventId });
         return;
       }
     } catch (error) {
@@ -7458,21 +10072,41 @@ function createPublicApp(): express.Express {
     res.setHeader('X-Accel-Buffering', 'no');
     // @ts-ignore
     res.flushHeaders?.();
+    res.write(`data: ${JSON.stringify({ meta: { eventId: brainEventId } })}\n\n`);
 
     try {
-      const executionTarget =
-        (await resolveBrainExecutionTarget(req.body?.executionTarget, actionSessionId)) || 'EOA';
-      await storeBrainSessionContext(actionSessionId, { executionTarget });
+      if (isAgentflowChatSseDebug()) {
+        logChatSseDebug({ chat_stream_start: true });
+      }
+      const executionTarget = 'DCW' as const;
       const walletCtx = await buildBrainWalletCtx(walletAddress, executionTarget);
       try {
         await extractProfileFact(message, walletAddress);
       } catch (error) {
         console.error('[memory] profile extraction failed:', error);
       }
+
+      const preferenceAck = buildPreferenceMemoryAck(message, walletAddress);
+      if (preferenceAck) {
+        await appendBrainConversationTurn(memorySessionId, message, preferenceAck);
+        res.write(`data: ${JSON.stringify({ delta: preferenceAck })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
       const profile = await loadBrainUserProfile(walletAddress);
       walletCtx.profileContext = shouldAttachBrainProfileContext(message)
         ? buildBrainProfileContext(profile)
         : '';
+      const semanticMemoryContext = shouldAttachBrainSemanticMemoryContext(message)
+        ? await buildBrainSemanticMemoryContext(walletAddress, memorySessionId, message)
+        : '';
+      if (semanticMemoryContext) {
+        walletCtx.profileContext = [walletCtx.profileContext, semanticMemoryContext]
+          .filter(Boolean)
+          .join('\n\n');
+      }
       try {
         const financialContextNote = await buildFinancialContextNote(
           message,
@@ -7487,13 +10121,18 @@ function createPublicApp(): express.Express {
       } catch (error) {
         console.warn('[brain] financial context preload failed:', getErrorMessage(error));
       }
-      const persistedHistory = isCasualSmallTalkTurn(message)
-        ? []
-        : await loadBrainConversationHistory(memorySessionId);
-      const clientHistoryForAnonymousOnly = walletAddress ? [] : messages;
+      const persistedHistory =
+        !hasThreadScopedSession ||
+        (isCasualSmallTalkTurn(message) && !shouldKeepPersistentConversationContext(message))
+          ? []
+          : await loadBrainConversationHistory(memorySessionId);
+      // Always merge the client-sent recent thread into persisted history. For connected
+      // wallet chats, dropping req.body.messages caused referential follow-ups like
+      // "yeah make that" and "set up that payment every month" to lose the immediate
+      // context that the frontend already had.
       const mergedMessages = mergeBrainConversationHistory(
         persistedHistory,
-        clientHistoryForAnonymousOnly,
+        messages,
       );
       const historyForBrain =
         mergedMessages.length > 0 &&
@@ -7501,9 +10140,239 @@ function createPublicApp(): express.Express {
         mergedMessages.at(-1)?.content.trim() === message
           ? mergedMessages.slice(0, -1)
           : mergedMessages;
+      if (
+        shouldGroundPortfolioAdviceContinuation(message, historyForBrain) &&
+        !/\bCurrent wallet context for this request:/i.test(walletCtx.profileContext || '')
+      ) {
+        try {
+          const continuationFinancialContext = await buildFinancialContextNote(
+            'do you think my portfolio is good?',
+            walletCtx,
+            actionSessionId,
+          );
+          if (continuationFinancialContext) {
+            walletCtx.profileContext = [walletCtx.profileContext, continuationFinancialContext]
+              .filter(Boolean)
+              .join('\n\n');
+          }
+        } catch (error) {
+          console.warn(
+            '[brain] portfolio advice continuation context preload failed:',
+            getErrorMessage(error),
+          );
+        }
+      }
+
+      const backendPendingAction = await loadPendingAction(actionSessionId).catch((error) => {
+        console.warn('[chat/respond] backend continuation pending load failed:', getErrorMessage(error));
+        return null;
+      });
+      const routerContinuationState = await loadRouterContinuationState(actionSessionId).catch((error) => {
+        console.warn('[chat/respond] router continuation load failed:', getErrorMessage(error));
+        return null;
+      });
+      let routerOverrideMessage: string | null = null;
+
+      if (isAgentflowChatSessionTraceDebug()) {
+        console.info('[chat-session-trace]', {
+          session_trace_user_message: message.slice(0, 120),
+          memorySessionId: memorySessionId.slice(0, 128),
+          actionSessionId: actionSessionId.slice(0, 128),
+          requestSessionId: requestSessionId.slice(0, 128),
+          session_trace_history_count: {
+            persistedHistory: persistedHistory.length,
+            reqBodyMessages: messages.length,
+            mergedMessages: mergedMessages.length,
+            historyForBrain: historyForBrain.length,
+          },
+          session_trace_last_assistant: lastAssistantContentPreview(mergedMessages),
+        });
+      }
+
+      if (routerContinuationState) {
+        if (/^(?:no|cancel|never mind|nevermind|stop)$/i.test(message.trim())) {
+          await clearRouterContinuationState(actionSessionId);
+          const responseText = 'Okay, cancelled that pending follow-up.';
+          await appendBrainConversationTurn(memorySessionId, message, responseText);
+          res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+
+        routerOverrideMessage = tryBuildRouterContinuationMessage(routerContinuationState, message);
+        if (
+          !routerOverrideMessage &&
+          (isSoftContinuationReply(message) ||
+            /^(?:yes|y|yeah|yep|sure|ok|okay|go ahead)$/i.test(message.trim()) ||
+            message.trim().length <= 3)
+        ) {
+          const responseText = buildRouterContinuationReminder(routerContinuationState);
+          await appendBrainConversationTurn(memorySessionId, message, responseText);
+          res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+      }
+
+      const nameAddressingPreferenceFollowupReply =
+        await buildNameAddressingPreferenceFollowupReply(
+          message,
+          historyForBrain,
+          walletAddress,
+        );
+      if (nameAddressingPreferenceFollowupReply) {
+        await appendBrainConversationTurn(
+          memorySessionId,
+          message,
+          nameAddressingPreferenceFollowupReply,
+        );
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: nameAddressingPreferenceFollowupReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(
+          `data: ${JSON.stringify({ delta: nameAddressingPreferenceFollowupReply })}\n\n`,
+        );
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const backendContinuationReply = buildBackendContinuationReply({
+        message,
+        history: historyForBrain,
+        pending: backendPendingAction,
+      });
+      if (backendContinuationReply) {
+        await appendBrainConversationTurn(memorySessionId, message, backendContinuationReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: backendPendingAction?.tool ?? 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields(backendPendingAction?.tool ?? 'general.chat'),
+          final_response_summary: backendContinuationReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: backendContinuationReply })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const semanticContinuationContext = buildSemanticContinuationContext(message, historyForBrain);
+      if (semanticContinuationContext) {
+        walletCtx.profileContext = [walletCtx.profileContext, semanticContinuationContext]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+
+      const conversationRecallReply = buildConversationRecallReply(message, historyForBrain, profile);
+      if (conversationRecallReply) {
+        await appendBrainConversationTurn(memorySessionId, message, conversationRecallReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: conversationRecallReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: conversationRecallReply })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const referentialWorkflowClarification = buildReferentialWorkflowClarification(
+        message,
+        historyForBrain,
+      );
+      if (referentialWorkflowClarification) {
+        await appendBrainConversationTurn(memorySessionId, message, referentialWorkflowClarification);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: referentialWorkflowClarification,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: referentialWorkflowClarification })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const contextualGreetingReply = buildContextualGreetingReply(message, historyForBrain);
+      if (contextualGreetingReply) {
+        await appendBrainConversationTurn(memorySessionId, message, contextualGreetingReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: contextualGreetingReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: contextualGreetingReply })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
 
       const upperMsg = message.trim().toUpperCase();
       const lowerMsg = message.trim().toLowerCase();
+
+      if (
+        /^(?:YES|YEAH|YEP|OK|OKAY|SURE|SHOW ME|GUIDE ME)$/i.test(message.trim()) &&
+        isVoiceToTextAssistantReply(getMostRecentAssistantMessage(historyForBrain))
+      ) {
+        const responseText = buildVoiceToTextGuideReply();
+        await appendBrainConversationTurn(memorySessionId, message, responseText);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'voice_to_text.guide_followup',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('voice_to_text.guide_followup'),
+          final_response_summary: responseText,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
 
       if (upperMsg === 'YES' || upperMsg === 'CONFIRM') {
         try {
@@ -7997,6 +10866,15 @@ function createPublicApp(): express.Express {
             const txShort = txHash.length > 12 ? `${txHash.slice(0, 10)}...` : txHash;
             const explorerUrl = executeJson.explorerLink || `https://testnet.arcscan.app/tx/${txHash}`;
             const responseText = `Sent payment successfully on Arc.\n\nTx: \`${txShort}\`\n[View on Arc Explorer](${explorerUrl})`;
+            if (brainEventId) {
+              await adminDb
+                .from('brain_events')
+                .update({
+                  layer_used: 'fastpath',
+                  final_intent: 'agentpay_send',
+                })
+                .eq('id', brainEventId);
+            }
             await appendBrainConversationTurn(memorySessionId, message, responseText);
             res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
             res.write('data: [DONE]\n\n');
@@ -8014,6 +10892,29 @@ function createPublicApp(): express.Express {
               walletCtx,
               actionSessionId,
             );
+            const pendingResult = classifyBrainToolResult(result);
+            const pendingProvider =
+              (pending.tool === 'swap_tokens' ||
+                pending.tool === 'vault_action' ||
+                pending.tool === 'predict_action') &&
+              pending.payload &&
+              typeof pending.payload === 'object' &&
+              typeof (pending.payload as { provider?: unknown }).provider === 'string'
+                ? (pending.payload as { provider: string }).provider
+                : null;
+            await appendBrainToolTelemetry(brainEventId, brainToolsTelemetry, {
+              name: pending.tool,
+              provider:
+                pending.tool === 'swap_tokens' ||
+                pending.tool === 'vault_action' ||
+                pending.tool === 'predict_action'
+                  ? pendingProvider
+                  : null,
+              params_summary: summarizeToolParams({ ...pending.args, confirmed: true }),
+              result_summary: summarizeTelemetryValue(result),
+              latency_ms: null,
+              success: pendingResult.success,
+            });
             let resultForUser = result;
             if (requestedPortfolioA2a && walletCtx.walletAddress && typeof result === 'string') {
               resultForUser = await appendRequestedPortfolioA2aReport({
@@ -8038,21 +10939,73 @@ function createPublicApp(): express.Express {
               meta.paymentMeta = paymentMeta;
             }
             await appendBrainConversationTurn(memorySessionId, message, resultForUser);
+            await updateBrainEvent(brainEventId, {
+              intent_label: pending.tool,
+              intent_source: 'fastpath',
+              ...buildFastpathBrainEventFields(pending.tool),
+              final_response_summary: resultForUser,
+              outcome: pendingResult.outcome,
+              failure_reason: pendingResult.failureReason,
+              total_latency_ms: Date.now() - responseStartedAt,
+            });
+            brainTelemetryFinalized = true;
             res.write(`data: ${JSON.stringify({ meta })}\n\n`);
             res.write(`data: ${JSON.stringify({ delta: resultForUser })}\n\n`);
             res.write('data: [DONE]\n\n');
             res.end();
             return;
           } else {
-            const responseText =
-              'Nothing to confirm. Ask me to simulate a swap, vault deposit, bridge, or AgentPay send first.';
-            await appendBrainConversationTurn(memorySessionId, message, responseText);
-            res.write(
-              `data: ${JSON.stringify({ delta: responseText })}\n\n`,
-            );
-            res.write('data: [DONE]\n\n');
-            res.end();
-            return;
+            if (isAgentflowChatSessionTraceDebug()) {
+              console.info('[chat-session-trace]', {
+                research_confirm_yes_received: true,
+                memorySessionId: memorySessionId.slice(0, 128),
+                actionSessionId: actionSessionId.slice(0, 128),
+              });
+            }
+
+            const deferredResearchTask =
+              (await takeDeferredResearchConfirmTaskRedisDual(memorySessionId, actionSessionId)) ??
+              resolveDeferredResearchTaskFromBrainHistory(historyForBrain);
+
+            if (isAgentflowChatSessionTraceDebug()) {
+              if (deferredResearchTask) {
+                console.info('[chat-session-trace]', {
+                  research_confirm_history_found: true,
+                  deferredTaskLen: deferredResearchTask.length,
+                });
+              } else {
+                const tail = historyForBrain[historyForBrain.length - 1];
+                let research_confirm_miss_reason = 'assistant_tail_not_research_offer';
+                if (!walletCtx.walletAddress) research_confirm_miss_reason = 'no_wallet';
+                else if (!historyForBrain.length) research_confirm_miss_reason = 'empty_history';
+                else if (tail?.role === 'assistant' && looksLikeAssistantResearchConfirmationOffer(tail.content)) {
+                  research_confirm_miss_reason = 'offer_regex_but_no_matching_user_topic';
+                }
+                console.info('[chat-session-trace]', { research_confirm_miss_reason });
+              }
+            }
+
+            if (deferredResearchTask && walletCtx.walletAddress) {
+              await executeBrainResearchPipelineForChat({
+                res,
+                memorySessionId,
+                persistUserTurn: message,
+                researchTask: deferredResearchTask,
+                walletAddress: walletCtx.walletAddress,
+                brainEventId,
+                redisActionScopeKey: memorySessionId,
+              });
+              return;
+            }
+
+            if (isAgentflowChatSessionTraceDebug()) {
+              console.info('[chat-session-trace]', {
+                yes_confirm_no_pending_fallthrough: true,
+                memorySessionId: memorySessionId.slice(0, 128),
+                actionSessionId: actionSessionId.slice(0, 128),
+              });
+            }
+            // No invoice/contact/batch/split/agentpay/tool pending nor deferred research topic — fall through to Hermes.
           }
         } catch (error) {
           console.warn('[chat/respond] pending confirm failed:', getErrorMessage(error));
@@ -8079,14 +11032,23 @@ function createPublicApp(): express.Express {
             .del(`contact:update:${canonicalRedisSessionId(actionSessionId)}`)
             .catch(() => null);
 
+          await getRedis()
+            .del(`${RESEARCH_CONFIRM_REDIS_PREFIX}${memorySessionId}`)
+            .catch(() => null);
+
+          await getRedis()
+            .del(`${RESEARCH_CONFIRM_REDIS_PREFIX}${actionSessionId}`)
+            .catch(() => null);
+          await clearRouterContinuationState(actionSessionId);
+
           if (agentPayPendingExists) {
             responseText = "Okay, I didn't send the payment.";
           } else if (toolPending?.tool === 'swap_tokens') {
             responseText = "Okay, I didn't execute the swap.";
           } else if (toolPending?.tool === 'vault_action') {
             responseText = "Okay, I didn't execute the vault action.";
-          } else if (toolPending?.tool === 'bridge_usdc') {
-            responseText = "Okay, I didn't execute the bridge.";
+          } else if (toolPending?.tool === 'predict_action') {
+            responseText = "Okay, I didn't execute the prediction market action.";
           }
         } catch (error) {
           console.warn('[chat/respond] pending cancel failed:', getErrorMessage(error));
@@ -8100,7 +11062,819 @@ function createPublicApp(): express.Express {
         return;
       }
 
-      if (shouldHandleAsContactView(message) && walletCtx.walletAddress) {
+      let routerValidationResult: ValidationResult | null = null;
+
+      const hasStrictRouterApproval = (validation: ValidationResult | null): boolean => {
+        if (!validation) {
+          return false;
+        }
+        const threshold = getFastpathExecutionConfidenceThreshold(validation.intent.intent);
+        return (
+          validation.severity === 'pass' &&
+          validation.intent.confidence >= threshold &&
+          STRICT_ROUTER_APPROVAL_INTENTS.has(validation.intent.intent)
+        );
+      };
+
+      const canUseFastPathForIntents = (...expectedIntents: AgentFlowIntentName[]): boolean => {
+        if (!routerValidationResult) {
+          return false;
+        }
+        return (
+          hasStrictRouterApproval(routerValidationResult) &&
+          expectedIntents.includes(routerValidationResult.intent.intent)
+        );
+      };
+
+      async function tryHandleIntentRouterLayer(): Promise<boolean> {
+        if (!INTENT_ROUTER_ENABLED) {
+          return false;
+        }
+
+        const tier2StartedAt = Date.now();
+        try {
+          const routingMessage = routerOverrideMessage ?? message;
+    const classifiedByRouter =
+      quickActionIntent ??
+      await classifyIntent(
+        routingMessage,
+        buildClassifierHistory(historyForBrain),
+      );
+    const fastpathFallback =
+      classifiedByRouter.intent === AgentFlowIntentName.GeneralChat
+        ? buildAgentPayHistoryFastpathIntent(routingMessage)
+        : null;
+    const classified = fastpathFallback ?? classifiedByRouter;
+          const validation = validateIntent(classified);
+          routerValidationResult = validation;
+
+          if (validation.severity === 'hard' && validation.clarification) {
+            const vaultSelectionReply =
+              validation.intent.intent === AgentFlowIntentName.VaultDeposit
+                ? parseDirectAgentFlowRoute(message, messages)
+                : null;
+            if (
+              vaultSelectionReply?.type === 'reply' &&
+              vaultSelectionReply.quickActionGroups?.length
+            ) {
+              const responseText = vaultSelectionReply.text;
+              await updateBrainEvent(brainEventId, {
+                intent_label: validation.intent.intent,
+                intent_source: 'fastpath',
+                ...buildFastpathBrainEventFields('product_reply'),
+                final_response_summary: responseText,
+                outcome: 'success',
+                total_latency_ms: Date.now() - responseStartedAt,
+              });
+              await appendBrainConversationTurn(memorySessionId, message, responseText);
+              res.write(
+                `data: ${JSON.stringify({
+                  meta: { quickActionGroups: vaultSelectionReply.quickActionGroups },
+                })}\n\n`,
+              );
+              res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+              res.write('data: [DONE]\n\n');
+              res.end();
+              return true;
+            }
+            if (isRouterContinuationIntent(validation.intent.intent)) {
+              await storeRouterContinuationState(actionSessionId, {
+                intent: validation.intent.intent,
+                rawMessage: routingMessage,
+                slots:
+                  validation.intent.slots && typeof validation.intent.slots === 'object'
+                    ? (validation.intent.slots as Record<string, unknown>)
+                    : {},
+                slotsMissing: validation.slots_missing ?? [],
+                clarification: validation.clarification,
+                createdAt: new Date().toISOString(),
+              });
+            }
+            const responseText = validation.clarification;
+            await updateBrainEvent(brainEventId, {
+              intent_label: validation.intent.intent,
+              ...buildIntentRouterBrainEventFields(validation.intent, validation.ok),
+              final_response_summary: responseText,
+              outcome: 'validation_error',
+              total_latency_ms: Date.now() - responseStartedAt,
+            });
+            console.info('[INTENT_DISPATCH]', {
+              raw_message: truncateIntentDispatchMessage(message),
+              layer_used: 'intent_router',
+              intent: validation.intent.intent,
+              validator_severity: validation.severity,
+              tool_called: null,
+              confidence: validation.intent.confidence,
+              latency_ms: Date.now() - tier2StartedAt,
+            });
+            await appendBrainConversationTurn(memorySessionId, message, responseText);
+            res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+            return true;
+          }
+
+          const shouldDispatchFromRouter =
+            validation.intent.intent !== AgentFlowIntentName.GeneralChat &&
+            (hasStrictRouterApproval(validation) ||
+              (
+                validation.intent.intent === AgentFlowIntentName.AgentpayPaymentLink &&
+                validation.severity === 'soft'
+              ) || (
+              !STRICT_ROUTER_APPROVAL_INTENTS.has(validation.intent.intent) &&
+              validation.intent.confidence >= 0.7
+            ));
+
+          if (shouldDispatchFromRouter) {
+            await clearRouterContinuationState(actionSessionId);
+            const routed = await dispatchIntent({
+              intent: validation.intent,
+              walletCtx,
+              sessionId: actionSessionId,
+              deps: {
+                executeTool: async (toolName, args, toolWalletCtx, sessionId) => {
+                  if (toolName === 'get_portfolio' && toolWalletCtx.walletAddress?.trim()) {
+                    return executePortfolioAgentForChat({
+                      userWalletAddress: toolWalletCtx.walletAddress,
+                      sessionId,
+                      fallback: () =>
+                        executeTool(toolName, args, toolWalletCtx, sessionId, {
+                          rawUserMessage: message,
+                        }),
+                    });
+                  }
+                  return executeTool(toolName, args, toolWalletCtx, sessionId, {
+                    rawUserMessage: message,
+                  });
+                },
+                runResearchReport: async (researchTask, options) => {
+                  const portfolioImpact = options?.portfolioImpact === true;
+                  const predmarketResearchContext = extractPredmarketResearchContext(researchTask);
+                  await executeBrainResearchPipelineForChat({
+                    res,
+                    memorySessionId,
+                    persistUserTurn: message,
+                    researchTask,
+                    reasoningMode: options?.reasoningMode,
+                    portfolioImpact,
+                    walletAddress: walletCtx.walletAddress,
+                    brainEventId,
+                    redisActionScopeKey: memorySessionId,
+                    predmarketResearchContext,
+                  });
+                  return {
+                    handled: true,
+                    responseText: '',
+                    toolCalled: null,
+                    responseAlreadyStreamed: true,
+                  };
+                },
+                runSchedule: async (intentValue, walletAddress) => {
+                  const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
+                  const scheduleSlots = (intentValue.slots ?? {}) as Record<string, any>;
+                  const recipientHandle =
+                    typeof scheduleSlots.recipient?.handle === 'string' && scheduleSlots.recipient.handle.trim()
+                      ? scheduleSlots.recipient.handle.trim()
+                      : typeof scheduleSlots.recipient?.address === 'string' && scheduleSlots.recipient.address.trim()
+                        ? scheduleSlots.recipient.address.trim()
+                        : '';
+                  const amountValue =
+                    typeof scheduleSlots.amount?.value === 'number'
+                      ? String(scheduleSlots.amount.value)
+                      : typeof scheduleSlots.amount?.value === 'string' && scheduleSlots.amount.value.trim()
+                        ? scheduleSlots.amount.value.trim()
+                        : '';
+                  const amountCurrency =
+                    typeof scheduleSlots.amount?.currency === 'string' && scheduleSlots.amount.currency.trim()
+                      ? scheduleSlots.amount.currency.trim()
+                      : 'USDC';
+                  const cadence =
+                    typeof scheduleSlots.schedule?.cadence === 'string' && scheduleSlots.schedule.cadence.trim()
+                      ? scheduleSlots.schedule.cadence.trim()
+                      : '';
+                  const remark =
+                    typeof scheduleSlots.remark === 'string' && scheduleSlots.remark.trim()
+                      ? scheduleSlots.remark.trim()
+                      : '';
+                  const synthesizedTask =
+                    recipientHandle && amountValue && cadence
+                      ? [
+                          'pay',
+                          amountValue,
+                          amountCurrency,
+                          'to',
+                          recipientHandle,
+                          cadence,
+                          ...(remark ? ['for', remark] : []),
+                        ].join(' ')
+                      : intentValue.raw_message;
+                  const scheduleAgentRes = await fetch(`${SCHEDULE_AGENT_BASE_URL}/run`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      ...(internalKey ? { 'X-Agentflow-Brain-Internal': internalKey } : {}),
+                    },
+                    body: JSON.stringify({ task: synthesizedTask, walletAddress }),
+                  });
+                  const scheduleData = await scheduleAgentRes.json().catch(() => ({
+                    action: 'error',
+                    message: 'Schedule agent error',
+                  })) as {
+                    message?: string;
+                    confirmId?: string;
+                    confirmLabel?: string;
+                    choices?: Array<{ id: string; label: string; confirmId: string }>;
+                  };
+                  return {
+                    handled: true,
+                    responseText:
+                      typeof scheduleData.message === 'string' ? scheduleData.message : 'Schedule agent error',
+                    toolCalled: null,
+                    meta:
+                      scheduleData.confirmId || scheduleData.choices?.length
+                        ? {
+                            confirmation: {
+                              required: true,
+                              action: 'schedule',
+                              confirmId: scheduleData.confirmId,
+                              confirmLabel: scheduleData.confirmLabel || 'Confirm',
+                              choices: scheduleData.choices,
+                            },
+                          }
+                        : undefined,
+                  };
+                },
+                listContacts: async (walletAddress) => {
+                  const w = getAddress(walletAddress);
+                  const { data: contacts, error } = await adminDb
+                    .from('contacts')
+                    .select('*')
+                    .eq('wallet_address', w)
+                    .order('name', { ascending: true });
+                  if (error) {
+                    return {
+                      handled: true,
+                      responseText: `Could not load contacts: ${error.message}`,
+                      toolCalled: null,
+                    };
+                  }
+                  const rows = Array.isArray(contacts) ? contacts : [];
+                  const responseText = rows.length
+                    ? `Saved contacts:\n\n${rows
+                        .map((contact) => `- ${String(contact.name)} -> ${String(contact.address)}`)
+                        .join('\n')}`
+                    : 'No saved contacts yet.';
+                  return { handled: true, responseText, toolCalled: null };
+                },
+                createContact: async (walletAddress, name, recipient) => {
+                  const addressText =
+                    typeof recipient.handle === 'string' && recipient.handle.trim()
+                      ? recipient.handle.trim()
+                      : typeof recipient.address === 'string'
+                        ? recipient.address.trim()
+                        : '';
+                  if (!name || !addressText) {
+                    return {
+                      handled: true,
+                      responseText: 'Tell me the contact name and address or .arc handle to save.',
+                      toolCalled: null,
+                    };
+                  }
+                  const w = getAddress(walletAddress);
+                  const resolved = getAddress(await resolvePayee(addressText, w));
+                  const { error } = await adminDb.from('contacts').insert({
+                    wallet_address: w,
+                    name,
+                    address: resolved,
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                  });
+                  if (error) {
+                    return {
+                      handled: true,
+                      responseText: `Failed to save contact: ${error.message}`,
+                      toolCalled: null,
+                    };
+                  }
+                  return {
+                    handled: true,
+                    responseText: `Saved contact "${name}" -> ${resolved}.`,
+                    toolCalled: null,
+                  };
+                },
+                updateContact: async (walletAddress, name, recipient) => {
+                  const addressText =
+                    typeof recipient.handle === 'string' && recipient.handle.trim()
+                      ? recipient.handle.trim()
+                      : typeof recipient.address === 'string'
+                        ? recipient.address.trim()
+                        : '';
+                  if (!name || !addressText) {
+                    return {
+                      handled: true,
+                      responseText: 'Tell me which contact to update and the new address or .arc handle.',
+                      toolCalled: null,
+                    };
+                  }
+                  const w = getAddress(walletAddress);
+                  const { data: existing } = await adminDb
+                    .from('contacts')
+                    .select('address')
+                    .eq('wallet_address', w)
+                    .ilike('name', name)
+                    .maybeSingle();
+                  if (!existing?.address) {
+                    return {
+                      handled: true,
+                      responseText: `Contact "${name}" not found.`,
+                      toolCalled: null,
+                    };
+                  }
+                  await getRedis().set(
+                    `contact:update:${canonicalRedisSessionId(actionSessionId)}`,
+                    JSON.stringify({
+                      name,
+                      newAddress: addressText,
+                      oldAddress: String(existing.address),
+                    }),
+                    'EX',
+                    300,
+                  );
+                  return {
+                    handled: true,
+                    responseText: [
+                      `Update contact "${name}"?`,
+                      '',
+                      `From: ${String(existing.address)}`,
+                      `To: ${addressText}`,
+                      '',
+                      'Reply YES to confirm.',
+                    ].join('\n'),
+                    toolCalled: null,
+                  };
+                },
+                deleteContact: async (walletAddress, name) => {
+                  const w = getAddress(walletAddress);
+                  const { data: deletedRows, error } = await adminDb
+                    .from('contacts')
+                    .delete()
+                    .eq('wallet_address', w)
+                    .ilike('name', name)
+                    .select('id');
+                  if (error) {
+                    return {
+                      handled: true,
+                      responseText: `Failed to remove contact: ${error.message}`,
+                      toolCalled: null,
+                    };
+                  }
+                  if (!deletedRows?.length) {
+                    return {
+                      handled: true,
+                      responseText: `No contact named "${name}" found.`,
+                      toolCalled: null,
+                    };
+                  }
+                  return {
+                    handled: true,
+                    responseText: `Contact "${name}" removed.`,
+                    toolCalled: null,
+                  };
+                },
+                getAgentPayHistory: async (walletAddress) => {
+                  const rows = await fetchPayHistoryForBrain(walletAddress, 10);
+                  return {
+                    handled: true,
+                    responseText: formatAgentPayHistoryForChat(rows as Array<Record<string, any>>, {
+                      requestedLimit: 10,
+                      allRequested: isAllAgentPayHistoryRequest(validation.intent.raw_message),
+                      browserTimeZone,
+                      browserLocale,
+                    }),
+                    toolCalled: null,
+                  };
+                },
+                buildPaymentLink: async (recipient, amount, remark) => {
+                  let rawHandle =
+                    typeof recipient.handle === 'string' && recipient.handle.trim()
+                      ? recipient.handle.trim()
+                      : typeof recipient.address === 'string'
+                        ? recipient.address.trim()
+                        : '';
+                  if (recipient.registeredNameOwner && typeof recipient.address === 'string') {
+                    rawHandle = await getPreferredAgentpayPaymentLinkHandle(
+                      recipient.address,
+                      recipient.registeredNameOwner,
+                    );
+                  }
+                  if (!rawHandle) {
+                    return {
+                      handled: true,
+                      responseText: [
+                        'I can build a payment link, but I need a recipient.',
+                        '',
+                        'Try: "payment link for jack.arc 5 USDC for coffee"',
+                      ].join('\n'),
+                      toolCalled: null,
+                    };
+                  }
+                  const handle =
+                    rawHandle.endsWith('.arc') || rawHandle.startsWith('0x')
+                      ? rawHandle
+                      : `${rawHandle}.arc`;
+                  const params = new URLSearchParams();
+                  if (amount != null) params.set('amount', String(amount));
+                  if (typeof remark === 'string' && remark.trim()) {
+                    params.set('remark', remark.trim());
+                  }
+                  const query = params.toString();
+                  const path = `/pay/${encodeURIComponent(handle)}${query ? `?${query}` : ''}`;
+                  const displayHandle = handle.startsWith('0x')
+                    ? `${handle.slice(0, 6)}...${handle.slice(-4)}`
+                    : handle;
+                  const responseLines = [`Here's your payment link for **${displayHandle}**.`];
+                  if (amount != null) responseLines.push(`Pre-filled amount: **${amount} USDC**.`);
+                  if (typeof remark === 'string' && remark.trim()) {
+                    responseLines.push(`Remark: _${remark.trim()}_.`);
+                  }
+                  responseLines.push('');
+                  responseLines.push(
+                    'Anyone can open it - AgentFlow users pay automatically from their DCW, others can connect any wallet on Arc Testnet.',
+                  );
+                  return {
+                    handled: true,
+                    responseText: responseLines.join('\n'),
+                    toolCalled: null,
+                    meta: {
+                      paymentLink: {
+                        handle,
+                        displayHandle,
+                        amount: amount != null ? String(amount) : null,
+                        remark: typeof remark === 'string' && remark.trim() ? remark.trim() : null,
+                        path,
+                      },
+                    },
+                  };
+                },
+                runBatch: async (intentValue: AgentFlowIntent, walletAddress, sessionId) => {
+                  const parsedBatch = parseBatchMessage(intentValue.raw_message);
+                  if ('error' in parsedBatch) {
+                    return {
+                      handled: true,
+                      responseText:
+                        `I see you want to run a batch payment, but I could not parse the recipients.\n` +
+                        formatBatchParseError(parsedBatch.error),
+                      toolCalled: null,
+                    };
+                  }
+                  const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
+                  const batchAgentRes = await fetch(`${BATCH_AGENT_BASE_URL}/run`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      ...(internalKey ? { 'X-Agentflow-Brain-Internal': internalKey } : {}),
+                    },
+                    body: JSON.stringify({
+                      sessionId,
+                      walletAddress,
+                      payments: parsedBatch,
+                    }),
+                  });
+                  const batchData = (await batchAgentRes.json().catch(() => ({
+                    action: 'error',
+                    message: 'Batch agent error',
+                  }))) as { message?: string; confirmId?: string; confirmLabel?: string; action?: string };
+                  return {
+                    handled: true,
+                    responseText: typeof batchData.message === 'string' ? batchData.message : 'Batch agent error',
+                    toolCalled: null,
+                    meta:
+                      batchData.action === 'preview' && batchData.confirmId
+                        ? {
+                            confirmation: {
+                              required: true,
+                              action: 'batch',
+                              confirmId: batchData.confirmId,
+                              confirmLabel: batchData.confirmLabel || 'Send batch',
+                            },
+                          }
+                        : undefined,
+                  };
+                },
+                runSplit: async (intentValue: AgentFlowIntent, walletAddress, sessionId) => {
+                  const parsed = parseSplitRequest(intentValue.raw_message);
+                  if (!parsed) {
+                    return {
+                      handled: true,
+                      responseText:
+                        'I see you want to split a payment, but I could not extract the amount and recipients. Try: "split 30 USDC between alice.arc, bob.arc and charlie.arc".',
+                      toolCalled: null,
+                    };
+                  }
+                  const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
+                  const splitAgentRes = await fetch(`${SPLIT_AGENT_BASE_URL}/run`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      ...(internalKey ? { 'X-Agentflow-Brain-Internal': internalKey } : {}),
+                    },
+                    body: JSON.stringify({
+                      sessionId,
+                      walletAddress,
+                      recipients: parsed.recipients,
+                      totalAmount: parsed.totalAmount,
+                      remark: parsed.remark || '',
+                    }),
+                  });
+                  const splitData = (await splitAgentRes.json().catch(() => ({
+                    action: 'error',
+                    message: 'Split agent error',
+                  }))) as { message?: string; confirmId?: string; confirmLabel?: string; action?: string };
+                  return {
+                    handled: true,
+                    responseText: typeof splitData.message === 'string' ? splitData.message : 'Split agent error',
+                    toolCalled: null,
+                    meta:
+                      splitData.action === 'preview' && splitData.confirmId
+                        ? {
+                            confirmation: {
+                              required: true,
+                              action: 'split',
+                              confirmId: splitData.confirmId,
+                              confirmLabel: splitData.confirmLabel || 'Confirm split',
+                            },
+                          }
+                        : undefined,
+                  };
+                },
+                createInvoice: async (intentValue: AgentFlowIntent, walletAddress, sessionId) => {
+                  const parsed = parseInvoiceRequest(intentValue.raw_message);
+                  if (!parsed) {
+                    return {
+                      handled: true,
+                      responseText: [
+                        'Could not parse invoice details.',
+                        '',
+                        'Try: "create invoice for alice.arc 50 USDC for website work"',
+                      ].join('\n'),
+                      toolCalled: null,
+                    };
+                  }
+                  const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+                  const pendingPayload = {
+                    tool: 'create_invoice',
+                    walletAddress,
+                    vendorHandle: parsed.vendorHandle,
+                    amount: parsed.amount,
+                    description: parsed.description,
+                    invoiceNumber,
+                    createdAt: new Date().toISOString(),
+                  };
+                  await getRedis().set(`invoice:pending:${sessionId}`, JSON.stringify(pendingPayload), 'EX', 900);
+                  return {
+                    handled: true,
+                    responseText: [
+                      `Create invoice ${invoiceNumber}?`,
+                      '',
+                      `To: ${parsed.vendorHandle}`,
+                      `Amount: ${parsed.amount} USDC`,
+                      `For: ${parsed.description}`,
+                      '',
+                      'Reply YES to confirm.',
+                    ].join('\n'),
+                    toolCalled: null,
+                    meta: {
+                      confirmation: {
+                        required: true,
+                        action: 'invoice',
+                        confirmId: `invoice-${sessionId}`,
+                        confirmLabel: `Create Invoice - ${parsed.amount} USDC`,
+                      },
+                    },
+                  };
+                },
+                getInvoiceStatus: async (walletAddress) => {
+                  const authHeader =
+                    typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+                  const url = new URL('http://127.0.0.1:4000/api/invoice/status');
+                  url.searchParams.set('walletAddress', walletAddress);
+                  const response = await fetch(url.toString(), {
+                    headers: authHeader ? { Authorization: authHeader } : {},
+                  });
+                  const data = (await response.json().catch(() => ({}))) as {
+                    invoices?: Array<Record<string, unknown>>;
+                    error?: string;
+                  };
+                  if (!response.ok) {
+                    return {
+                      handled: true,
+                      responseText: `Failed to fetch invoices: ${data.error || `HTTP ${response.status}`}`,
+                      toolCalled: null,
+                    };
+                  }
+                  const invoices = Array.isArray(data.invoices) ? data.invoices : [];
+                  if (!invoices.length) {
+                    return {
+                      handled: true,
+                      responseText: 'No invoices found.',
+                      toolCalled: null,
+                    };
+                  }
+                  const lines = ['Invoices:', ''];
+                  for (const invoice of invoices.slice(0, 10)) {
+                    lines.push(
+                      `- ${String(invoice.invoice_number || invoice.id || 'invoice')} | ${String(invoice.status || 'unknown')} | ${String(invoice.amount || '?')} USDC`,
+                    );
+                  }
+                  return { handled: true, responseText: lines.join('\n'), toolCalled: null };
+                },
+              },
+            });
+
+            if (routed.handled) {
+              if (routed.toolCalled === 'get_portfolio') {
+                const routedMeta = buildBrainMetaFromToolResults([
+                  { name: 'agentflow_portfolio', result: routed.responseText },
+                ]);
+                const paymentMeta = takeRecentExecutionMeta(actionSessionId);
+                if (paymentMeta) {
+                  routedMeta.paymentMeta = paymentMeta;
+                }
+                routed.meta = {
+                  ...(routed.meta ?? {}),
+                  ...routedMeta,
+                } as typeof routed.meta;
+              }
+              if (routed.toolCalled === 'predict_action') {
+                const routedMeta = routed.meta ?? {};
+                if (validation.intent.intent === AgentFlowIntentName.PredmarketList) {
+                  routedMeta.quickActionGroups = buildPredmarketListQuickActionGroups(
+                    routed.responseText,
+                  );
+                } else if (validation.intent.intent === AgentFlowIntentName.PredmarketDetail) {
+                  const marketAddress =
+                    typeof validation.intent.slots?.market?.address === 'string' &&
+                    isAddress(validation.intent.slots.market.address)
+                      ? (getAddress(validation.intent.slots.market.address) as `0x${string}`)
+                      : null;
+                  if (marketAddress) {
+                    routedMeta.quickActionGroups = buildPredmarketDetailQuickActionGroups(
+                      routed.responseText,
+                      marketAddress,
+                    );
+                  }
+                } else if (validation.intent.intent === AgentFlowIntentName.PredmarketPosition) {
+                  routedMeta.quickActionGroups = buildPredmarketPositionQuickActionGroups(
+                    routed.responseText,
+                  );
+                }
+                routed.meta = routedMeta;
+              } else if (routed.toolCalled === 'bridge_precheck') {
+                const routedMeta = routed.meta ?? {};
+                routedMeta.quickActionGroups = buildBridgeChoiceQuickActionGroups();
+                routed.meta = routedMeta;
+              } else if (
+                routed.toolCalled === 'vault_action' &&
+                validation.intent.intent === AgentFlowIntentName.VaultList
+              ) {
+                const routedMeta = routed.meta ?? {};
+                routedMeta.quickActionGroups = buildVaultListQuickActionGroups();
+                routed.meta = routedMeta;
+              }
+              if (routed.responseAlreadyStreamed) {
+                await updateBrainEvent(brainEventId, {
+                  intent_label: validation.intent.intent,
+                  ...buildIntentRouterBrainEventFields(validation.intent, validation.ok),
+                });
+              } else {
+                const routedResult = classifyBrainToolResult(routed.responseText);
+                await updateBrainEvent(brainEventId, {
+                  intent_label: validation.intent.intent,
+                  ...buildIntentRouterBrainEventFields(validation.intent, validation.ok),
+                  final_response_summary: routed.responseText,
+                  outcome: routedResult.outcome,
+                  failure_reason: routedResult.failureReason,
+                  total_latency_ms: Date.now() - responseStartedAt,
+                });
+              }
+              console.info('[INTENT_DISPATCH]', {
+                raw_message: truncateIntentDispatchMessage(message),
+                layer_used: 'intent_router',
+                intent: validation.intent.intent,
+                validator_severity: validation.severity,
+                tool_called: routed.toolCalled,
+                confidence: validation.intent.confidence,
+                latency_ms: Date.now() - tier2StartedAt,
+              });
+              if (routed.responseAlreadyStreamed) {
+                return true;
+              }
+              await appendBrainConversationTurn(memorySessionId, message, routed.responseText);
+              if (routed.meta) {
+                res.write(`data: ${JSON.stringify({ meta: routed.meta })}\n\n`);
+              }
+              res.write(`data: ${JSON.stringify({ delta: routed.responseText })}\n\n`);
+              res.write('data: [DONE]\n\n');
+              res.end();
+              return true;
+            }
+          }
+
+          const postRouterDirectRoute = parseDirectAgentFlowRoute(message, messages);
+          if (postRouterDirectRoute?.type === 'reply') {
+            const responseText = postRouterDirectRoute.text;
+            await appendBrainConversationTurn(memorySessionId, message, responseText);
+            await updateBrainEvent(brainEventId, {
+              intent_label: validation.intent.intent,
+              intent_source: 'fastpath',
+              ...buildFastpathBrainEventFields('product_reply'),
+              final_response_summary: responseText,
+              outcome: 'success',
+              total_latency_ms: Date.now() - responseStartedAt,
+            });
+            brainTelemetryFinalized = true;
+            recentBrainEventsBySession.set(memorySessionId, {
+              eventId: brainEventId,
+              assistantAt: Date.now(),
+            });
+            if (postRouterDirectRoute.quickActionGroups) {
+              res.write(
+                `data: ${JSON.stringify({
+                  meta: { quickActionGroups: postRouterDirectRoute.quickActionGroups },
+                })}\n\n`,
+              );
+            }
+            res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+            return true;
+          }
+
+          const productReply =
+            reserveForReportContext || !shouldOfferPostRouterProductFallback(validation.intent)
+              ? null
+              : await buildAgentFlowProductReply(capabilityProbe, capabilityThreadCtx);
+          if (productReply) {
+            await appendBrainConversationTurn(memorySessionId, message, productReply);
+            await updateBrainEvent(brainEventId, {
+              intent_label: 'product_reply',
+              intent_source: 'fastpath',
+              ...buildFastpathBrainEventFields('product_reply'),
+              final_response_summary: productReply,
+              outcome: 'success',
+              total_latency_ms: Date.now() - responseStartedAt,
+            });
+            brainTelemetryFinalized = true;
+            recentBrainEventsBySession.set(memorySessionId, {
+              eventId: brainEventId,
+              assistantAt: Date.now(),
+            });
+            streamStaticSseReply(res, productReply);
+            return true;
+          }
+
+          console.info('[INTENT_DISPATCH]', {
+            raw_message: truncateIntentDispatchMessage(message),
+            layer_used: 'hermes',
+            intent: validation.intent.intent,
+            validator_severity: validation.severity,
+            tool_called: null,
+            confidence: validation.intent.confidence,
+            latency_ms: Date.now() - tier2StartedAt,
+          });
+          return false;
+        } catch (error) {
+          if (
+            error instanceof IntentRouterTimeoutError ||
+            error instanceof IntentRouterRequestError ||
+            error instanceof IntentRouterParseError ||
+            error instanceof IntentRouterSchemaError
+          ) {
+            console.warn('[INTENT_DISPATCH]', {
+              raw_message: truncateIntentDispatchMessage(message),
+              layer_used: 'hermes',
+              intent: null,
+              validator_severity: null,
+              tool_called: null,
+              confidence: null,
+              latency_ms: Date.now() - tier2StartedAt,
+              error: error.name,
+            });
+            return false;
+          }
+          throw error;
+        }
+      }
+
+      if (await tryHandleIntentRouterLayer()) {
+        return;
+      }
+
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.ContactsList) &&
+        shouldHandleAsContactView(message) &&
+        walletCtx.walletAddress
+      ) {
         try {
           const w = getAddress(walletCtx.walletAddress);
           const { data: contacts, error } = await adminDb
@@ -8111,6 +11885,16 @@ function createPublicApp(): express.Express {
           if (error) {
             const responseText = `Could not load contacts: ${error.message}`;
             await appendBrainConversationTurn(memorySessionId, message, responseText);
+            await updateBrainEvent(brainEventId, {
+              intent_label: 'deterministic_contact_handler',
+              intent_source: 'fastpath',
+              ...buildFastpathBrainEventFields('deterministic_contact_handler'),
+              final_response_summary: responseText,
+              outcome: 'tool_error',
+              failure_reason: responseText,
+              total_latency_ms: Date.now() - responseStartedAt,
+            });
+            brainTelemetryFinalized = true;
             res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
             res.write('data: [DONE]\n\n');
             res.end();
@@ -8140,6 +11924,16 @@ function createPublicApp(): express.Express {
             }
             responseText = lines.join('\n');
           }
+          await updateBrainEvent(brainEventId, {
+            intent_label: 'deterministic_contact_handler',
+            intent_source: 'fastpath',
+            ...buildFastpathBrainEventFields('deterministic_contact_handler'),
+            final_response_summary: responseText,
+            outcome: 'success',
+            failure_reason: null,
+            total_latency_ms: Date.now() - responseStartedAt,
+          });
+          brainTelemetryFinalized = true;
           await appendBrainConversationTurn(memorySessionId, message, responseText);
           res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
           res.write('data: [DONE]\n\n');
@@ -8156,7 +11950,11 @@ function createPublicApp(): express.Express {
         }
       }
 
-      if (shouldHandleAsContactSave(message) && walletCtx.walletAddress) {
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.ContactsCreate) &&
+        shouldHandleAsContactSave(message) &&
+        walletCtx.walletAddress
+      ) {
         const patterns: RegExp[] = [
           /save\s+(\w+)\s+as\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i,
           /add\s+contact\s+(\w+)\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i,
@@ -8171,6 +11969,28 @@ function createPublicApp(): express.Express {
             contactAddress = match[2].trim();
             break;
           }
+        }
+        if (!contactName) {
+          const nameOnlyMatch = message.match(/^save\s+(\w+)$/i);
+          if (nameOnlyMatch) {
+            contactName = nameOnlyMatch[1].toLowerCase();
+          }
+        }
+        if (contactName && !contactAddress) {
+          const responseText = `What handle or wallet address should I save for ${contactName}?`;
+          await storeRouterContinuationState(actionSessionId, {
+            intent: AgentFlowIntentName.ContactsCreate,
+            rawMessage: message,
+            slots: { name: contactName },
+            slotsMissing: ['recipient'],
+            clarification: responseText,
+            createdAt: new Date().toISOString(),
+          });
+          await appendBrainConversationTurn(memorySessionId, message, responseText);
+          res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
         }
         if (contactName && contactAddress) {
           try {
@@ -8231,7 +12051,11 @@ function createPublicApp(): express.Express {
         }
       }
 
-      if (shouldHandleAsContactUpdate(message) && walletCtx.walletAddress) {
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.ContactsUpdate) &&
+        shouldHandleAsContactUpdate(message) &&
+        walletCtx.walletAddress
+      ) {
         const match =
           message.match(/update\s+(\w+)\s+to\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i) ||
           message.match(/change\s+(\w+)\s+address\s+to\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i);
@@ -8292,7 +12116,11 @@ function createPublicApp(): express.Express {
         }
       }
 
-      if (shouldHandleAsContactDelete(message) && walletCtx.walletAddress) {
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.ContactsDelete) &&
+        shouldHandleAsContactDelete(message) &&
+        walletCtx.walletAddress
+      ) {
         const match = message.match(/(?:remove|delete)\s+contact\s+(\w+)/i);
         if (match) {
           const name = match[1].toLowerCase();
@@ -8338,8 +12166,50 @@ function createPublicApp(): express.Express {
         }
       }
 
-      // Schedule intents are now handled by the dedicated schedule agent on port 3018
-      if (shouldHandleAsScheduleRequest(message) && walletCtx.walletAddress) {
+      const shouldDeferScheduleFastPathToIntentRouter =
+        /\b(?:that|this|it)\s+payment\b/i.test(message) ||
+        /^(?:yeah go|go ahead|continue|do it|yeah make that)$/i.test(message.trim());
+      const scheduleRoutingMessage =
+        routerOverrideMessage && routerContinuationState?.intent === AgentFlowIntentName.ScheduleCreate
+          ? routerOverrideMessage
+          : message;
+
+      // Schedule intents are now handled by the dedicated schedule agent on port 3018,
+      // but referential follow-ups need the newer intent router because they depend on
+      // current-session context rather than message-only parsing.
+      if (
+        canUseFastPathForIntents(
+          AgentFlowIntentName.ScheduleCreate,
+          AgentFlowIntentName.ScheduleCancel,
+          AgentFlowIntentName.ScheduleList,
+        ) &&
+        shouldHandleAsScheduleRequest(scheduleRoutingMessage) &&
+        walletCtx.walletAddress &&
+        !shouldDeferScheduleFastPathToIntentRouter
+      ) {
+        const scheduleRecipient = parseContinuationRecipient(scheduleRoutingMessage);
+        const scheduleAmount = parseContinuationAmount(scheduleRoutingMessage);
+        const scheduleCadence = parseContinuationCadence(scheduleRoutingMessage);
+        if (scheduleRecipient && scheduleAmount && !scheduleCadence) {
+          const responseText = 'How often should I send it?';
+          await storeRouterContinuationState(actionSessionId, {
+            intent: AgentFlowIntentName.ScheduleCreate,
+            rawMessage: scheduleRoutingMessage,
+            slots: {
+              recipient: scheduleRecipient,
+              amount: { value: scheduleAmount.value, currency: scheduleAmount.currency },
+            },
+            slotsMissing: ['schedule.cadence'],
+            clarification: responseText,
+            createdAt: new Date().toISOString(),
+          });
+          await appendBrainConversationTurn(memorySessionId, message, responseText);
+          res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+
         const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
         try {
           const scheduleAgentRes = await fetch(`${SCHEDULE_AGENT_BASE_URL}/run`, {
@@ -8348,7 +12218,7 @@ function createPublicApp(): express.Express {
               'Content-Type': 'application/json',
               ...(internalKey ? { 'X-Agentflow-Brain-Internal': internalKey } : {}),
             },
-            body: JSON.stringify({ task: message, walletAddress: walletCtx.walletAddress }),
+            body: JSON.stringify({ task: scheduleRoutingMessage, walletAddress: walletCtx.walletAddress }),
           });
           const scheduleData = await scheduleAgentRes.json().catch(() => ({ action: 'error', message: 'Schedule agent error' })) as {
             action?: string;
@@ -8358,7 +12228,18 @@ function createPublicApp(): express.Express {
             choices?: Array<{ id: string; label: string; confirmId: string }>;
           };
           const responseText = typeof scheduleData.message === 'string' ? scheduleData.message : 'Schedule agent error';
+          await clearRouterContinuationState(actionSessionId);
           await appendBrainConversationTurn(memorySessionId, message, responseText);
+          await updateBrainEvent(brainEventId, {
+            intent_label: 'deterministic_schedule_agent',
+            intent_source: 'fastpath',
+            ...buildFastpathBrainEventFields('deterministic_schedule_agent'),
+            final_response_summary: responseText,
+            outcome: scheduleAgentRes.ok ? 'success' : 'tool_error',
+            failure_reason: scheduleAgentRes.ok ? null : responseText,
+            total_latency_ms: Date.now() - responseStartedAt,
+          });
+          brainTelemetryFinalized = true;
           if (scheduleData.confirmId || scheduleData.choices?.length) {
             res.write(`data: ${JSON.stringify({ meta: { confirmation: { required: true, action: 'schedule', confirmId: scheduleData.confirmId, confirmLabel: scheduleData.confirmLabel || 'Confirm', choices: scheduleData.choices } } })}\n\n`);
           }
@@ -8370,6 +12251,16 @@ function createPublicApp(): express.Express {
           const msg = scheduleErr instanceof Error ? scheduleErr.message : String(scheduleErr);
           const responseText = `Schedule agent unavailable: ${msg}`;
           await appendBrainConversationTurn(memorySessionId, message, responseText);
+          await updateBrainEvent(brainEventId, {
+            intent_label: 'deterministic_schedule_agent',
+            intent_source: 'fastpath',
+            ...buildFastpathBrainEventFields('deterministic_schedule_agent'),
+            final_response_summary: responseText,
+            outcome: 'tool_error',
+            failure_reason: responseText,
+            total_latency_ms: Date.now() - responseStartedAt,
+          });
+          brainTelemetryFinalized = true;
           res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
           res.write('data: [DONE]\n\n');
           res.end();
@@ -8378,13 +12269,16 @@ function createPublicApp(): express.Express {
       }
 
       // Batch/payroll payment intents — dedicated agent on port 3020. Text-only fast-path.
-      if (shouldHandleAsBatchPayment(message) && walletCtx.walletAddress) {
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.BatchExecute) &&
+        shouldHandleAsBatchPayment(message) &&
+        walletCtx.walletAddress
+      ) {
         const parsedBatch = parseBatchMessage(message);
         if ('error' in parsedBatch) {
           const responseText =
             `I see you want to run a batch payment, but I could not parse the recipients.\n` +
-            `${parsedBatch.error}\n\n` +
-            `Use this format:\nbatch pay\nalice.arc,100,salary\nbob.arc,100,salary`;
+            formatBatchParseError(parsedBatch.error);
           await appendBrainConversationTurn(memorySessionId, message, responseText);
           res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
           res.write('data: [DONE]\n\n');
@@ -8460,7 +12354,11 @@ function createPublicApp(): express.Express {
 
       // Split-payment intents are handled by the dedicated split agent on port 3019.
       // Bypass Hermes entirely to prevent hallucinated previews / fake tx hashes.
-      if (shouldHandleAsSplitRequest(message) && walletCtx.walletAddress) {
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.SplitExecute) &&
+        shouldHandleAsSplitRequest(message) &&
+        walletCtx.walletAddress
+      ) {
         const parsed = parseSplitRequest(message);
         if (!parsed) {
           const responseText =
@@ -8544,7 +12442,10 @@ function createPublicApp(): express.Express {
       // Payment-link fast-path — pure URL construction, no money moves, no
       // confirmation needed. Emits a `meta.paymentLink` event so the frontend
       // can render a QR code + Copy/Share buttons.
-      if (shouldHandleAsPaymentLinkRequest(message)) {
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.AgentpayPaymentLink) &&
+        shouldHandleAsPaymentLinkRequest(message)
+      ) {
         const parsed = parsePaymentLinkRequest(message);
         if (!parsed) {
           const responseText = [
@@ -8553,6 +12454,28 @@ function createPublicApp(): express.Express {
             'Try: "payment link for jack.arc 5 USDC for coffee"',
             '  or: "qr code for 0x…address 10 USDC".',
           ].join('\n');
+          await appendBrainConversationTurn(memorySessionId, message, responseText);
+          res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+
+        if (!parsed.amount) {
+          const responseText = 'How much USDC should the payment link request?';
+          await storeRouterContinuationState(actionSessionId, {
+            intent: AgentFlowIntentName.AgentpayPaymentLink,
+            rawMessage: message,
+            slots: {
+              recipient: parsed.handle.startsWith('0x')
+                ? { address: parsed.handle }
+                : { handle: `${parsed.handle}.arc` },
+              ...(parsed.remark ? { remark: parsed.remark } : {}),
+            },
+            slotsMissing: ['amount.value'],
+            clarification: responseText,
+            createdAt: new Date().toISOString(),
+          });
           await appendBrainConversationTurn(memorySessionId, message, responseText);
           res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
           res.write('data: [DONE]\n\n');
@@ -8604,7 +12527,11 @@ function createPublicApp(): express.Express {
       }
 
       // Invoice creation fast-path — bypass Hermes entirely, no LLM call.
-      if (shouldHandleAsInvoiceRequest(message) && walletCtx.walletAddress) {
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.InvoiceCreate) &&
+        shouldHandleAsInvoiceRequest(message) &&
+        walletCtx.walletAddress
+      ) {
         const parsed = parseInvoiceRequest(message);
         if (!parsed) {
           const responseText = [
@@ -8676,7 +12603,11 @@ function createPublicApp(): express.Express {
       }
 
       // Invoice status fast-path — bypass Hermes to avoid hallucination.
-      if (shouldHandleAsInvoiceStatus(message) && walletAddress) {
+      if (
+        canUseFastPathForIntents(AgentFlowIntentName.InvoiceStatus) &&
+        shouldHandleAsInvoiceStatus(message) &&
+        walletAddress
+      ) {
         try {
           const { data: invoices } = await adminDb
             .from('invoices')
@@ -8730,7 +12661,12 @@ function createPublicApp(): express.Express {
       // the same /run pipeline (research → analyst → writer) the tool would use.
       // Internal counterparty risk fast-path. Uses AgentFlow contacts, invoices,
       // payment requests, transactions, and reputation cache only; no web search.
-      if (shouldHandleCounterpartyRiskRequest(message) && walletCtx.walletAddress) {
+      const capabilityRouting = analyzeCapabilityAwareRouting(message);
+      if (
+        shouldHandleCounterpartyRiskRequest(message) &&
+        capabilityRouting.counterpartyRisk.routeToFeature &&
+        walletCtx.walletAddress
+      ) {
         const parsed = parseCounterpartyRiskRequest(message);
         if (!parsed) {
           const responseText = 'I can check internal AgentFlow counterparty risk, but I need a contact name, .arc handle, or wallet address.';
@@ -8763,74 +12699,14 @@ function createPublicApp(): express.Express {
         }
       }
 
-      if (hasAsciiArtIntent(message)) {
-        if (!walletCtx.walletAddress) {
-          const responseText = 'Connect your wallet to run the paid ASCII Agent.';
-          await appendBrainConversationTurn(memorySessionId, message, responseText);
-          res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-          return;
-        }
-
-        try {
-          const asciiTask = extractAsciiAgentTask({ task: message }) || message.trim();
-          res.write(`data: ${JSON.stringify({ meta: buildAsciiFastPathMeta('started') })}\n\n`);
-          const paidAscii = await executeUserPaidAgentViaX402<{
-            success?: boolean;
-            result?: string;
-            error?: string;
-          }>({
-            agent: 'ascii',
-            price: asciiPrice,
-            userWalletAddress: getAddress(walletCtx.walletAddress),
-            requestId: `chat_ascii_${actionSessionId}_${Date.now()}`,
-            url: ASCII_URL,
-            body: {
-              task: asciiTask,
-            },
-          });
-          const responseText =
-            typeof paidAscii.data?.result === 'string' && paidAscii.data.result.trim()
-              ? paidAscii.data.result.trim()
-              : '';
-          if (!responseText) {
-            throw new Error(
-              typeof paidAscii.data?.error === 'string' && paidAscii.data.error.trim()
-                ? paidAscii.data.error.trim()
-                : 'ASCII Agent returned no art.',
-            );
-          }
-          res.write(`data: ${JSON.stringify({ meta: buildAsciiFastPathMeta('completed') })}\n\n`);
-          res.write(
-            `data: ${JSON.stringify({
-              meta: {
-                paymentMeta: {
-                  entries: [paidAscii.paymentEntry],
-                },
-              },
-            })}\n\n`,
-          );
-          await appendBrainConversationTurn(memorySessionId, message, responseText);
-          res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-          return;
-        } catch (asciiErr) {
-          const msg = asciiErr instanceof Error ? asciiErr.message : String(asciiErr);
-          console.warn('[chat/respond] ascii fast-path failed:', msg);
-          const failureReply = buildAsciiFailureReply(msg);
-          res.write(`data: ${JSON.stringify({ meta: buildAsciiFastPathMeta('failed') })}\n\n`);
-          await appendBrainConversationTurn(memorySessionId, message, failureReply);
-          res.write(`data: ${JSON.stringify({ delta: failureReply })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-          return;
-        }
-      }
+      const previousReport = findLatestStoredResearchReport(historyForBrain);
+      console.log('[report-context] previousReport:', Boolean(previousReport));
+      console.log(
+        '[report-context] shouldUse:',
+        shouldUseReportContextTurn(message, previousReport),
+      );
 
       if (isReportRenderingComplaint(message)) {
-        const previousReport = findLatestStoredResearchReport(historyForBrain);
         if (previousReport) {
           const responseText = `Re-rendering the latest full research report.\n\n---\n\n${previousReport}`;
           await appendBrainConversationTurn(memorySessionId, message, responseText);
@@ -8859,262 +12735,96 @@ function createPublicApp(): express.Express {
         }
       }
 
-      if (shouldHandleAsResearchRequest(message) && walletCtx.walletAddress) {
-        const syncToken = `sync:${randomUUID()}`;
-        let slotHeld = false;
-        const intermediate: string[] = [];
-        const pushStatus = (status: string) => {
-          intermediate.push(status);
-          res.write(`data: ${JSON.stringify({ delta: status })}\n\n`);
-        };
-
-        try {
-          const reasoningMode = inferResearchReasoningMode({
-            task: message,
-            defaultMode: 'fast',
-          });
-
-          const acquired = await tryAcquireResearchSlot(syncToken);
-          if (!acquired) {
-            const { jobId, position } = await enqueueResearch({
-              sessionId: memorySessionId,
-              walletAddress: walletCtx.walletAddress,
-              query: message,
-              mode: reasoningMode === 'deep' ? 'deep' : 'fast',
-              reasoningMode,
-            });
-            const waitMsg = [
-              '📊 Our research pipeline is busy right now.',
-              'Your report is queued and will be ready soon.',
-              '',
-              `Query: "${message}"`,
-              `Position: #${position}`,
-              `Job ID: ${jobId}`,
-              '',
-              "You'll get a Telegram notification when it's done (if Telegram is linked).",
-              'The full report will also appear in this chat when polling completes.',
-              reasoningMode === 'deep'
-                ? 'Deep reports usually take 3-5 minutes.'
-                : 'Fast reports usually take 1-2 minutes.',
-            ].join('\n');
-            await appendBrainConversationTurn(memorySessionId, message, waitMsg);
-            res.write(
-              `data: ${JSON.stringify({
-                meta: { researchQueued: { jobId, position } },
-              })}\n\n`,
-            );
-            res.write(`data: ${JSON.stringify({ delta: waitMsg })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-            return;
-          }
-          slotHeld = true;
-
-          // Keep the user-facing status honest: actual source names are known only after retrieval.
-          pushStatus(
-            reasoningMode === 'deep'
-              ? 'Running DEEP research -> analyst -> writer with Firecrawl retrieval, claim checks, and source verification. This can take 3-5 minutes.\n\n'
-              : 'Running FAST research -> analyst -> writer with Firecrawl-backed live retrieval and source checks. This usually takes 1-2 minutes.\n\n',
-          );
-
-          const pipelineRes = await fetch(`http://127.0.0.1:${PUBLIC_PORT}/run`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              task: message,
-              userAddress: walletCtx.walletAddress,
-              reasoningMode,
-              deepResearch: reasoningMode === 'deep',
-            }),
-          });
-
-          if (!pipelineRes.ok || !pipelineRes.body) {
-            throw new Error(
-              `Research pipeline returned ${pipelineRes.status} ${pipelineRes.statusText}`,
+      if (shouldUseReportContextTurn(message, previousReport)) {
+        console.log('[report-context] handling post-report follow-up');
+        const reportTurnKind = classifyReportContextTurn(message);
+        let responseText: string;
+        if (reportTurnKind === 'ack') {
+          responseText = buildReportAcknowledgementReply();
+        } else if (reportTurnKind === 'source_lookup') {
+          responseText =
+            buildMatchedReportSourceReply(previousReport!, message) ??
+            buildReportSourceLookupReply(previousReport!);
+        } else {
+          const matchedExplanation = buildMatchedReportExplanationReply(message);
+          if (matchedExplanation) {
+            responseText = matchedExplanation;
+          } else {
+          const explanationClarifier = buildReportExplanationClarifier(previousReport!);
+          if (explanationClarifier && /\b(?:that|this|it|these|those)\b/i.test(message)) {
+            responseText = explanationClarifier;
+          } else {
+            const reportFollowupInput = buildReportFollowupModelInput(previousReport!, message);
+            responseText = await withTimeout(
+              callHermesFast(REPORT_FOLLOWUP_SYSTEM_PROMPT, reportFollowupInput),
+              20000,
+              'Report follow-up timed out after 20s',
             );
           }
-
-          const reader = pipelineRes.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = '';
-          let report = '';
-          let reportPayload: any = null;
-          let pipelineErr = '';
-          let eventCount = 0;
-          let pipelineReceipt: any = null;
-
-          const handlePipelineSseEvent = (ev: string) => {
-            if (!ev.trim()) return;
-            eventCount += 1;
-            for (const line of ev.split('\n')) {
-              if (!line.startsWith('data:')) continue;
-              const raw = line.slice(5).trim();
-              if (!raw || raw === '[DONE]') continue;
-              let parsed: any;
-              try {
-                parsed = JSON.parse(raw);
-              } catch {
-                continue;
-              }
-              if (!parsed || typeof parsed !== 'object') continue;
-              if (typeof parsed.type === 'string') {
-                console.log(
-                  '[research-consumer] event:',
-                  parsed.type,
-                  typeof parsed.step === 'string' ? parsed.step : '',
-                );
-              }
-              if (parsed.type === 'step_start' && typeof parsed.step === 'string') {
-                pushStatus(`- ${parsed.step} agent started\n`);
-              } else if (parsed.type === 'step_complete' && typeof parsed.step === 'string') {
-                pushStatus(`- ${parsed.step} agent complete\n`);
-              } else if (typeof parsed.delta === 'string' && parsed.delta) {
-                pushStatus(parsed.delta);
-              } else if (parsed.type === 'report' && typeof parsed.markdown === 'string') {
-                report = parsed.markdown;
-                reportPayload = parsed;
-              } else if (parsed.type === 'receipt') {
-                pipelineReceipt = parsed;
-              } else if (parsed.type === 'error' && typeof parsed.message === 'string') {
-                pipelineErr = parsed.message;
-              }
-            }
-          };
-
-          const drainCompleteSseBlocks = () => {
-            const normalized = buffer.replace(/\r\n/g, '\n');
-            const events = normalized.split('\n\n');
-            buffer = events.pop() ?? '';
-            for (const ev of events) {
-              handlePipelineSseEvent(ev);
-            }
-          };
-
-          while (true) {
-            const { value, done } = await reader.read();
-            buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-            drainCompleteSseBlocks();
-            if (done) {
-              const tail = buffer.replace(/\r\n/g, '\n').trim();
-              buffer = '';
-              if (tail) {
-                handlePipelineSseEvent(tail);
-              }
-              break;
-            }
-          }
-
-          console.log(
-            '[research-consumer] done,',
-            'got report:', !!report,
-            'events:', eventCount,
-          );
-
-          if (!report && pipelineErr) {
-            const failureText = `Research pipeline failed: ${pipelineErr}`;
-            await appendBrainConversationTurn(memorySessionId, message, failureText);
-            res.write(`data: ${JSON.stringify({ delta: `\n${failureText}` })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-            return;
-          }
-          if (!report) {
-            console.error('[research] no report markdown received');
-            res.write(
-              `data: ${JSON.stringify({
-                type: 'error',
-                error: 'Report generation incomplete. Please try again.',
-              })}\n\n`,
-            );
-            res.write('data: [DONE]\n\n');
-            res.end();
-            return;
-          }
-
-          console.log('[research] report received, length:', report.length);
-
-          const paymentMeta = pipelineReceipt
-            ? {
-                entries:
-                  Array.isArray(pipelineReceipt.entries) && pipelineReceipt.entries.length
-                    ? pipelineReceipt.entries
-                    : [
-                    {
-                      requestId: `${pipelineReceipt.pipelineRequestId ?? 'pipeline'}:research`,
-                      agent: 'research',
-                      price: pipelineReceipt.researchPrice ?? null,
-                      transactionRef: pipelineReceipt.researchTx ?? null,
-                      settlementTxHash: null,
-                      mode: 'dcw',
-                    },
-                    {
-                      requestId: `${pipelineReceipt.pipelineRequestId ?? 'pipeline'}:analyst`,
-                      agent: 'analyst',
-                      price: pipelineReceipt.analystPrice ?? null,
-                      transactionRef: pipelineReceipt.analystTx ?? null,
-                      settlementTxHash: null,
-                      mode: 'dcw',
-                    },
-                    {
-                      requestId: `${pipelineReceipt.pipelineRequestId ?? 'pipeline'}:writer`,
-                      agent: 'writer',
-                      price: pipelineReceipt.writerPrice ?? null,
-                      transactionRef: pipelineReceipt.writerTx ?? null,
-                      settlementTxHash: null,
-                      mode: 'dcw',
-                    },
-                  ],
-              }
-            : null;
-
-          const finalText = `\n\n---\n\n${report}`;
-          await appendBrainConversationTurn(
-            memorySessionId,
-            message,
-            `${intermediate.join('')}${finalText}`,
-          );
-          res.write(
-            `data: ${JSON.stringify({
-              meta: {
-                reportMeta: {
-                  kind: 'research',
-                  mode: reasoningMode,
-                },
-                ...(paymentMeta ? { paymentMeta } : {}),
-              },
-            })}\n\n`,
-          );
-          res.write(
-            `data: ${JSON.stringify({
-              type: 'report',
-              markdown: report,
-              research: reportPayload?.research ?? null,
-              analysis: reportPayload?.analysis ?? null,
-              liveData: reportPayload?.liveData ?? null,
-            })}\n\n`,
-          );
-          res.write(`data: ${JSON.stringify({ delta: finalText })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-          return;
-        } catch (researchErr) {
-          const msg = researchErr instanceof Error ? researchErr.message : String(researchErr);
-          console.warn('[chat/respond] research fast-path failed:', msg);
-          const failureReply = buildResearchFailureReply(msg);
-          await appendBrainConversationTurn(memorySessionId, message, failureReply);
-          res.write(`data: ${JSON.stringify({ delta: `\n${failureReply}` })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-          return;
-        } finally {
-          if (slotHeld) {
-            await releaseResearchSlot(syncToken);
           }
         }
+        await appendBrainConversationTurn(memorySessionId, message, responseText);
+        res.write(
+          `data: ${JSON.stringify({
+            meta: {
+              reportMeta: {
+                kind: 'research_followup',
+                diagnostics: ['Answered from the latest completed research report in session history.'],
+              },
+            },
+          })}\n\n`,
+        );
+        for (const chunk of responseText.match(/[\s\S]{1,120}/g) ?? [responseText]) {
+          res.write(`data: ${JSON.stringify({ delta: chunk })}\n\n`);
+        }
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
       }
 
-      if (shouldHandleAsAgentFlowCapabilityQuestion(message)) {
-        const responseText = getAgentFlowCircleStackSummary();
+      // Referential routing ("is that my portfolio?", "yeah run it") must resolve
+      // against the visible thread only. Falling back to merged/persisted history
+      // let an old report from another thread drive a "report above" reply or a
+      // fresh paid portfolio check. The client always sends the visible thread; when
+      // it is empty there is no antecedent, so we pass an empty history rather than
+      // persisted memory.
+      const directRouteHistory = messages as BrainConversationMessage[];
+      const preResearchDirectRoute = parseDirectAgentFlowRoute(message, directRouteHistory);
+
+      if (
+        shouldHandleAsResearchRequest(message, historyForBrain) &&
+        walletCtx.walletAddress &&
+        !preResearchDirectRoute
+      ) {
+        await executeBrainResearchPipelineForChat({
+          res,
+          memorySessionId,
+          persistUserTurn: message,
+          researchTask: message,
+          portfolioImpact: detectPortfolioImpactIntent(message),
+          walletAddress: walletCtx.walletAddress,
+          brainEventId,
+          redisActionScopeKey: memorySessionId,
+        });
+        return;
+      }
+
+      const capabilityRoutingForChat = analyzeCapabilityAwareRouting(message);
+      if (
+        !capabilityRoutingForChat.bridge.routeToResearch &&
+        !capabilityRoutingForChat.vault.routeToResearch &&
+        !capabilityRoutingForChat.swap.routeToResearch &&
+        !capabilityRoutingForChat.predmarket.routeToResearch &&
+        !capabilityRoutingForChat.counterpartyRisk.routeToResearch &&
+        !isVaultPositionIntent(capabilityProbe) &&
+        shouldHandleAsAgentFlowCapabilityQuestion(capabilityProbe, capabilityThreadCtx)
+      ) {
+        logFastPathDebug({
+          kind: 'capability_sse',
+          branch: 'capability_faq',
+          messageCount: capabilityThreadCtx.messageCount,
+        });
+        const responseText = formatAgentFlowCapabilityReply(capabilityProbe);
         await appendBrainConversationTurn(memorySessionId, message, responseText);
         res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
         res.write('data: [DONE]\n\n');
@@ -9142,8 +12852,7 @@ function createPublicApp(): express.Express {
           lowerMsg.includes('eoa') ||
           lowerMsg.includes('funding'))
       ) {
-        const responseText =
-          'No. AgentFlow does not expose a manual EOA bridge in the Funding page anymore. Funding is for moving Arc USDC between your EOA, your Agent wallet, and your Gateway reserve. If you want to bridge to Arc inside AgentFlow, use the sponsored Bridge agent in chat.';
+        const responseText = formatBridgeExecutionReply();
         await appendBrainConversationTurn(memorySessionId, message, responseText);
         res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
         res.write('data: [DONE]\n\n');
@@ -9151,7 +12860,33 @@ function createPublicApp(): express.Express {
         return;
       }
 
-      const directRoute = parseDirectAgentFlowRoute(message, historyForBrain);
+      const lowConfidenceClarification = maybeLowConfidenceClarify(message);
+      if (lowConfidenceClarification) {
+        console.warn('[LOW_CONFIDENCE_CLARIFY]', {
+          session_id: actionSessionId,
+          reason: 'swap_missing_source_token',
+        });
+        await appendBrainConversationTurn(memorySessionId, message, lowConfidenceClarification);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'swap',
+          intent_source: 'unclear',
+          final_response_summary: lowConfidenceClarification,
+          outcome: 'low_confidence_clarify',
+          failure_reason: 'swap_missing_source_token',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: lowConfidenceClarification })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const directRoute = preResearchDirectRoute;
       if (directRoute) {
         let responseText = '';
         let meta:
@@ -9160,79 +12895,32 @@ function createPublicApp(): express.Express {
 
         if (directRoute.type === 'reply') {
           responseText = directRoute.text;
+          if (directRoute.quickActionGroups?.length) {
+            meta = { quickActionGroups: directRoute.quickActionGroups };
+          }
         } else {
           if (
-            executionTarget === 'EOA' &&
-            (
-              directRoute.tool === 'swap_tokens' ||
-              directRoute.tool === 'vault_action' ||
-              directRoute.tool === 'bridge_usdc'
-            )
-          ) {
-            responseText =
-              directRoute.tool === 'bridge_usdc'
-                ? 'You selected EOA mode, which is the manual/funding wallet mode. DCW mode is the in-chat execution mode. AgentFlow bridge runs through the sponsored Bridge agent in DCW mode, so switch execution mode to DCW if you want me to do the bridge for you here.'
-                : 'You selected EOA mode, which is the manual/funding wallet mode. DCW mode is the in-chat execution mode for swap and vault actions. Switch execution mode to DCW if you want me to execute this for you in chat.';
-          } else if (
             directRoute.tool === 'get_portfolio' &&
-            executionTarget === 'DCW' &&
             walletCtx.walletAddress?.trim()
           ) {
-            let usedPaidPortfolio = false;
-            try {
-              if (await isAgentHealthy('portfolio')) {
-                const paid = await runDcwPaidConfirm<Record<string, unknown>>({
-                  walletAddress: walletCtx.walletAddress.trim(),
-                  agent: 'portfolio',
-                  price: portfolioPrice,
-                  url: PORTFOLIO_URL,
-                  requestId: `portfolio_chat_${canonicalRedisSessionId(actionSessionId)}_${Date.now()}`,
-                });
-                const data = paid.data ?? {};
-                const errMsg = typeof data.error === 'string' ? data.error.trim() : '';
-                const failed =
-                  paid.status < 200 ||
-                  paid.status >= 300 ||
-                  data.success === false ||
-                  Boolean(errMsg);
-                if (!failed) {
-                  responseText = formatPaidPortfolioAgentChatBody(data, portfolioPrice);
-                  appendRecentExecutionEntries(actionSessionId, [
-                    {
-                      requestId: paid.payment.requestId,
-                      agent: 'portfolio',
-                      price: portfolioPrice,
-                      payer: paid.payment.payer,
-                      mode: 'dcw',
-                      transactionRef: paid.payment.transaction ?? null,
-                    },
-                  ]);
-                  meta = buildBrainMetaFromToolResults([
-                    { name: 'agentflow_portfolio', result: responseText },
-                  ]);
-                  const paymentMeta = takeRecentExecutionMeta(actionSessionId);
-                  if (paymentMeta) {
-                    meta.paymentMeta = paymentMeta;
-                  }
-                  usedPaidPortfolio = true;
-                }
-              }
-            } catch (err) {
-              console.warn(
-                '[chat/respond] paid portfolio direct route failed:',
-                getErrorMessage(err),
-              );
-            }
-            if (!usedPaidPortfolio) {
-              responseText = await executeTool(
-                directRoute.tool,
-                directRoute.args,
-                walletCtx,
-                actionSessionId,
-              );
-              meta = buildBrainMetaFromToolResults([
-                { name: directRoute.tool, result: responseText },
-              ]);
+            responseText = await executePortfolioAgentForChat({
+              userWalletAddress: walletCtx.walletAddress,
+              sessionId: actionSessionId,
+              fallback: () =>
+                executeTool(
+                  directRoute.tool,
+                  directRoute.args,
+                  walletCtx,
+                  actionSessionId,
+                  { rawUserMessage: message },
+                ),
+            });
+            meta = buildBrainMetaFromToolResults([
+              { name: 'agentflow_portfolio', result: responseText },
+            ]);
+            const paymentMeta = takeRecentExecutionMeta(actionSessionId);
+            if (paymentMeta) {
+              meta.paymentMeta = paymentMeta;
             }
           } else {
             responseText = await executeTool(
@@ -9240,6 +12928,7 @@ function createPublicApp(): express.Express {
               directRoute.args,
               walletCtx,
               actionSessionId,
+              { rawUserMessage: message },
             );
             if (directRoute.postActionNote && /Reply YES to execute or NO to cancel\./i.test(responseText)) {
               responseText = `${responseText}\n\n${directRoute.postActionNote}`;
@@ -9253,37 +12942,131 @@ function createPublicApp(): express.Express {
                   buyerAgentSlug: 'vault',
                   trigger: 'post_vault_requested_report',
                 });
-              } else if (directRoute.tool === 'bridge_usdc') {
-                await storeRequestedPortfolioA2a(actionSessionId, {
-                  buyerAgentSlug: 'bridge',
-                  trigger: 'post_bridge_requested_report',
-                });
               }
             }
-            meta = buildBrainMetaFromToolResults([
-              { name: directRoute.tool, result: responseText },
-            ]);
+        meta = buildBrainMetaFromToolResults([
+          { name: directRoute.tool, result: responseText },
+        ]);
+        if (directRoute.quickActionGroups?.length) {
+          meta.quickActionGroups = directRoute.quickActionGroups;
+        }
+        if (
+          directRoute.tool === 'predict_action' &&
+          directRoute.args.action === 'list'
+        ) {
+          meta.quickActionGroups = buildPredmarketListQuickActionGroups(responseText);
+        } else if (
+          directRoute.tool === 'predict_action' &&
+          directRoute.args.action === 'detail'
+        ) {
+              const marketAddress =
+                typeof directRoute.args.marketAddress === 'string' && isAddress(directRoute.args.marketAddress)
+                  ? (getAddress(directRoute.args.marketAddress) as `0x${string}`)
+                  : null;
+              if (marketAddress) {
+            meta.quickActionGroups = buildPredmarketDetailQuickActionGroups(
+              responseText,
+              marketAddress,
+            );
           }
+        } else if (
+          directRoute.tool === 'predict_action' &&
+          directRoute.args.action === 'position'
+        ) {
+          meta.quickActionGroups = buildPredmarketPositionQuickActionGroups(responseText);
+        }
+      }
         }
 
+        if (
+          directRoute.type === 'tool' &&
+          directRoute.tool === 'predict_action' &&
+          meta
+        ) {
+        if (directRoute.args.action === 'list') {
+          meta.quickActionGroups = buildPredmarketListQuickActionGroups(responseText);
+        } else if (directRoute.args.action === 'detail') {
+            const marketAddress =
+              typeof directRoute.args.marketAddress === 'string' && isAddress(directRoute.args.marketAddress)
+                ? (getAddress(directRoute.args.marketAddress) as `0x${string}`)
+                : null;
+            if (marketAddress) {
+            meta.quickActionGroups = buildPredmarketDetailQuickActionGroups(
+              responseText,
+              marketAddress,
+            );
+          }
+        } else if (directRoute.args.action === 'position') {
+          meta.quickActionGroups = buildPredmarketPositionQuickActionGroups(responseText);
+        }
+      }
+
+        if (directRoute.type === 'tool') {
+          if (directRoute.tool === 'get_portfolio' && meta) {
+            const predmarketGroups = buildPredmarketPositionQuickActionGroups(responseText);
+            if (predmarketGroups.length) {
+              meta.quickActionGroups = [
+                ...(meta.quickActionGroups ?? []),
+                ...predmarketGroups,
+              ];
+            }
+          }
+
+          const previewPending =
+            directRoute.tool === 'swap_tokens' ||
+            directRoute.tool === 'vault_action' ||
+            directRoute.tool === 'predict_action'
+              ? await loadPendingAction(actionSessionId)
+              : null;
+          const previewProvider =
+            (previewPending?.tool === 'swap_tokens' ||
+              previewPending?.tool === 'vault_action' ||
+              previewPending?.tool === 'predict_action') &&
+            previewPending.payload &&
+            typeof previewPending.payload === 'object' &&
+            typeof (previewPending.payload as { provider?: unknown }).provider === 'string'
+              ? (previewPending.payload as { provider: string }).provider
+              : null;
+          const toolResult = classifyBrainToolResult(responseText);
+          await appendBrainToolTelemetry(brainEventId, brainToolsTelemetry, {
+            name: directRoute.tool,
+            provider:
+              directRoute.tool === 'swap_tokens' ||
+              directRoute.tool === 'vault_action' ||
+              directRoute.tool === 'predict_action'
+                ? previewProvider
+                : null,
+            params_summary: summarizeToolParams(directRoute.args),
+            result_summary: summarizeTelemetryValue(responseText),
+            latency_ms: null,
+            success: toolResult.success,
+          });
+        }
+        const directRouteResult =
+          directRoute.type === 'tool'
+            ? classifyBrainToolResult(responseText)
+            : { outcome: 'success' as const, failureReason: null };
+        await updateBrainEvent(brainEventId, {
+          intent_label: directRoute.type === 'tool' ? directRoute.tool : 'direct_reply',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields(
+            directRoute.type === 'tool' ? directRoute.tool : 'direct_reply',
+          ),
+          final_response_summary: responseText,
+          outcome: directRouteResult.outcome,
+          failure_reason: directRouteResult.failureReason,
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
         await appendBrainConversationTurn(memorySessionId, message, responseText);
         if (meta) {
           res.write(`data: ${JSON.stringify({ meta })}\n\n`);
         }
         res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-        return;
-      }
-
-      const eoaAdviceReply = await tryBuildEoaFinancialAdviceReply(
-        message,
-        walletCtx,
-        actionSessionId,
-      );
-      if (eoaAdviceReply) {
-        await appendBrainConversationTurn(memorySessionId, message, eoaAdviceReply);
-        res.write(`data: ${JSON.stringify({ delta: eoaAdviceReply })}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
         return;
@@ -9306,19 +13089,150 @@ function createPublicApp(): express.Express {
 
       const brainMessage = buildBrainInputMessage(message);
       let fullResponse = '';
-      // Run agent brain
-      for await (const chunk of runAgentBrain(
-        brainMessage,
-        historyForBrain,
-        walletCtx,
-        actionSessionId
-      )) {
-        if (chunk.type === 'meta') {
-          res.write(`data: ${JSON.stringify({ meta: chunk.meta })}\n\n`);
-          continue;
+      let guardedOutcome: BrainEventOutcome | null = null;
+
+      let chatSseHermesChunkWritten = false;
+      let chatSseHermesAnyWriteCounted = false;
+      const writeHermesSsePayload = (payload: Record<string, unknown>) => {
+        if (isAgentflowChatSseDebug() && !chatSseHermesAnyWriteCounted) {
+          chatSseHermesAnyWriteCounted = true;
+          logChatSseDebug({ chat_stream_first_event_written: true, keys: Object.keys(payload) });
         }
-        fullResponse += chunk.delta;
-        res.write(`data: ${JSON.stringify({ delta: chunk.delta })}\n\n`)
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      };
+
+      if (isAgentflowChatSseDebug()) {
+        logChatSseDebug({
+          chat_stream_backend_received: true,
+          messagePreview: message.slice(0, 100),
+          memorySessionId: memorySessionId.slice(0, 120),
+          actionSessionId: actionSessionId.slice(0, 120),
+          hasWallet: Boolean(walletCtx.walletAddress),
+          brainHistoryTurns: historyForBrain.length,
+          route: 'hermes_runAgentBrain',
+        });
+      }
+      logChatSseDebug({ chat_stream_hermes_call_start: true });
+
+      try {
+        // Run agent brain (Hermes)
+        for await (const chunk of runAgentBrain(
+          brainMessage,
+          historyForBrain,
+          walletCtx,
+          actionSessionId,
+        )) {
+          if (chunk.type === 'meta') {
+            writeHermesSsePayload({ meta: chunk.meta });
+            continue;
+          }
+          if (chunk.type === 'guard') {
+            if (chunk.guard === 'stale_state_blocked' && chunk.requiredTool) {
+              const pendingForGuard = await loadPendingAction(actionSessionId).catch(() => null);
+              const shouldGroundState = userExplicitlyRequestedLiveState(message);
+              let guardText: string;
+              let guardMeta: BrainMessageMeta | undefined;
+
+              if (pendingForGuard && !shouldGroundState) {
+                guardText = formatPendingActionFollowup(pendingForGuard);
+              } else if (shouldGroundState) {
+                const toolName = chunk.requiredTool === 'get_portfolio' ? 'get_portfolio' : 'get_balance';
+                const groundedResult = await executeTool(toolName, {}, walletCtx, actionSessionId);
+                const groundedToolResult = classifyBrainToolResult(groundedResult);
+                await appendBrainToolTelemetry(brainEventId, brainToolsTelemetry, {
+                  name: toolName,
+                  provider: null,
+                  params_summary: '{}',
+                  result_summary: summarizeTelemetryValue(groundedResult),
+                  latency_ms: null,
+                  success: groundedToolResult.success,
+                });
+                guardText = `\n\nI refreshed the live state for this turn:\n${groundedResult}`;
+                guardMeta = buildBrainMetaFromToolResults([{ name: toolName, result: groundedResult }]);
+              } else {
+                guardText =
+                  "I can't verify live balances or market state from that reply alone. Ask me to refresh your balances or portfolio, and I will continue from the live result.";
+              }
+
+              await updateBrainEvent(brainEventId, {
+                outcome: 'stale_state_blocked',
+                failure_reason: chunk.assertedState
+                  ? `${chunk.reason} Asserted text: ${chunk.assertedState}`
+                  : chunk.reason,
+                total_latency_ms: Date.now() - responseStartedAt,
+              });
+              brainTelemetryFinalized = true;
+              guardedOutcome = 'stale_state_blocked';
+              fullResponse += guardText;
+              chatSseHermesChunkWritten = true;
+              if (guardMeta) {
+                writeHermesSsePayload({ meta: guardMeta });
+              }
+              writeHermesSsePayload({ delta: guardText });
+              continue;
+            }
+            if (chunk.guard === 'turn_cap_hit') {
+              const capText =
+                fullResponse.trim() ||
+                "I hit my tool-call limit for that turn, so I'm stopping here with the work completed so far.";
+              if (!fullResponse.trim()) {
+                fullResponse = capText;
+                chatSseHermesChunkWritten = true;
+                writeHermesSsePayload({ delta: capText });
+              }
+              await updateBrainEvent(brainEventId, {
+                outcome: 'turn_cap_hit',
+                failure_reason: chunk.toolsStarted?.length
+                  ? `${chunk.reason}. tools_called=[${chunk.toolsStarted.join(', ')}]`
+                  : chunk.reason,
+                total_latency_ms: Date.now() - responseStartedAt,
+              });
+              brainTelemetryFinalized = true;
+              guardedOutcome = 'turn_cap_hit';
+              continue;
+            }
+            if (chunk.guard === 'unexpected_tool_blocked') {
+              const blockedText =
+                fullResponse.trim() ||
+                'AgentFlow could not complete that response safely. Please retry or rephrase your request.';
+              if (!fullResponse.trim()) {
+                fullResponse = blockedText;
+                chatSseHermesChunkWritten = true;
+                writeHermesSsePayload({ delta: blockedText });
+              }
+              await updateBrainEvent(brainEventId, {
+                outcome: 'unexpected_tool_blocked',
+                failure_reason: chunk.toolsStarted?.length
+                  ? `${chunk.reason}. tools_called=[${chunk.toolsStarted.join(', ')}]`
+                  : chunk.reason,
+                total_latency_ms: Date.now() - responseStartedAt,
+              });
+              brainTelemetryFinalized = true;
+              guardedOutcome = 'unexpected_tool_blocked';
+              continue;
+            }
+            continue;
+          }
+          fullResponse += chunk.delta;
+          chatSseHermesChunkWritten = true;
+          writeHermesSsePayload({ delta: chunk.delta });
+        }
+      } catch (brainStreamErr: unknown) {
+        logChatSseDebug({
+          chat_stream_hermes_error: getErrorMessage(brainStreamErr),
+        });
+        throw brainStreamErr;
+      }
+
+      if (!chatSseHermesChunkWritten) {
+        logChatSseDebug({
+          chat_stream_closed_without_reply: true,
+          fullResponseChars: fullResponse.length,
+          hadMetaChunksOnly: chatSseHermesAnyWriteCounted,
+        });
+        const fallback = CHAT_SSE_EMPTY_REPLY_FALLBACK;
+        fullResponse = fallback;
+        writeHermesSsePayload({ delta: fallback });
       }
 
       try {
@@ -9413,12 +13327,63 @@ function createPublicApp(): express.Express {
         console.warn('[chat/respond] pending postflight failed:', getErrorMessage(error));
       }
 
-      await appendBrainConversationTurn(memorySessionId, message, fullResponse);
+      const hermesResult = classifyBrainToolResult(fullResponse);
+      const existingOutcome: BrainEventOutcome = guardedOutcome ?? hermesResult.outcome;
+      const hermesEventUpdate: Parameters<typeof updateBrainEvent>[1] = {
+        intent_source: 'hermes',
+        ...buildHermesBrainEventFields(),
+        hermes_model: 'fast',
+        final_response_summary: fullResponse,
+        outcome: existingOutcome,
+        total_latency_ms: Date.now() - responseStartedAt,
+      };
+      if (!guardedOutcome) {
+        hermesEventUpdate.failure_reason = hermesResult.failureReason;
+      }
+      await updateBrainEvent(brainEventId, hermesEventUpdate);
+      brainTelemetryFinalized = true;
+      recentBrainEventsBySession.set(memorySessionId, {
+        eventId: brainEventId,
+        assistantAt: Date.now(),
+      });
+      await appendBrainConversationTurn(memorySessionId, message, fullResponse, memorySessionId);
       res.write('data: [DONE]\n\n')
       res.end()
     } catch (err) {
-      res.write(`data: ${JSON.stringify({ error: getErrorMessage(err) })}\n\n`)
-      res.end()
+      if (brainEventId && !brainTelemetryFinalized) {
+        await updateBrainEvent(brainEventId, {
+          outcome: 'tool_error',
+          failure_reason: getErrorMessage(err),
+          final_response_summary: getErrorMessage(err),
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+      }
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: getErrorMessage(err) })}\n\n`)
+        res.end()
+      }
+    }
+  });
+
+  app.post('/api/chat/feedback', async (req: Request, res: Response) => {
+    try {
+      const eventId = typeof req.body?.event_id === 'string' ? req.body.event_id.trim() : '';
+      const feedback = req.body?.feedback === 'positive' || req.body?.feedback === 'negative'
+        ? req.body.feedback
+        : null;
+      const note = typeof req.body?.note === 'string' ? req.body.note.trim() : '';
+      if (!eventId || !feedback) {
+        return res.status(400).json({ error: 'event_id and feedback are required.' });
+      }
+      await updateBrainEvent(eventId, {
+        user_feedback: feedback,
+        ...(note ? { feedback_note: note } : {}),
+      });
+      console.info('[BRAIN_FEEDBACK_RECEIVED]', { event_id: eventId, feedback });
+      return res.json({ ok: true });
+    } catch (error) {
+      return res.status(500).json({ error: getErrorMessage(error) });
     }
   });
 
@@ -9638,36 +13603,37 @@ function createPublicApp(): express.Express {
 
     try {
       const normalizedWallet = getAddress(auth.walletAddress);
-      const circleWallet = await getOrCreateUserAgentWallet(normalizedWallet);
-      const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-      const upstreamHeaders: Record<string, string> = {
-        authorization: `Bearer ${generateJWT(normalizedWallet)}`,
-        ...(internalKey ? { 'x-agentflow-paid-internal': internalKey } : {}),
-      };
-
       const upstreamBody =
-        req.body && typeof req.body === 'object'
-          ? {
-              ...(req.body as Record<string, unknown>),
-              walletAddress: normalizedWallet,
-              executionTarget: 'DCW',
-            }
-          : { walletAddress: normalizedWallet, executionTarget: 'DCW' };
+        req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : undefined;
       const requestId = req.header('x-agentflow-request-id')?.trim() || createRunId(`dcw_${slug}`);
 
-      const result = await payProtectedResourceServer<
-        Record<string, unknown>,
-        Record<string, unknown>
-      >({
+      if (slug === 'transcribe') {
+        const upstreamHeaders: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'x-agentflow-request-id': requestId,
+        };
+        const authorization = req.header('authorization')?.trim();
+        if (authorization) {
+          upstreamHeaders.authorization = authorization;
+        }
+
+        const upstreamResponse = await fetch(getDcwPaidAgentUrl(slug), {
+          method: 'POST',
+          headers: upstreamHeaders,
+          body: JSON.stringify(upstreamBody ?? {}),
+        });
+
+        const upstreamJson = await upstreamResponse.json().catch(() => ({}));
+        return res.status(upstreamResponse.status).json(upstreamJson);
+      }
+
+      const result = await executeDcwPaidAgentViaX402<Record<string, unknown>>({
+        userWalletAddress: normalizedWallet,
+        agent: slug,
+        price: getDcwPaidAgentPrice(slug),
         url: getDcwPaidAgentUrl(slug),
-        method: 'POST',
         body: upstreamBody,
-        circleWalletId: circleWallet.wallet_id,
-        payer: getAddress(circleWallet.address),
-        chainId: CHAIN_ID,
-        headers: upstreamHeaders,
         requestId,
-        idempotencyKey: requestId,
       });
 
       if (result.status >= 200 && result.status < 300) {
@@ -9679,15 +13645,15 @@ function createPublicApp(): express.Express {
       return res.status(result.status).json({
         ...(typeof result.data === 'object' && result.data ? result.data : { result: result.data }),
         payment: {
-          mode: 'DCW',
-          payer: getAddress(circleWallet.address),
-          agent: slug,
-          price: getDcwPaidAgentPrice(slug),
-          requestId: result.requestId,
-          transaction: result.transactionRef ?? null,
-          transactionRef: result.transactionRef ?? null,
-          settlement: result.transaction ?? null,
-          settlementTxHash: result.transaction?.txHash ?? null,
+          mode: result.payment.mode,
+          payer: result.payment.payer,
+          agent: result.payment.agent,
+          price: result.payment.price,
+          requestId: result.payment.requestId,
+          transaction: result.payment.transaction,
+          transactionRef: result.payment.transactionRef,
+          settlement: result.payment.settlement,
+          settlementTxHash: result.payment.settlementTxHash,
         },
       });
     } catch (err) {
@@ -9706,9 +13672,14 @@ function createPublicApp(): express.Express {
   const proxyHandler = async (req: Request, res: Response) => {
     const step = parseStep(req.params.step);
     if (!step) {
-      return res
-        .status(400)
-        .json({ error: 'Invalid step. Use research, analyst, or writer.' });
+      return res.status(404).json({ error: 'Not found' });
+    }
+    if (step === 'analyst' || step === 'writer') {
+      const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
+      const reqKey = (req.headers['x-agentflow-brain-internal'] as string | undefined)?.trim();
+      if (!internalKey || reqKey !== internalKey) {
+        return res.status(404).json({ error: 'Not found' });
+      }
     }
 
     const paymentSignature = req.header('Payment-Signature') || undefined;
@@ -9752,7 +13723,14 @@ function createPublicApp(): express.Express {
   app.post('/agent/:step/run', proxyHandler);
 
   app.post('/run', async (req, res) => {
-    const task = (req.body?.task as string | undefined) ?? '';
+    let activePipelineRunCounted = false;
+    const timingTraceStart = Date.now();
+    const pipelineTimingTrace: PipelineTimingTracePoint[] = [];
+    const rawTask = (req.body?.task as string | undefined) ?? '';
+    const portfolioImpact =
+      req.body?.portfolioImpact === true || detectPortfolioImpactIntent(rawTask);
+    const task = portfolioImpact ? stripPortfolioImpactPhrasing(rawTask) : rawTask;
+    const timingTraceId = RESEARCH_TIMING_TRACE ? `openai-trace-${Date.now()}` : '';
     const userAddressInput = (req.body?.userAddress as string | undefined) ?? '';
     const reasoningMode = inferResearchReasoningMode({
       task,
@@ -9830,15 +13808,22 @@ function createPublicApp(): express.Express {
     }
 
     try {
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'public_run_start', {
+        task,
+        reasoningMode,
+      });
+      await beginResearchPipelineRun();
+      activePipelineRunCounted = true;
       const walletContext =
         req.body?.walletContext && typeof req.body.walletContext === 'object'
           ? (req.body.walletContext as ResearchWalletContext)
-          : await buildResearchWalletContext({
-              task,
-              ownerWalletAddress: normalizedUserAddress,
-              executionWalletAddress: payerAddress,
-              executionTarget: 'DCW',
-            });
+          : portfolioImpact
+            ? await buildResearchWalletContext({
+                ownerWalletAddress: normalizedUserAddress,
+                executionWalletAddress: payerAddress,
+                executionTarget: 'DCW',
+              })
+            : null;
 
       await sendGAEvent('pipeline_started', {
         wallet_address: payerAddress,
@@ -9860,12 +13845,9 @@ function createPublicApp(): express.Express {
         mode: reasoningMode,
       });
       sendEvent({
-        delta:
-          reasoningMode === 'deep'
-            ? 'Research Agent is running deep Firecrawl retrieval and claim verification.\n'
-            : 'Research Agent is running fast Firecrawl-backed live retrieval.\n',
+        delta: 'Research Agent is running Firecrawl + SearXNG live retrieval.\n',
       });
-      if (walletContext) {
+      if (walletContext && portfolioImpact) {
         sendEvent({
           delta: walletContext.error
             ? 'Portfolio snapshot was requested, but the DCW scan was unavailable; the report will say so instead of guessing.\n'
@@ -9873,45 +13855,158 @@ function createPublicApp(): express.Express {
         });
       }
 
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_research_agent_call', {
+        pipelineRequestId,
+      });
       const researchResult = await payProtectedResourceServer<
-        { task?: string; result?: string; liveData?: Record<string, unknown> | null },
-        { task: string; reasoningMode: 'fast' | 'deep'; walletContext?: ResearchWalletContext }
+        {
+          task?: string;
+          result?: string;
+          structuredResearch?: Record<string, unknown> | null;
+          liveData?: Record<string, unknown> | null;
+        },
+        {
+          task: string;
+          reasoningMode: 'fast' | 'deep';
+          deepResearch?: boolean;
+          portfolioImpact?: boolean;
+          walletContext?: ResearchWalletContext;
+        }
       >({
         url: RESEARCH_URL,
         method: 'POST',
         body: {
           task,
           reasoningMode,
-          ...(walletContext ? { walletContext } : {}),
+          deepResearch: reasoningMode === 'deep',
+          portfolioImpact,
+          ...(walletContext && portfolioImpact ? { walletContext } : {}),
+          ...(timingTraceId ? { timingTraceId } : {}),
         },
         circleWalletId,
         payer: payerAddress,
         chainId: CHAIN_ID,
         requestId: `${pipelineRequestId}:research`,
+        idempotencyKey: `${pipelineRequestId}:research`,
+      });
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_research_agent_response', {
+        status: researchResult.status,
       });
 
+      if (researchResult.status >= 200 && researchResult.status < 300) {
+        pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_research_ledger_write');
+        void ensureUserPaidAgentLedger({
+          payer: payerAddress,
+          agent: 'research',
+          price: researchPrice,
+          requestId: researchResult.requestId,
+          settlement: researchResult.transaction,
+          remark: 'User DCW -> Research Agent (pipeline)',
+          context: 'user_dcw->research pipeline',
+        })
+          .then(() => {
+            pushPipelineTimingTrace(
+              pipelineTimingTrace,
+              timingTraceStart,
+              'after_research_ledger_write',
+            );
+          })
+          .catch((ledgerErr) => {
+            pushPipelineTimingTrace(
+              pipelineTimingTrace,
+              timingTraceStart,
+              'research_ledger_write_failed',
+              {
+                error: getErrorMessage(ledgerErr),
+              },
+            );
+            console.error('[ledger] research ledger write failed', ledgerErr);
+          });
+      }
+
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_research_result_handling');
       const researchTx = researchResult.transactionRef ?? null;
       const researchText = getAgentResultText(researchResult.data);
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_research_result_handling', {
+        researchTextChars: researchText.length,
+      });
 
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_research_step_complete_event');
       sendEvent({
         type: 'step_complete',
         step: 'research',
         tx: researchTx,
         amount: researchPrice,
       });
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_research_step_complete_event', {
+        researchTx,
+        researchTextChars: researchText.length,
+      });
 
-      await sendGAEvent('research_complete', {
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_research_ga_event');
+      void sendGAEvent('research_complete', {
         wallet_address: payerAddress,
         tx: researchTx,
         timestamp: Date.now(),
-      });
+      })
+        .then(() => {
+          pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_research_ga_event');
+        })
+        .catch((gaErr) => {
+          pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'research_ga_event_failed', {
+            error: getErrorMessage(gaErr),
+          });
+          console.error('[ga] research_complete event failed', gaErr);
+        });
 
-      const parsedResearch = safeParseObject(researchText);
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_direct_structured_research_extract');
+      const directStructuredResearch = recordValue(researchResult.data.structuredResearch);
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_direct_structured_research_extract', {
+        hasStructuredResearch: !!directStructuredResearch,
+      });
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_research_parse_object');
+      const researchParse = directStructuredResearch
+        ? { parsed: directStructuredResearch, outcome: 'success_without_unwrapping' as const }
+        : parseObjectWithDiagnostics(researchText);
+      const parsedResearch = researchParse.parsed;
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_research_parse_object', {
+        parserOutcome: researchParse.outcome,
+      });
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_research_parsing', {
+        parserOutcome: researchParse.outcome,
+        hasStructuredResearch: !!directStructuredResearch,
+      });
+      if (directStructuredResearch) {
+        console.log('[parser] research_result supplied as structured object');
+      } else if (researchParse.outcome === 'success_without_unwrapping') {
+        console.log('[parser] research_result parsed without unwrapping');
+      } else if (researchParse.outcome === 'success_after_unwrapping') {
+        console.log('[parser] research_result parsed after unwrapping');
+      } else {
+        console.log('[parser] research_result parse failed');
+      }
+      void writeResearchOutputDebug({
+        query: task,
+        mode: reasoningMode,
+        rawResearchText: researchText,
+        parserOutcome: researchParse.outcome,
+        parsedValue: parsedResearch,
+      }).catch((error) => {
+        console.warn('[parser] failed to write research output debug file:', getErrorMessage(error));
+      });
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_research_debug_write_kicked_off');
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_live_data_source_summary');
       const parsedLiveData = researchResult.data.liveData ?? null;
       const actualSources = summarizeLiveDataSourceNames(parsedLiveData);
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_live_data_source_summary', {
+        actualSourcesCount: actualSources.length,
+      });
+      pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_analyst_step_start', {
+        actualSourcesCount: actualSources.length,
+      });
       sendEvent({
         delta: actualSources.length
-          ? `\nRead live sources: ${actualSources.join(', ')}\n`
+          ? `\nRead live sources: ${formatLiveDataSourceSummary(actualSources)}\n`
           : '\nLive retrieval found limited directly relevant sources; the report will avoid unrelated citations.\n',
       });
 
@@ -9933,22 +14028,28 @@ function createPublicApp(): express.Express {
           researchJson: Record<string, unknown> | null;
           liveData: Record<string, unknown> | null;
           task: string;
+          portfolioImpact?: boolean;
           reasoningMode: 'fast' | 'deep';
         }
       >({
         url: ANALYST_URL,
         method: 'POST',
+        headers: {
+          'x-agentflow-brain-internal': process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '',
+        },
         body: {
           research: researchText,
           researchJson: parsedResearch,
           liveData: parsedLiveData,
           task,
+          portfolioImpact,
           reasoningMode,
         },
         circleWalletId: researchOwnerWallet.walletId,
         payer: researchOwnerWallet.address,
         chainId: CHAIN_ID,
         requestId: `${pipelineRequestId}:analyst`,
+        idempotencyKey: `${pipelineRequestId}:analyst`,
       });
 
       console.log('[pipeline] analyst complete, starting writer');
@@ -9989,7 +14090,15 @@ function createPublicApp(): express.Express {
         timestamp: Date.now(),
       });
 
-      const parsedAnalysis = safeParseObject(analysisText);
+      const analysisParse = parseObjectWithDiagnostics(analysisText);
+      const parsedAnalysis = analysisParse.parsed;
+      if (analysisParse.outcome === 'success_without_unwrapping') {
+        console.log('[parser] analysis_result parsed without unwrapping');
+      } else if (analysisParse.outcome === 'success_after_unwrapping') {
+        console.log('[parser] analysis_result parsed after unwrapping');
+      } else {
+        console.log('[parser] analysis_result parse failed');
+      }
 
       // Writer step
       sendEvent({
@@ -10013,11 +14122,15 @@ function createPublicApp(): express.Express {
           analysisJson: Record<string, unknown> | null;
           liveData: Record<string, unknown> | null;
           task: string;
+          portfolioImpact?: boolean;
           reasoningMode: 'fast' | 'deep';
         }
       >({
         url: WRITER_URL,
         method: 'POST',
+        headers: {
+          'x-agentflow-brain-internal': process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '',
+        },
         body: {
           research: researchText,
           analysis: analysisText,
@@ -10025,12 +14138,14 @@ function createPublicApp(): express.Express {
           analysisJson: parsedAnalysis,
           liveData: parsedLiveData,
           task,
+          portfolioImpact,
           reasoningMode,
         },
         circleWalletId: analystOwnerWallet.walletId,
         payer: analystOwnerWallet.address,
         chainId: CHAIN_ID,
         requestId: `${pipelineRequestId}:writer`,
+        idempotencyKey: `${pipelineRequestId}:writer`,
       });
 
       console.log('[pipeline] writer complete');
@@ -10126,6 +14241,7 @@ function createPublicApp(): express.Express {
       const finalMarkdown = ensureWalletContextInReport(
         finalizedReport.markdown,
         parsedLiveData,
+        portfolioImpact,
       );
 
       if (finalizedReport.validationIssues.length > 0) {
@@ -10155,6 +14271,31 @@ function createPublicApp(): express.Express {
         message: getErrorMessage(e),
       });
     } finally {
+      if (RESEARCH_TIMING_TRACE && timingTraceId) {
+        try {
+          const outDir = path.join(process.cwd(), 'tmp', 'latency-fast-research-diagnostic');
+          await fs.mkdir(outDir, { recursive: true });
+          await fs.writeFile(
+            path.join(outDir, `${timingTraceId}.public.json`),
+            `${JSON.stringify(
+              {
+                timingTraceId,
+                task,
+                reasoningMode,
+                trace: pipelineTimingTrace,
+              },
+              null,
+              2,
+            )}\n`,
+            'utf8',
+          );
+        } catch (traceError) {
+          console.warn('[timing-trace] failed to write public trace:', getErrorMessage(traceError));
+        }
+      }
+      if (activePipelineRunCounted) {
+        await endResearchPipelineRun();
+      }
       clearHeartbeat();
       if (!res.writableEnded) res.end();
     }
@@ -10171,7 +14312,12 @@ async function start(): Promise<void> {
     researchPrice,
     RESEARCH_AGENT_TIMEOUT_MS,
     async (req) => {
-    const task = (req.body?.task as string) ?? (req.query.task as string) ?? '';
+    const rawTask = (req.body?.task as string) ?? (req.query.task as string) ?? '';
+    const portfolioImpact =
+      req.body?.portfolioImpact === true ||
+      req.query.portfolioImpact === 'true' ||
+      detectPortfolioImpactIntent(rawTask);
+    const task = portfolioImpact ? stripPortfolioImpactPhrasing(rawTask) : rawTask;
     const researchContext =
       typeof req.body?.researchContext === 'string' && req.body.researchContext.trim()
         ? req.body.researchContext.trim()
@@ -10198,41 +14344,13 @@ async function start(): Promise<void> {
       deepResearch: req.body?.deepResearch ?? req.query.deepResearch,
       defaultMode: 'fast',
     });
-    if (reasoningMode === 'deep') {
-      try {
-        const { runDeepResearchCore } = await import('./agents/research/deepPipeline');
-        const deep = await runDeepResearchCore({
-          task,
-          walletContext: walletContext ?? undefined,
-        });
-        if (deep.sources.length > 0) {
-          return {
-            task,
-            liveData: {
-              source: 'Firecrawl search and scrape',
-              source_count: deep.sources.length,
-              sources: deep.sources.slice(0, 25),
-              liveFacts: deep.liveFacts,
-              ...(walletContext ? { wallet_context: walletContext } : {}),
-            },
-            reasoningMode,
-            result: deep.result,
-          };
-        }
-        console.warn('[Research] Firecrawl returned zero relevant sources; falling back to live data/API research.');
-      } catch (deepError) {
-        console.warn(
-          '[Research] Firecrawl deep retrieval failed; falling back to live data/API research:',
-          getErrorMessage(deepError),
-        );
-      }
-    }
     let liveData = '';
+    const liveDataTimeout = classifyLiveDataTimeout(task);
     try {
       liveData = await withTimeout(
         fetchLiveData(task),
-        LIVE_DATA_TIMEOUT_MS,
-        `Live data timed out after ${LIVE_DATA_TIMEOUT_MS / 1000}s`,
+        liveDataTimeout.timeoutMs,
+        `Live data timed out after ${liveDataTimeout.timeoutMs / 1000}s`,
       );
     } catch (liveDataError) {
       console.warn('[Research] Live data enrichment skipped:', getErrorMessage(liveDataError));
@@ -10241,7 +14359,10 @@ async function start(): Promise<void> {
     if (!liveData.trim() && requiresLiveEvidence(task)) {
       return {
         task,
-        liveData: walletContext ? { wallet_context: walletContext } : null,
+        liveData: {
+          ...(walletContext && portfolioImpact ? { wallet_context: walletContext } : {}),
+          portfolio_impact: portfolioImpact,
+        },
         reasoningMode,
         result: buildSparseEvidenceResearch(task, asOf),
       };
@@ -10249,23 +14370,40 @@ async function start(): Promise<void> {
     const contextBlock = researchContext
       ? `\n\nINTERNAL AGENTFLOW CONTEXT JSON:\n${researchContext}\n\nUse this internal context as primary evidence for private AgentFlow handles, wallets, invoices, payment requests, transactions, contacts, and reputation cache. Public web evidence is enrichment only. If public web evidence is limited, say so and still produce a risk assessment from internal evidence.`
       : '';
-    const walletContextBlock = walletContext
+    const walletContextBlock = walletContext && portfolioImpact
       ? `\n\nPORTFOLIO_CONTEXT JSON:\n${JSON.stringify(walletContext, null, 2)}\n\nThe user asked about their portfolio. Use this AgentFlow DCW snapshot as private first-party exposure context. Classify what the user holds (stablecoins, volatile crypto, DeFi, Gateway, mixed) and explain impact through those asset classes. Do not expose full wallet addresses, raw balances, or PnL unless the user explicitly asks for a balance/portfolio breakdown. If the snapshot has an error or empty holdings, say that the DCW scan was unavailable or empty instead of inventing holdings.`
       : '';
+    const liveDataPayload = parseLiveDataPayload(liveData);
+    const currentEventsPayload =
+      liveDataPayload?.current_events &&
+      typeof liveDataPayload.current_events === 'object'
+        ? liveDataPayload.current_events as Record<string, unknown>
+        : null;
+    const hasCurrentEventEvidence = Boolean(
+      currentEventsPayload &&
+        (Array.isArray(currentEventsPayload.articles) ||
+          Array.isArray(currentEventsPayload.article_snapshots) ||
+          currentEventsPayload.framing_signals),
+    );
+    const geopoliticalEvidenceInstruction = hasCurrentEventEvidence
+      ? ' Verify the user\'s premise before accepting it. If the evidence supports only tensions, reported planning, isolated strikes, or older background context, say that plainly instead of repeating the user\'s framing. If LIVE DATA current_events framing_signals are present, follow them exactly for broader conflict status, Strait of Hormuz route status, and Red Sea route status.'
+      : '';
     const userMessage = liveData
-      ? `AS OF ${asOf}\nCURRENT DATE: ${asOf.slice(0, 10)}\n\nLIVE DATA JSON:\n${liveData}${contextBlock}${walletContextBlock}\n\nUSER TASK:\n${task}\n\nUse the LIVE DATA JSON above for current figures and dated evidence. Do not cite or mention any date after CURRENT DATE as if it has happened. When present, cite concrete titles and URLs from current_events.articles, current_events.article_snapshots, dynamic_sources.articles, wikipedia.pages, coingecko, and defillama; do not invent outlets. The source registry is only a search planner and must not be cited as evidence. Verify the user's premise before accepting it. If the evidence supports only tensions, reported planning, isolated strikes, or older background context, say that plainly instead of repeating the user's framing. If LIVE DATA current_events framing_signals are present, follow them exactly for broader conflict status, Strait of Hormuz route status, and Red Sea route status. When PORTFOLIO_CONTEXT is present, classify the user's exposure and explain impact through that exposure profile without revealing raw balances, full addresses, or PnL unless explicitly requested. Prefer CoinGecko for token market data, DefiLlama for chain TVL and stablecoin liquidity, current-event article snapshots for recent developments, Wikipedia for factual background, and DuckDuckGo for supporting context.`
+      ? `AS OF ${asOf}\nCURRENT DATE: ${asOf.slice(0, 10)}\n\nLIVE DATA JSON:\n${liveData}${contextBlock}${walletContextBlock}\n\nUSER TASK:\n${task}\n\nUse the LIVE DATA JSON above for current figures and dated evidence. Do not cite or mention any date after CURRENT DATE as if it has happened. When present, cite concrete titles and URLs from current_events.articles, current_events.article_snapshots, dynamic_sources.articles, wikipedia.pages, coingecko, defillama, and bitcoin_onchain; do not invent outlets. Retrieval layers are not evidence and must not be cited as sources.${geopoliticalEvidenceInstruction} When creator_audience_metrics is present, treat current_subscribers/current_subscribers_display and observed_at as direct evidence for the latest available audience count and mention that figure explicitly in the answer. When bitcoin_onchain is present, treat it as primary evidence for Bitcoin network transaction counts, block counts, fees, and on-chain activity windows; do not substitute market trading volume for on-chain transaction volume. When PORTFOLIO_CONTEXT is present, classify the user's exposure and explain impact through that exposure profile without revealing raw balances, full addresses, or PnL unless explicitly requested. Prefer official APIs, reputable publishers, Mempool.space for Bitcoin block/on-chain metrics, CoinGecko for token market data, DefiLlama for chain TVL and stablecoin liquidity, current-event article snapshots for recent developments, and Wikipedia for factual background.`
       : `${task}${contextBlock}${walletContextBlock}`;
     return {
       task,
       liveData: researchContext
         ? {
-            ...(safeParseObject(liveData) ?? {}),
+            ...(liveDataPayload ?? {}),
             internal_context: safeParseObject(researchContext),
-            ...(walletContext ? { wallet_context: walletContext } : {}),
+            portfolio_impact: portfolioImpact,
+            ...(walletContext && portfolioImpact ? { wallet_context: walletContext } : {}),
           }
         : {
-            ...(safeParseObject(liveData) ?? {}),
-            ...(walletContext ? { wallet_context: walletContext } : {}),
+            ...(liveDataPayload ?? {}),
+            portfolio_impact: portfolioImpact,
+            ...(walletContext && portfolioImpact ? { wallet_context: walletContext } : {}),
           },
       reasoningMode,
       result: await callHermesFast(RESEARCH_SYSTEM_PROMPT, userMessage),
@@ -10291,21 +14429,24 @@ async function start(): Promise<void> {
       safeParseObject(research);
     const liveData =
       (req.body?.liveData as Record<string, unknown> | undefined) ?? null;
+    const portfolioImpact =
+      req.body?.portfolioImpact === true ||
+      req.query.portfolioImpact === 'true' ||
+      liveData?.portfolio_impact === true;
     const analystInput = buildAnalystModelInput({
       task,
       researchText: research,
       research: researchJson,
       liveData,
+      portfolioImpact,
     });
     return {
       research,
       reasoningMode,
-      result:
-        reasoningMode === 'deep'
-          ? await callHermesDeep(ANALYST_SYSTEM_PROMPT, analystInput)
-          : await callHermesFast(ANALYST_SYSTEM_PROMPT, analystInput),
+      result: await callHermesFast(ANALYST_SYSTEM_PROMPT, analystInput),
     };
   },
+  { internalOnly: true },
   );
   const writerApp = createAgentApp(
     'writer',
@@ -10325,10 +14466,21 @@ async function start(): Promise<void> {
       safeParseObject(analysis);
     const liveData =
       (req.body?.liveData as Record<string, unknown> | undefined) ?? null;
+    const portfolioImpact =
+      req.body?.portfolioImpact === true ||
+      req.query.portfolioImpact === 'true' ||
+      liveData?.portfolio_impact === true;
+    const reasoningMode = inferResearchReasoningMode({
+      task,
+      explicitMode: req.body?.reasoningMode ?? req.query.reasoningMode,
+      deepResearch: req.body?.deepResearch ?? req.query.deepResearch,
+      defaultMode: 'fast',
+    });
+    console.log('[writer] using Hermes fast model');
     return {
       research,
       analysis,
-      result: await callHermesDeep(
+      result: await callHermesFast(
         WRITER_SYSTEM_PROMPT,
         buildWriterModelInput({
           task,
@@ -10337,10 +14489,12 @@ async function start(): Promise<void> {
           research: researchJson,
           analysis: analysisJson,
           liveData,
+          portfolioImpact,
         }),
       ),
     };
   },
+  { internalOnly: true },
   );
   const publicApp = createPublicApp();
 

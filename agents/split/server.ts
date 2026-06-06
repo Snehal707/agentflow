@@ -131,16 +131,6 @@ app.post(
       return res.status(400).json({ action: 'error', message: 'totalAmount is required' });
     }
 
-    if (req.body?.benchmark === true) {
-      console.log('[benchmark] split short-circuit');
-      return res.json({
-        ok: true,
-        benchmark: true,
-        agent: 'split',
-        result: 'Benchmark mode - payment logged',
-      });
-    }
-
     try {
       const result = await previewSplit({ sessionId, walletAddress, recipients, totalAmount, remark });
       return res.json(result);

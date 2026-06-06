@@ -10,7 +10,6 @@ const links = [
   { href: "/pay", label: "AgentPay" },
   { href: "/funds", label: "Funding" },
   { href: "/portfolio", label: "Portfolio" },
-  { href: "/economy", label: "Benchmark" },
 ] as const;
 
 export function TopNav() {

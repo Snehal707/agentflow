@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS users (
   arc_handle varchar UNIQUE,
   max_per_transaction numeric, -- optional per-user tx limit in USDC
   max_per_day numeric,         -- optional per-user daily limit in USDC
+  allowed_recipients text[],
+  blocked_recipients text[],
+  require_confirmation_above numeric,
   training_consent boolean DEFAULT false,
   yield_monitoring boolean DEFAULT false,
   telegram_id varchar,
@@ -24,6 +27,49 @@ CREATE TABLE IF NOT EXISTS user_profiles (
   created_at timestamp DEFAULT now(),
   updated_at timestamp DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS semantic_memories (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  wallet_address varchar NOT NULL,
+  session_id varchar,
+  memory_type varchar NOT NULL,
+  category varchar,
+  content text NOT NULL,
+  structured jsonb DEFAULT '{}'::jsonb,
+  keywords text[] DEFAULT '{}'::text[],
+  source_user_message text,
+  source_assistant_message text,
+  confidence numeric DEFAULT 0.7,
+  supersedes_id uuid,
+  created_at timestamp DEFAULT now(),
+  updated_at timestamp DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_memories_wallet_updated
+  ON semantic_memories (wallet_address, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_memories_wallet_type
+  ON semantic_memories (wallet_address, memory_type);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_memories_session
+  ON semantic_memories (session_id);
+
+CREATE TABLE IF NOT EXISTS semantic_memory_metric_snapshots (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  bucket_start timestamptz NOT NULL UNIQUE,
+  granularity varchar NOT NULL DEFAULT '6h',
+  total_events integer NOT NULL DEFAULT 0,
+  writes_count integer NOT NULL DEFAULT 0,
+  retrievals_count integer NOT NULL DEFAULT 0,
+  profile_intent_mismatch_count integer NOT NULL DEFAULT 0,
+  zero_result_recall_like_count integer NOT NULL DEFAULT 0,
+  average_returned_count numeric DEFAULT 0,
+  payload jsonb DEFAULT '{}'::jsonb,
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_memory_metric_snapshots_bucket
+  ON semantic_memory_metric_snapshots (bucket_start DESC);
 
 CREATE TABLE IF NOT EXISTS wallets (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -83,8 +129,8 @@ CREATE TABLE IF NOT EXISTS invoices (
   settled_at timestamp
 );
 
--- Agent Store listings (published agents; table name retained for compatibility)
-CREATE TABLE IF NOT EXISTS marketplace_agents (
+-- Agent Store published agents
+CREATE TABLE IF NOT EXISTS agent_store_agents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   dev_wallet varchar NOT NULL,
   arc_handle varchar UNIQUE,
@@ -92,7 +138,7 @@ CREATE TABLE IF NOT EXISTS marketplace_agents (
   agent_card_json jsonb,
   erc8004_token_id varchar,
   category varchar,
-  listing_fee_tx varchar,
+  publish_tx varchar,
   status varchar DEFAULT 'pending', -- pending/active/suspended
   created_at timestamp DEFAULT now()
 );
@@ -110,6 +156,34 @@ CREATE TABLE IF NOT EXISTS transactions (
   remark text,
   created_at timestamp DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS agent_economy_ledger (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  request_id varchar UNIQUE,
+  buyer_wallet varchar NOT NULL,
+  seller_wallet varchar NOT NULL,
+  buyer_agent varchar NOT NULL,
+  seller_agent varchar NOT NULL,
+  amount numeric NOT NULL,
+  currency varchar DEFAULT 'USDC',
+  payment_rail varchar DEFAULT 'x402/gateway',
+  x402_transaction_ref varchar,
+  settlement_tx_hash varchar,
+  arc_tx_id varchar,
+  chain_id integer DEFAULT 5042002,
+  status varchar DEFAULT 'complete',
+  metadata jsonb DEFAULT '{}'::jsonb,
+  created_at timestamp DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_economy_ledger_created_at
+  ON agent_economy_ledger (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_economy_ledger_agents
+  ON agent_economy_ledger (buyer_agent, seller_agent);
+
+CREATE INDEX IF NOT EXISTS idx_agent_economy_ledger_seller_agent
+  ON agent_economy_ledger (seller_agent);
 
 CREATE TABLE IF NOT EXISTS payment_requests (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -138,6 +212,7 @@ CREATE TABLE IF NOT EXISTS scheduled_payments (
   next_run date NOT NULL,
   last_run date,
   status varchar DEFAULT 'active',
+  blocked_reason text,
   created_at timestamp DEFAULT now(),
   execution_count integer DEFAULT 0
 );

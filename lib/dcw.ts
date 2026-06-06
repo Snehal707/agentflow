@@ -29,6 +29,7 @@ export interface TransactionParams {
   contractAddress: string;
   abiFunctionSignature: string;
   abiParameters: string[];
+  amount?: string;
   feeLevel?: 'LOW' | 'MEDIUM' | 'HIGH';
   /** For user_agent wallets: enforce configured per-user spend controls (and optional balance check). */
   usdcAmount?: number;
@@ -37,6 +38,11 @@ export interface TransactionParams {
 // SDK surface can evolve faster than local typings; keep the boundary untyped.
 let dcwClientSingleton: any | null = null;
 let arcPublicClientSingleton: ReturnType<typeof createPublicClient> | null = null;
+const persistedUserAgentWalletCache = new Map<
+  string,
+  { row: PersistedWalletRow; cachedAt: number }
+>();
+const PERSISTED_USER_AGENT_WALLET_CACHE_TTL_MS = 5 * 60_000;
 
 export function getCircleClient(): any {
   if (!dcwClientSingleton) {
@@ -60,6 +66,26 @@ function getArcPublicClient() {
     });
   }
   return arcPublicClientSingleton;
+}
+
+function getCachedPersistedUserAgentWallet(normalizedUserWallet: string): PersistedWalletRow | null {
+  const cached = persistedUserAgentWalletCache.get(normalizedUserWallet.toLowerCase());
+  if (!cached) {
+    return null;
+  }
+  if (Date.now() - cached.cachedAt > PERSISTED_USER_AGENT_WALLET_CACHE_TTL_MS) {
+    persistedUserAgentWalletCache.delete(normalizedUserWallet.toLowerCase());
+    return null;
+  }
+  return cached.row;
+}
+
+function cachePersistedUserAgentWallet(normalizedUserWallet: string, row: PersistedWalletRow): PersistedWalletRow {
+  persistedUserAgentWalletCache.set(normalizedUserWallet.toLowerCase(), {
+    row,
+    cachedAt: Date.now(),
+  });
+  return row;
 }
 
 export function getWalletSetId(): string {
@@ -107,21 +133,9 @@ export async function getOrCreateUserAgentWallet(
   const existing = await findPersistedUserAgentWalletByUser(normalized);
 
   if (existing) {
-    const existingRow = existing;
-    try {
-      const recovered = await findBestRemoteUserAgentWallet(normalized);
-      if (recovered && recovered.address !== existingRow.address) {
-        const existingScore = await scoreWalletLiquidity(existingRow.address);
-        if (recovered.score > existingScore) {
-          return adoptRecoveredUserAgentWallet(normalized, recovered, existingRow);
-        }
-      }
-    } catch (error) {
-      // RPC providers can throttle read calls briefly; keep serving the persisted wallet.
-      console.warn('[dcw] recovered wallet scoring skipped:', error instanceof Error ? error.message : String(error));
-    }
-
-    return existingRow;
+    // Hot-path reads like wallet balances should not spend seconds rescanning remote
+    // Circle candidates when we already have a persisted execution wallet.
+    return existing;
   }
 
   const recovered = await findBestRemoteUserAgentWallet(normalized);
@@ -165,7 +179,7 @@ export async function getOrCreateUserAgentWallet(
     throw new Error(`[dcw] Failed to persist user agent wallet: ${inserted.error.message}`);
   }
 
-  return inserted.data as PersistedWalletRow;
+  return cachePersistedUserAgentWallet(normalized, inserted.data as PersistedWalletRow);
 }
 
 export async function findPersistedUserAgentWallet(
@@ -248,6 +262,7 @@ export async function executeTransaction(params: TransactionParams): Promise<unk
   const feeLevel = params.feeLevel ?? 'HIGH';
   const res = await dcw.createContractExecutionTransaction({
     walletId: params.walletId,
+    amount: params.amount,
     contractAddress: params.contractAddress,
     abiFunctionSignature: params.abiFunctionSignature,
     abiParameters: params.abiParameters,
@@ -546,6 +561,11 @@ async function findBestRemoteUserAgentWallet(userWalletAddress: string): Promise
 async function findPersistedUserAgentWalletByUser(
   normalizedUserWallet: string,
 ): Promise<PersistedWalletRow | null> {
+  const cached = getCachedPersistedUserAgentWallet(normalizedUserWallet);
+  if (cached) {
+    return cached;
+  }
+
   const exact = await adminDb
     .from('wallets')
     .select('*')
@@ -558,7 +578,10 @@ async function findPersistedUserAgentWalletByUser(
   }
   const exactRows = Array.isArray(exact.data) ? (exact.data as PersistedWalletRow[]) : [];
   if (exactRows.length > 0) {
-    return chooseBestPersistedUserAgentWallet(exactRows);
+    return cachePersistedUserAgentWallet(
+      normalizedUserWallet,
+      await chooseBestPersistedUserAgentWallet(exactRows),
+    );
   }
 
   const lowercased = await adminDb
@@ -576,7 +599,12 @@ async function findPersistedUserAgentWalletByUser(
     ? (lowercased.data as PersistedWalletRow[])
     : [];
 
-  return lowerRows.length > 0 ? chooseBestPersistedUserAgentWallet(lowerRows) : null;
+  return lowerRows.length > 0
+    ? cachePersistedUserAgentWallet(
+        normalizedUserWallet,
+        await chooseBestPersistedUserAgentWallet(lowerRows),
+      )
+    : null;
 }
 
 async function findPersistedWalletByRecoveredCandidate(
@@ -639,7 +667,7 @@ async function adoptRecoveredUserAgentWallet(
       throw new Error(`[dcw] Failed to persist recovered user agent wallet: ${inserted.error.message}`);
     }
 
-    return inserted.data as PersistedWalletRow;
+    return cachePersistedUserAgentWallet(normalizedUserWallet, inserted.data as PersistedWalletRow);
   }
 
   if (currentRow.purpose !== 'user_agent') {
@@ -676,7 +704,7 @@ async function adoptRecoveredUserAgentWallet(
     throw new Error(`[dcw] Failed to adopt recovered user agent wallet: ${updated.error.message}`);
   }
 
-  return updated.data as PersistedWalletRow;
+  return cachePersistedUserAgentWallet(normalizedUserWallet, updated.data as PersistedWalletRow);
 }
 
 async function chooseBestPersistedUserAgentWallet(

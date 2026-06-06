@@ -1,35 +1,47 @@
 "use client";
 
-import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAccount } from "wagmi";
 import { useConnectModal } from "@rainbow-me/rainbowkit";
-import { isLikelyErc8004Registry } from "@/lib/arcChain";
-import { shortenAddress } from "@/lib/appData";
-import { useAgentJwt } from "@/lib/hooks/useAgentJwt";
 import { AppSidebar } from "@/components/app/AppSidebar";
 import { SessionStatusChip } from "@/components/app/SessionStatusChip";
-import { ChatTopNavbar } from "@/components/chat/ChatTopNavbar";
-import {
-  AllocationSparklines,
-} from "@/components/portfolio/AllocationSparklines";
+import { useAgentJwt } from "@/lib/hooks/useAgentJwt";
 import {
   fetchExecutionWalletSummary,
   fetchPortfolioSnapshot,
-  type PortfolioHolding,
-  type PortfolioRecentTransaction,
+  type ExecutionWalletSummary,
+  type PortfolioPosition,
   type PortfolioSnapshotResponse,
 } from "@/lib/liveAgentClient";
+import { shortenAddress } from "@/lib/appData";
+import { AllocationSparklines } from "@/components/portfolio/AllocationSparklines";
 import {
-  portfolioValueUsdExcludingGatewayOnly,
-  pnlSummaryExcludingGateway,
+  combinedPortfolioMetrics,
+  mergeCombinedHoldings,
+  mergeCombinedPositions,
 } from "@/lib/portfolioMetrics";
-import { findVaultHolding, type VaultHoldingCard } from "@/lib/vaultPositionCards";
+import {
+  loadVaultHoldingCards,
+  type VaultHoldingCard,
+} from "@/lib/vaultPositionCards";
 import { useSidebarPreference } from "@/lib/useSidebarPreference";
+import { Line, LineChart, ResponsiveContainer, XAxis, YAxis } from "recharts";
+
+function formatAmount(value: string | number | null | undefined): string {
+  const numeric = typeof value === "number" ? value : Number(value ?? 0);
+  if (!Number.isFinite(numeric)) {
+    return "0";
+  }
+  return new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: numeric >= 100 ? 2 : 4,
+  }).format(numeric);
+}
 
 function formatUsd(value: number | null | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "N/A";
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "N/A";
+  }
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
@@ -38,228 +50,136 @@ function formatUsd(value: number | null | undefined): string {
   }).format(value);
 }
 
-function formatPct(value: number | null | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "N/A";
-  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+function parseNumeric(value: string | number | null | undefined): number {
+  const numeric = typeof value === "number" ? value : Number(value ?? 0);
+  return Number.isFinite(numeric) ? numeric : 0;
 }
 
 function formatSignedUsd(value: number | null | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "N/A";
-  return `${value >= 0 ? "+" : "-"}${formatUsd(Math.abs(value))}`;
-}
-
-function formatTimestamp(value: string): string {
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
-}
-
-function formatVaultShares(value: string): string {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return value;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "N/A";
   }
-  return new Intl.NumberFormat("en-US", {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: numeric >= 100 ? 2 : 4,
-  }).format(numeric);
+  const formatted = formatUsd(Math.abs(value));
+  return `${value >= 0 ? "+" : "-"}${formatted}`;
 }
 
-function getLocalTimeHint(): string {
-  try {
-    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    return zone ? `Times shown in your local timezone (${zone})` : "Times shown in your local timezone";
-  } catch {
-    return "Times shown in your local timezone";
+function formatPct(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "N/A";
   }
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
-function humanizeMethodName(method: string | null | undefined): string {
-  if (!method) return "Transaction";
-  const base = method.split("(")[0]?.trim() || method.trim();
-  if (!base) return "Transaction";
-  const spaced = base
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+function hashSeed(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }
 
-function formatActivityCounterparty(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  return /^0x[a-fA-F0-9]{40}$/.test(trimmed) ? shortenAddress(trimmed) : trimmed;
+function sparkSeries(
+  id: string,
+  steps: number,
+  h: number,
+  amp01: number,
+): { i: number; y: number }[] {
+  const seed = hashSeed(id);
+  const maxAmp = (h / 2 - 1) * Math.max(0.12, Math.min(1, amp01));
+  const out: { i: number; y: number }[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const s1 = Math.sin(t * Math.PI * 4 + seed * 1e-6);
+    const s2 = Math.sin(t * Math.PI * 11 + seed * 3e-6);
+    const s3 = Math.sin(t * Math.PI * 19 + seed * 7e-6) * 0.35;
+    const wobble = s1 * 0.5 + s2 * 0.35 + s3;
+    const y = h / 2 + maxAmp * wobble;
+    out.push({ i, y });
+  }
+  return out;
 }
 
-type ActivityFeedKind = "transfer" | "register" | "approve" | "other";
+const TOKEN_LINE_COLORS: Record<string, string> = {
+  USDC: "#f2ca50", // Gold
+  EURC: "#ffffff", // White
+  AFVUSDC: "#d8ad27", // Golden variant
+};
 
-/** Bullet / middle-dot / dash separators from activity summaries. */
-const ACTIVITY_SUMMARY_SPLIT = /\s*[•·-]\s*/;
-
-function extractRecentActivityMeta(
-  activity: PortfolioRecentTransaction,
-  viewerAddress?: string | null,
-): {
-  title: string;
-  counterparty: string | null;
-  fee: string | null;
-  kind: ActivityFeedKind;
-  transferDirection: "in" | "out" | null;
-} {
-  const rawParts = activity.summary
-    .split(ACTIVITY_SUMMARY_SPLIT)
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  const methodPart = rawParts[0] ?? activity.method ?? "transaction";
-  const contractPart = rawParts[1] ?? null;
-
-  const feePart = rawParts.find((part) => /^fee\s+/i.test(part)) ?? null;
-
-  const counterpartyPart =
-    rawParts.find((part, index) => index > 0 && !/^fee\s+/i.test(part)) ?? activity.to ?? null;
-
-  const methodLower = methodPart.toLowerCase();
-  const contractLower = (contractPart ?? "").toLowerCase();
-  const isFiatTokenProxy = contractLower.includes("fiattokenproxy");
-  const isTransferMethod = methodLower.includes("transfer");
-  const isApproveMethod = methodLower.includes("approve");
-  const isRegisterMethod = methodLower.includes("register");
-  const isSwapMethod = methodLower.includes("swap");
-  const isDepositMethod = methodLower.includes("deposit");
-  const isWithdrawMethod = methodLower.includes("withdraw") || methodLower.includes("redeem");
-  const isMintMethod = methodLower.includes("mint");
-  const isBurnMethod = methodLower.includes("burn");
-  const isGenericTransaction =
-    methodLower === "transaction" ||
-    methodLower === "contract interaction" ||
-    methodLower === "contractinteraction";
-
-  let title: string;
-  let kind: ActivityFeedKind = "other";
-
-  const registerTarget =
-    activity.to ??
-    (contractPart && /^0x[a-fA-F0-9]{40}$/.test(contractPart.trim()) ? contractPart.trim() : null);
-
-  if (isFiatTokenProxy && isTransferMethod) {
-    title = "USDC Transfer";
-    kind = "transfer";
-  } else if (isFiatTokenProxy && isApproveMethod) {
-    title = "USDC Approval";
-    kind = "approve";
-  } else if (isRegisterMethod && registerTarget && isLikelyErc8004Registry(registerTarget)) {
-    title = "Agent Registration";
-    kind = "register";
-  } else if (isSwapMethod) {
-    title = "Swap";
-  } else if (isDepositMethod && contractLower.includes("vault")) {
-    title = "Vault Deposit";
-  } else if (isWithdrawMethod && contractLower.includes("vault")) {
-    title = "Vault Withdraw";
-  } else if (isMintMethod) {
-    title = "Mint";
-  } else if (isBurnMethod) {
-    title = "Burn";
-  } else if (isApproveMethod) {
-    title = "Token Approval";
-    kind = "approve";
-  } else if (isTransferMethod) {
-    title = "Transfer";
-    kind = "transfer";
-  } else if (isGenericTransaction && contractPart && /^0x[a-fA-F0-9]{40}$/.test(contractPart.trim())) {
-    title = "Contract Interaction";
-  } else if (contractPart && /^0x[a-fA-F0-9]{40}$/.test(contractPart.trim())) {
-    title = "Contract Interaction";
-    if (isTransferMethod) kind = "transfer";
-    else if (isApproveMethod) kind = "approve";
-    else if (isRegisterMethod) kind = "register";
+function strokeForIndex(index: number): string {
+  const isAlt = index % 2 === 0;
+  if (isAlt) {
+    const hue = 42 + (index % 4) * 4;
+    return `hsla(${hue}, 82%, 62%, 0.8)`;
   } else {
-    title = humanizeMethodName(methodPart);
-    if (isTransferMethod) kind = "transfer";
-    else if (isApproveMethod) kind = "approve";
-    else if (isRegisterMethod) kind = "register";
+    return `rgba(255, 255, 255, 0.75)`;
   }
-
-  let transferDirection: "in" | "out" | null = null;
-  if (kind === "transfer" && viewerAddress) {
-    const v = viewerAddress.toLowerCase();
-    const from = activity.from?.toLowerCase() ?? "";
-    const to = activity.to?.toLowerCase() ?? "";
-    if (from === v) transferDirection = "out";
-    else if (to === v) transferDirection = "in";
-  }
-
-  return {
-    title,
-    counterparty:
-      title === "Contract Interaction"
-        ? formatActivityCounterparty(contractPart ?? counterpartyPart)
-        : formatActivityCounterparty(counterpartyPart),
-    fee: feePart,
-    kind,
-    transferDirection,
-  };
 }
 
-function ActivityFeedIcon({
-  kind,
-  direction,
+function strokeForHolding(symbol: string | undefined, index: number): string {
+  if (!symbol) return strokeForIndex(index);
+  const key = symbol.toUpperCase();
+  return TOKEN_LINE_COLORS[key] ?? strokeForIndex(index);
+}
+
+function MetricCard({
+  label,
+  title,
+  value,
+  unit,
+  accent = false,
+  detail,
+  supporting,
+  compact = false,
 }: {
-  kind: ActivityFeedKind;
-  direction: "in" | "out" | null;
+  label: string;
+  title: string;
+  value: string;
+  unit?: string;
+  accent?: boolean;
+  detail: string;
+  supporting?: React.ReactNode;
+  compact?: boolean;
 }) {
-  const cls = "material-symbols-outlined flex size-5 shrink-0 items-center justify-center leading-none";
-  if (kind === "transfer") {
-    if (direction === "in") {
-      return (
-        <span className={`${cls} text-[#f2ca50]`} aria-hidden>
-          arrow_downward
-        </span>
-      );
-    }
-    if (direction === "out") {
-      return (
-        <span className={`${cls} text-[#f2ca50]`} aria-hidden>
-          arrow_upward
-        </span>
-      );
-    }
-    return (
-      <span className={`${cls} text-[#8f96a7]`} aria-hidden>
-        swap_horiz
-      </span>
-    );
-  }
-  if (kind === "register") {
-    return (
-      <span className={`${cls} text-[#f2ca50]`} style={{ fontVariationSettings: "'FILL' 0" }} aria-hidden>
-        shield
-      </span>
-    );
-  }
-  if (kind === "approve") {
-    return (
-      <span className={`${cls} text-[#f2ca50]`} style={{ fontVariationSettings: "'FILL' 1" }} aria-hidden>
-        check_circle
-      </span>
-    );
-  }
   return (
-    <span className={`${cls} text-[#8f96a7]`} aria-hidden>
-      contract
-    </span>
+    <article
+      className={`group relative flex flex-col rounded-[28px] border transition-all duration-300 hover:-translate-y-1 ${
+        compact ? "min-h-[220px] p-5 xl:p-6" : "min-h-[270px] p-6 xl:min-h-[290px] xl:p-7"
+      } ${
+        accent
+          ? "border-[#f2ca50]/30 bg-[radial-gradient(circle_at_top_left,rgba(242,202,80,0.15),transparent_45%),linear-gradient(180deg,#171512_0%,#0c0b09_100%)] hover:border-[#f2ca50]/60 hover:shadow-[0_0_30px_rgba(242,202,80,0.06)]"
+          : "border-white/5 bg-[radial-gradient(circle_at_top_left,rgba(255,255,255,0.02),transparent_40%),linear-gradient(180deg,#131313_0%,#0d0d0d_100%)] hover:border-[#f2ca50]/20 hover:shadow-[0_0_30px_rgba(255,255,255,0.015)]"
+      }`}
+    >
+      <div className="absolute right-6 top-6 h-1.5 w-1.5 rounded-full bg-white/20 transition-all duration-300 group-hover:scale-150 group-hover:bg-[#f2ca50]" />
+      
+      <p className="text-[9px] font-black uppercase tracking-[0.28em] text-[#f2ca50]">{label}</p>
+      <h2 className="mt-4 max-w-[11ch] font-headline text-[clamp(1.35rem,1.85vw,2rem)] font-bold tracking-tight text-white/90 group-hover:text-white">
+        {title}
+      </h2>
+      <p
+        className={`font-headline font-black leading-none ${
+          compact ? "mt-5 text-[clamp(2.5rem,3vw,3.5rem)]" : "mt-6 text-[clamp(2.8rem,4vw,4.2rem)]"
+        } ${
+          accent ? "text-[#f2ca50]" : "text-white"
+        }`}
+      >
+        {value}
+      </p>
+      {unit ? (
+        <p className="mt-2 text-[11px] font-bold uppercase tracking-[0.24em] text-[#f2ca50]/75">{unit}</p>
+      ) : null}
+      <p className="mt-4 max-w-[28ch] text-sm leading-relaxed text-white/45 transition-colors group-hover:text-white/60">{detail}</p>
+      {supporting ? <div className="mt-auto pt-7">{supporting}</div> : null}
+    </article>
   );
 }
 
 export default function PortfolioPage() {
-  const router = useRouter();
   const { isCollapsed, toggleSidebar } = useSidebarPreference();
   const { address } = useAccount();
   const { openConnectModal } = useConnectModal();
   const {
-    session,
     isAuthenticated,
     signIn,
     loading: authLoading,
@@ -267,626 +187,574 @@ export default function PortfolioPage() {
     getAuthHeaders,
   } = useAgentJwt();
 
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [execSnapshot, setExecSnapshot] = useState<PortfolioSnapshotResponse | null>(null);
-  const [execLoadError, setExecLoadError] = useState<string | null>(null);
-  const [execLoading, setExecLoading] = useState(false);
-  const [assetSearch, setAssetSearch] = useState("");
-  useEffect(() => {
-    let cancelled = false;
-    const loadExec = async () => {
-      if (!address || !isAuthenticated) {
-        setExecSnapshot(null);
-        setExecLoadError(null);
-        setExecLoading(false);
-        return;
-      }
-      const headers = getAuthHeaders();
-      if (!headers) {
-        setExecSnapshot(null);
-        return;
-      }
-      setExecLoading(true);
-      try {
-        const summary = await fetchExecutionWalletSummary(headers);
-        if (cancelled) return;
-        if (cancelled) return;
-        const next = await fetchPortfolioSnapshot(summary.userAgentWalletAddress);
-        if (!cancelled) {
-          setExecSnapshot(next);
-          setExecLoadError(null);
-        }
-      } catch (cause) {
-        if (!cancelled) {
-          setExecSnapshot(null);
-          setExecLoadError(cause instanceof Error ? cause.message : "Execution wallet snapshot failed");
-        }
-      } finally {
-        if (!cancelled) {
-          setExecLoading(false);
-        }
-      }
-    };
-    void loadExec();
-    return () => {
-      cancelled = true;
-    };
-  }, [address, getAuthHeaders, isAuthenticated, session?.token]);
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    const executionAddress = executionSummary?.userAgentWalletAddress;
+    if (!executionAddress) return;
+    void navigator.clipboard.writeText(executionAddress);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
-  const activeSnapshot = execSnapshot;
-  const displayTotalUsd = useMemo(
-    () => portfolioValueUsdExcludingGatewayOnly(execSnapshot),
-    [execSnapshot],
-  );
-  const displayPnl = useMemo(() => pnlSummaryExcludingGateway(execSnapshot), [execSnapshot]);
-  const displayPnlUsd = execSnapshot ? displayPnl.pnlUsd : null;
-  const displayPnlPct = execSnapshot ? displayPnl.pnlPct : null;
-  const displayCostBasisUsd = execSnapshot ? displayPnl.costBasisUsd : null;
+  const [executionSummary, setExecutionSummary] = useState<ExecutionWalletSummary | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [vaultCards, setVaultCards] = useState<VaultHoldingCard[]>([]);
+  const [vaultLoading, setVaultLoading] = useState(false);
+  const [vaultError, setVaultError] = useState<string | null>(null);
+  const [walletSnapshot, setWalletSnapshot] = useState<PortfolioSnapshotResponse | null>(null);
+  const [executionSnapshot, setExecutionSnapshot] = useState<PortfolioSnapshotResponse | null>(null);
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
 
-  const pnlTone = useMemo(() => {
-    if (typeof displayPnlUsd !== "number" || !Number.isFinite(displayPnlUsd)) {
-      return { dot: "bg-white/40", text: "text-white/40" };
-    }
-    if (displayPnlUsd > 0) {
-      return { dot: "bg-emerald-400", text: "text-emerald-400" };
-    }
-    if (displayPnlUsd < 0) {
-      return { dot: "bg-rose-400", text: "text-rose-400" };
-    }
-      return { dot: "bg-white/40", text: "text-white/40" };
-  }, [displayPnlUsd]);
-
-  const vaultPositionCards = useMemo<VaultHoldingCard[]>(() => {
-    const nextCards: VaultHoldingCard[] = [];
-
-    const executionAddress = execSnapshot?.walletAddress;
-    if (executionAddress) {
-      const executionVault = findVaultHolding(execSnapshot.holdings);
-      if (executionVault) {
-        nextCards.push({
-          key: `execution-${executionAddress}`,
-          label: "Agent wallet",
-          walletAddress: executionAddress,
-          balanceFormatted: executionVault.balanceFormatted,
-          symbol: executionVault.symbol || "afvUSDC",
-          usdValue: executionVault.usdValue,
-          readLabel: "Live portfolio snapshot",
-        });
-      }
-    }
-
-    return nextCards;
-  }, [execSnapshot]);
-
-  const vaultPositionLoading = isLoading || execLoading;
-
-  const vaultPositionError = useMemo(() => {
-    if (!address) {
-      return null;
-    }
-    if (error || execLoadError) {
-      return "Some vault positions may be missing because Arc portfolio reads are rate-limited.";
-    }
-    return null;
-  }, [address, error, execLoadError]);
-
-  const holdings = useMemo(() => activeSnapshot?.holdings ?? [], [activeSnapshot]);
-  const positions = useMemo(() => activeSnapshot?.positions ?? [], [activeSnapshot]);
-  const gatewayPosition = useMemo(
-    () => positions.find((position) => position.kind === "gateway_position") ?? null,
-    [positions],
-  );
-  const agentPositions = useMemo(
-    () => positions.filter((position) => position.kind !== "gateway_position"),
-    [positions],
-  );
-  const recentTransactions = useMemo(() => activeSnapshot?.recentTransactions ?? [], [activeSnapshot]);
-  const allocationTotalUsd = useMemo(
-    () => holdings.reduce((sum, h) => sum + (h.usdValue ?? 0), 0),
-    [holdings],
-  );
-  const shareDenomAllocation = allocationTotalUsd > 0 ? allocationTotalUsd : 1;
-  const sortedAllHoldings = useMemo(
-    () => [...holdings].sort((a, b) => (b.usdValue ?? 0) - (a.usdValue ?? 0)),
-    [holdings],
-  );
-  const searchNeedle = assetSearch.trim().toLowerCase();
-  const filteredHoldings = useMemo(() => {
-    if (!searchNeedle) return sortedAllHoldings;
-    return sortedAllHoldings.filter((h) => {
-      const n = (h.name ?? "").toLowerCase();
-      const s = (h.symbol ?? "").toLowerCase();
-      return n.includes(searchNeedle) || s.includes(searchNeedle);
-    });
-  }, [sortedAllHoldings, searchNeedle]);
-  const topHoldings = useMemo(() => filteredHoldings.slice(0, 4), [filteredHoldings]);
-  const chartHoldings = useMemo(() => filteredHoldings.slice(0, 12), [filteredHoldings]);
-
-  const filteredPositions = useMemo(() => {
-    if (!searchNeedle) return agentPositions;
-    return agentPositions.filter((p) => {
-      const n = (p.name ?? "").toLowerCase();
-      const pr = (p.protocol ?? "").toLowerCase();
-      return n.includes(searchNeedle) || pr.includes(searchNeedle);
-    });
-  }, [agentPositions, searchNeedle]);
-  const maxHoldingValue = useMemo(() => {
-    const max = chartHoldings.reduce((highest, item) => Math.max(highest, item.usdValue ?? 0), 0);
-    return max > 0 ? max : 1;
-  }, [chartHoldings]);
-
-  const refreshSnapshot = async () => {
-    if (!address) {
-      openConnectModal?.();
+  const loadExecutionSummary = useCallback(async () => {
+    const authHeaders = getAuthHeaders();
+    if (!address || !isAuthenticated || !authHeaders) {
+      setExecutionSummary(null);
+      setSummaryError(null);
+      setSummaryLoading(false);
       return;
     }
-    setIsLoading(true);
-    setError(null);
+
+    setSummaryLoading(true);
+    setSummaryError(null);
     try {
-      const headers = getAuthHeaders();
-      if (!headers || !isAuthenticated) {
-        setExecSnapshot(null);
-        setExecLoadError("Sign your AgentFlow session to load the Agent wallet portfolio.");
-        return;
-      }
-      setExecLoading(true);
-      try {
-        const summary = await fetchExecutionWalletSummary(headers);
-        setExecSnapshot(await fetchPortfolioSnapshot(summary.userAgentWalletAddress, { force: true }));
-        setExecLoadError(null);
-      } catch (e) {
-        setExecLoadError(e instanceof Error ? e.message : "Execution snapshot failed");
-      } finally {
-        setExecLoading(false);
+      const summary = await fetchExecutionWalletSummary(authHeaders);
+      setExecutionSummary(summary);
+    } catch (cause) {
+      setExecutionSummary(null);
+      setSummaryError(
+        cause instanceof Error ? cause.message : "Could not load DCW balances.",
+      );
+    } finally {
+      setSummaryLoading(false);
+    }
+  }, [address, getAuthHeaders, isAuthenticated]);
+
+  const loadVaultCards = useCallback(async () => {
+    if (!address) {
+      setVaultCards([]);
+      setVaultError(null);
+      setVaultLoading(false);
+      return;
+    }
+    setVaultLoading(true);
+    try {
+      const { cards, error } = await loadVaultHoldingCards(address, getAuthHeaders, isAuthenticated);
+      setVaultCards(cards);
+      setVaultError(error);
+    } finally {
+      setVaultLoading(false);
+    }
+  }, [address, getAuthHeaders, isAuthenticated]);
+
+  useEffect(() => {
+    void loadExecutionSummary();
+  }, [loadExecutionSummary]);
+
+  useEffect(() => {
+    void loadVaultCards();
+  }, [loadVaultCards]);
+
+  const loadPortfolioSnapshots = useCallback(async () => {
+    if (!address) {
+      setWalletSnapshot(null);
+      setExecutionSnapshot(null);
+      setSnapshotError(null);
+      setSnapshotLoading(false);
+      return;
+    }
+
+    setSnapshotLoading(true);
+    setSnapshotError(null);
+
+    try {
+      const wallet = await fetchPortfolioSnapshot(address);
+      setWalletSnapshot(wallet);
+
+      const executionAddressCandidate = executionSummary?.userAgentWalletAddress;
+      if (
+        executionAddressCandidate &&
+        executionAddressCandidate.toLowerCase() !== address.toLowerCase()
+      ) {
+        const execution = await fetchPortfolioSnapshot(executionAddressCandidate);
+        setExecutionSnapshot(execution);
+      } else {
+        setExecutionSnapshot(null);
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Portfolio snapshot failed");
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const latestActivities = recentTransactions;
-  const localTimeHint = useMemo(() => getLocalTimeHint(), []);
-
-  const compactSummary = useMemo((): string | null => {
-    const parts: string[] = [];
-    if (typeof displayTotalUsd === "number" && Number.isFinite(displayTotalUsd)) {
-      parts.push(`Total: ${formatUsd(displayTotalUsd)}`);
-    }
-    for (const h of sortedAllHoldings.slice(0, 3)) {
-      if ((h.symbol ?? h.name) && typeof h.usdValue === "number") {
-        parts.push(`${h.symbol ?? h.name}: ${formatUsd(h.usdValue)}`);
-      }
-    }
-    if (typeof displayPnlUsd === "number" && Number.isFinite(displayPnlUsd)) {
-      const pctStr =
-        typeof displayPnlPct === "number" && Number.isFinite(displayPnlPct)
-          ? ` (${formatPct(displayPnlPct)})`
-          : "";
-      parts.push(
-        `PnL: ${displayPnlUsd >= 0 ? "+" : ""}${formatUsd(Math.abs(displayPnlUsd))}${pctStr}`,
+      setSnapshotError(
+        cause instanceof Error ? cause.message : "Could not load portfolio holdings.",
       );
+    } finally {
+      setSnapshotLoading(false);
     }
-    return parts.length > 0 ? parts.join(", ") : null;
-  }, [displayTotalUsd, displayPnlUsd, displayPnlPct, sortedAllHoldings]);
+  }, [address, executionSummary?.userAgentWalletAddress]);
 
-  const openPortfolioChat = () => {
-    const activeWalletTab = "dcw";
-    const focusLabel = "agent wallet (DCW)";
-    const message = encodeURIComponent(
-      `Review my ${focusLabel}, explain the biggest risks, and suggest next steps.`,
-    );
-    const ctx = compactSummary ? encodeURIComponent(compactSummary) : "";
-    const params = new URLSearchParams({
-      tab: "Portfolio",
-      walletTab: activeWalletTab,
-      message,
-    });
-    if (ctx) {
-      params.set("context", ctx);
-    }
-    params.set("executionTarget", "DCW");
-    router.push(`/chat?${params.toString()}`);
-  };
+  useEffect(() => {
+    void loadPortfolioSnapshots();
+  }, [loadPortfolioSnapshots]);
 
-  const scrollToAllocation = () => {
-    if (typeof document !== "undefined") {
-      requestAnimationFrame(() => {
-        document.getElementById("portfolio-allocation-section")?.scrollIntoView({
-          behavior: "smooth",
-          block: "start",
-        });
-      });
-    }
-  };
+  const executionAddress = executionSummary?.userAgentWalletAddress ?? null;
+  const dcwBalance = executionSummary?.balances.usdc.formatted ?? "0";
+  const gatewayReserve = executionSummary?.balances.gatewayUsdc.formatted ?? "0";
+  const summaryVaultShares = executionSummary?.balances.vaultShares.formatted ?? "0";
+  const totalVaultUsd = vaultCards.reduce((sum, card) => sum + (card.usdValue ?? 0), 0);
+  const vaultBalancesBySymbol = vaultCards.reduce<Record<string, number>>((acc, card) => {
+    const key = card.displaySymbol || card.symbol || "VAULT";
+    acc[key] = (acc[key] ?? 0) + parseNumeric(card.balanceFormatted);
+    return acc;
+  }, {});
+  const vaultSymbols = Object.keys(vaultBalancesBySymbol);
+  const hasMixedVaultAssets = vaultSymbols.length > 1;
+  const primaryVaultSymbol = vaultSymbols[0] ?? "USDC";
+  const primaryVaultBalance = vaultBalancesBySymbol[primaryVaultSymbol] ?? parseNumeric(summaryVaultShares);
+  const vaultHeadlineValue =
+    hasMixedVaultAssets && totalVaultUsd > 0
+      ? formatUsd(totalVaultUsd)
+      : formatAmount(primaryVaultBalance);
+  const vaultSourceAddresses =
+    vaultCards.length > 0
+      ? vaultCards.map((card) => shortenAddress(card.walletAddress)).join(" / ")
+      : "Waiting for live wallet data";
+  const vaultTokenLabel = hasMixedVaultAssets ? "TOTAL VALUE" : primaryVaultSymbol;
+  const vaultBalanceBreakdown =
+    vaultSymbols.length > 0
+      ? vaultSymbols
+          .map((symbol) => `${formatAmount(vaultBalancesBySymbol[symbol])} ${symbol}`)
+          .join(" / ")
+      : "No live vault balances detected";
+  const dcwHoldings = (executionSnapshot?.holdings ?? [])
+    .filter((holding) => (holding.usdValue ?? 0) > 0)
+    .sort((a, b) => (b.usdValue ?? 0) - (a.usdValue ?? 0));
+  const dcwHoldingsTotalUsd = dcwHoldings.reduce((sum, holding) => sum + (holding.usdValue ?? 0), 0);
+  const combinedPositions = mergeCombinedPositions(null, executionSnapshot);
+  const predictionPositions = combinedPositions.filter(
+    (position) => (position.kind as string) === "prediction_market",
+  );
+  const pnlMetrics = combinedPortfolioMetrics(walletSnapshot, executionSnapshot);
+  const dcwHoldingRows = dcwHoldings.slice(0, 6);
+  const summaryCards = [
+    {
+      key: "dcw",
+      label: "DCW",
+      title: "Primary wallet",
+      value: summaryLoading ? "..." : formatAmount(dcwBalance),
+      unit: "USDC",
+      icon: "account_balance_wallet",
+      accent: true,
+    },
+    {
+      key: "vault",
+      label: "Vault",
+      title: "Vault assets",
+      value: summaryLoading && vaultLoading ? "..." : vaultHeadlineValue,
+      unit: vaultTokenLabel,
+      icon: "savings",
+      accent: false,
+    },
+    {
+      key: "gateway",
+      label: "Gateway",
+      title: "Reserved funds",
+      value: summaryLoading ? "..." : formatAmount(gatewayReserve),
+      unit: "USDC",
+      icon: "hub",
+      accent: false,
+    },
+  ] as const;
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#131313] font-body text-[#e5e2e1]">
+    <div className="flex h-screen overflow-hidden bg-[#070707] text-[#e9e6df]">
       <AppSidebar collapsed={isCollapsed} onToggleCollapse={toggleSidebar} />
-      {/* Main content */}
-      <main className="flex flex-1 flex-col overflow-hidden bg-[#131313]">
-        <ChatTopNavbar
-          actions={(
-            <SessionStatusChip
-              address={isAuthenticated ? execSnapshot?.walletAddress ?? address : address}
-              isAuthenticated={isAuthenticated}
-              isLoading={false}
-              onAction={() => {
-                if (!address) { openConnectModal?.(); return; }
-                if (!isAuthenticated) void signIn().catch(() => {});
-              }}
-              compact
-            />
-          )}
-        />
-        {/* Scrollable content */}
-        <div className="flex-1 overflow-y-auto px-12 py-8">
-          <section className="mb-8 flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
-            <div>
-              <h1 className="font-headline text-5xl italic tracking-tight text-[#f2ca50]">Portfolio</h1>
-              <p className="mt-3 max-w-2xl text-sm leading-relaxed text-white/40">
-                Track your Agent wallet, Gateway reserve, vault exposure, and recent activity in one place.
-              </p>
-            </div>
-            <div className="flex flex-col gap-4 xl:items-end">
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="rounded-full bg-[#f2ca50] px-4 py-1.5 text-[10px] font-bold uppercase tracking-widest text-[#3c2f00]">
-                  Agent wallet view
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="flex items-center gap-4 rounded-full border border-white/5 bg-[#1c1b1b] px-4 py-2">
-                  <span className="material-symbols-outlined icon-standard text-white/40">search</span>
-                  <input
-                    value={assetSearch}
-                    onChange={(e) => setAssetSearch(e.target.value)}
-                    className="w-48 bg-transparent border-none focus:ring-0 text-sm text-[#e5e2e1] placeholder:text-white/30 outline-none"
-                    placeholder="Search assets..."
-                    type="search"
-                  />
-                </div>
-                <button
-                  type="button"
-                  onClick={() => { void refreshSnapshot(); }}
-                  disabled={isLoading}
-                  className="rounded-full border border-white/10 px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-white/50 transition hover:border-[#f2ca50]/40 hover:text-[#f2ca50] disabled:opacity-50"
-                >
-                  {isLoading ? "Refreshing" : "Refresh"}
-                </button>
-              </div>
-            </div>
-          </section>
 
-          {execLoadError ? (
-            <div className="mb-6 rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-              {execLoadError}
-            </div>
-          ) : null}
+      <div className="flex flex-1 flex-col overflow-hidden">
+        <header className="sticky top-0 z-40 flex items-center justify-between border-b border-white/5 bg-[#070707]/92 px-8 py-5 backdrop-blur-md xl:px-10">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-black uppercase tracking-[0.25em] text-[#f2ca50]">DApp</span>
+            <span className="text-[10px] font-bold text-white/20">/</span>
+            <span className="text-[10px] font-black uppercase tracking-[0.25em] text-white/80">Portfolio</span>
+          </div>
+          <SessionStatusChip
+            address={address}
+            isAuthenticated={isAuthenticated}
+            isLoading={authLoading}
+            error={authError}
+            onAction={() => {
+              if (!address) {
+                openConnectModal?.();
+                return;
+              }
+              if (!isAuthenticated) {
+                void signIn().catch(() => {});
+              }
+            }}
+          />
+        </header>
 
-          <section className="mb-6 rounded-xl border border-white/5 bg-[#1c1b1b] px-6 py-4">
-            <div className="max-w-3xl">
-                <p className="font-label text-[10px] uppercase tracking-[0.18em] text-white/40">
-                  Agent wallet
+        <main className="flex-1 overflow-y-auto px-8 pb-16 pt-8 xl:px-10 relative">
+          <div className={`mx-auto max-w-[1320px] transition-all duration-500 ${!address || !isAuthenticated ? "blur-[6px] pointer-events-none opacity-25" : ""}`}>
+            
+            {/* Title Block */}
+            <div className="mb-6 flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+              <div>
+                <p className="mb-2 text-[9px] font-black uppercase tracking-[0.38em] text-white/30">
+                  Wallet / Portfolio
                 </p>
-                <ul className="mt-2 space-y-2 text-sm leading-relaxed text-white/78">
-                  <li>
-                    <span className="font-semibold text-[#e5e2e1]">Agent wallet</span>
-                    {" - "}
-                    Circle DCW used for DeFi execution in chat after preview and confirmation.
-                  </li>
-                  <li>
-                    <span className="font-semibold text-[#e5e2e1]">Funding wallet</span>
-                    {" - "}
-                    your connected wallet is used only to fund AgentFlow and sign your session.
-                  </li>
-                </ul>
-            </div>
-          </section>
-
-          {/* Hero — Total Portfolio Value */}
-          <section className="relative mb-10 overflow-hidden rounded-xl bg-[#0e0e0e] p-10">
-            <div className="pointer-events-none absolute inset-y-0 right-0 w-1/2 opacity-20">
-              <div className="h-full w-full bg-gradient-to-l from-[#f2ca50]/20 to-transparent blur-3xl" />
-            </div>
-            <div className="relative z-10">
-              <div className="mb-2 flex items-center gap-3">
-                <span className="font-label uppercase tracking-[0.25em] text-white/40 text-[10px] font-bold">
-                  Total portfolio value
-                </span>
-                <div className="h-px w-12 bg-[#4d4635]/30" />
+                <h1 className="font-headline text-[clamp(2.5rem,5vw,4rem)] font-black italic leading-[0.92] tracking-[-0.04em] text-white">
+                  PORT<span className="text-[#f2ca50]">FOLIO</span>
+                </h1>
               </div>
-              <div className="flex items-baseline gap-6">
-                <h2 className="font-headline text-7xl font-bold text-[#e5e2e1] tracking-tight leading-none">
-                  {!address
-                    ? "Connect wallet"
-                    : !execSnapshot && (isLoading || execLoading)
-                      ? "Loading..."
-                      : formatUsd(displayTotalUsd)}
-                </h2>
-                {typeof displayPnlPct === "number" && Number.isFinite(displayPnlPct) ? (
-                  <div className="flex items-center gap-2 rounded-full border border-[#f2ca50]/20 bg-[#f2ca50]/10 px-3 py-1">
-                    <span className="material-symbols-outlined icon-standard text-[#f2ca50] text-sm">
-                      {(displayPnlUsd ?? 0) >= 0 ? "trending_up" : "trending_down"}
-                    </span>
-                    <span className={`font-label font-bold text-xs uppercase tracking-wider ${pnlTone.text}`}>
-                      {formatPct(displayPnlPct)}
+            </div>
+
+            {/* Net Worth Hero Display */}
+            <div className="mb-6 flex flex-col gap-3 rounded-[24px] border border-white/5 bg-gradient-to-r from-[#171512] to-[#0c0c0c] px-6 py-5 shadow-2xl relative overflow-hidden">
+              <div className="absolute right-0 top-0 h-full w-1/3 bg-[radial-gradient(circle_at_top_right,rgba(242,202,80,0.06),transparent_70%)] pointer-events-none" />
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="material-symbols-outlined text-[18px] text-[#f2ca50]/80">account_balance</span>
+                    <p className="text-[10px] font-black uppercase tracking-[0.25em] text-[#f2ca50]">Net Worth</p>
+                  </div>
+                  <div className="mt-3 flex flex-wrap items-center gap-3">
+                    <h2 className="font-headline text-[clamp(1.8rem,3vw,2.8rem)] font-black text-white leading-none">
+                    {snapshotLoading ? "..." : formatUsd(pnlMetrics.totalValueUsd)}
+                    </h2>
+                    <span className={`text-[11px] font-black uppercase tracking-[0.12em] px-3 py-1 rounded-full border ${
+                      pnlMetrics.netPnlUsd >= 0
+                        ? 'text-[#f2ca50] border-[#f2ca50]/20 bg-[#f2ca50]/5'
+                        : 'text-white/60 border-white/10 bg-white/5'
+                    }`}>
+                      {snapshotLoading ? "..." : `${formatSignedUsd(pnlMetrics.netPnlUsd)} (${formatPct(pnlMetrics.pnlPct)})`}
                     </span>
                   </div>
-                ) : null}
-              </div>
-              <p className="mt-4 font-body text-sm text-white/40 max-w-md leading-relaxed">
-                {!address
-                  ? "Connect your wallet to load your live Arc holdings and portfolio analytics."
-                  : `Net PnL: ${formatSignedUsd(displayPnlUsd)} · Cost basis: ${formatUsd(displayCostBasisUsd)}`}
-              </p>
-              <div className="mt-8 flex flex-wrap items-center gap-4">
-                <button
-                  type="button"
-                  onClick={openPortfolioChat}
-                  className="gold-shimmer px-10 py-3 rounded-md text-[#3c2f00] font-label font-extrabold uppercase tracking-[0.2em] text-[11px] shadow-lg shadow-[#f2ca50]/20 hover:scale-[1.02] hover:shadow-[#f2ca50]/40 transition-all duration-300 cursor-pointer"
-                >
-                  Open in chat
-                </button>
-                <button
-                  type="button"
-                  onClick={scrollToAllocation}
-                  className="px-8 py-3 border border-[#4d4635]/30 rounded-md text-[#e5e2e1] font-label font-bold uppercase tracking-widest text-[11px] hover:bg-[#3a3939] transition-colors"
-                >
-                  See holdings
-                </button>
+                </div>
+                <span className="mt-1 h-2.5 w-2.5 rounded-full bg-white/20" />
               </div>
             </div>
-          </section>
 
-          {/* Vault share positions */}
-          <section className="mb-10 rounded-xl border border-white/5 bg-[#1c1b1b] p-8">
-            <p className="font-label text-[10px] font-black uppercase tracking-[0.2em] text-[#f2ca50]">
-              Vault Position
-            </p>
-            <h2 className="font-headline mt-2 text-2xl text-[#e5e2e1]">Vault shares</h2>
-            <p className="mt-2 max-w-2xl text-sm leading-relaxed text-white/45">
-              Live vault share balances for your Agent wallet, alongside token holdings below.
-            </p>
-            {vaultPositionLoading ? (
-              <div className="mt-8 rounded-xl border border-white/5 bg-black/20 px-6 py-5 text-sm text-white/45">
-                Reading live vault balances...
+            {summaryError ? (
+              <div className="mb-6 rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+                {summaryError}
               </div>
-            ) : vaultPositionCards.length > 0 ? (
-              <div className="mt-8 grid gap-4 md:grid-cols-2">
-                {vaultPositionCards.map((holding) => (
+            ) : null}
+            {authError ? (
+              <div className="mb-6 rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+                {authError}
+              </div>
+            ) : null}
+            {snapshotError ? (
+              <div className="mb-6 rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+                {snapshotError}
+              </div>
+            ) : null}
+
+            <section className="overflow-hidden rounded-[28px] border border-white/8 bg-[radial-gradient(circle_at_top_left,rgba(242,202,80,0.08),transparent_24%),linear-gradient(180deg,#121212_0%,#0c0c0c_100%)] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] transition-all duration-300 hover:border-white/12">
+              <div className="grid gap-3 lg:grid-cols-[1.15fr_0.95fr_0.95fr]">
+                {summaryCards.map((card) => (
                   <article
-                    key={holding.key}
-                    className="rounded-xl border border-white/5 bg-black/20 p-6"
+                    key={card.key}
+                    className={`relative overflow-hidden rounded-[24px] border px-5 py-4 ${
+                      card.accent
+                        ? "border-[#f2ca50]/20 bg-[linear-gradient(135deg,rgba(242,202,80,0.12),rgba(242,202,80,0.02)_36%,rgba(255,255,255,0.01)_100%)]"
+                        : "border-white/6 bg-[linear-gradient(180deg,rgba(255,255,255,0.025),rgba(255,255,255,0.01))]"
+                    }`}
                   >
+                    <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-white/0 via-white/12 to-white/0" />
                     <div className="flex items-start justify-between gap-4">
-                      <div>
-                        <p className="font-label text-[10px] uppercase tracking-[0.18em] text-[#f2ca50]">
-                          {holding.label}
-                        </p>
-                        <p className="mt-2 text-sm font-medium text-[#e5e2e1]">
-                          {shortenAddress(holding.walletAddress)}
-                        </p>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-3">
+                          <span
+                            className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border ${
+                              card.accent
+                                ? "border-[#f2ca50]/25 bg-[#f2ca50]/10 text-[#f2ca50]"
+                                : "border-white/10 bg-white/[0.03] text-white/80"
+                            }`}
+                          >
+                            <span className="material-symbols-outlined text-[20px] leading-none">{card.icon}</span>
+                          </span>
+                          <div>
+                            <p className="text-[9px] font-black uppercase tracking-[0.32em] text-[#f2ca50]">{card.label}</p>
+                            <h2 className="mt-1 text-[0.95rem] font-semibold text-white/88">{card.title}</h2>
+                          </div>
+                        </div>
                       </div>
-                      <span className="rounded bg-emerald-500/10 px-3 py-1 font-label text-[9px] font-bold uppercase tracking-widest text-emerald-300">
-                        Live
-                      </span>
+                      <span className={`mt-1 h-2.5 w-2.5 rounded-full ${card.accent ? "bg-[#f2ca50]/70" : "bg-white/20"}`} />
                     </div>
-                    <div className="mt-6 grid grid-cols-3 gap-3">
-                      <div className="rounded-lg border border-white/5 bg-[#141414] px-4 py-3">
-                        <p className="font-label text-[9px] uppercase tracking-[0.16em] text-white/35">
-                          Shares
-                        </p>
-                        <p className="mt-2 text-sm font-semibold text-[#e5e2e1]">
-                          {formatVaultShares(holding.balanceFormatted)} {holding.symbol}
-                        </p>
-                      </div>
-                      <div className="rounded-lg border border-white/5 bg-[#141414] px-4 py-3">
-                        <p className="font-label text-[9px] uppercase tracking-[0.16em] text-white/35">
-                          Est. value
-                        </p>
-                        <p className="mt-2 text-sm font-semibold text-[#e5e2e1]">
-                          {holding.usdValue == null ? "N/A" : formatUsd(holding.usdValue)}
-                        </p>
-                      </div>
-                      <div className="rounded-lg border border-white/5 bg-[#141414] px-4 py-3">
-                        <p className="font-label text-[9px] uppercase tracking-[0.16em] text-white/35">
-                          Read
-                        </p>
-                        <p className="mt-2 text-sm font-semibold text-[#e5e2e1]">{holding.readLabel}</p>
-                      </div>
+
+                    <div className="mt-7 flex items-end justify-between gap-4">
+                      <p
+                        className={`min-w-0 truncate text-[clamp(1.55rem,1.9vw,2.15rem)] font-semibold leading-none tracking-[-0.035em] tabular-nums ${
+                          card.accent ? "text-[#f2ca50]" : "text-white"
+                        }`}
+                      >
+                        {card.value}
+                      </p>
+                      <span
+                        className={`shrink-0 rounded-full border px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.2em] ${
+                          card.accent
+                            ? "border-[#f2ca50]/20 bg-[#f2ca50]/8 text-[#f2ca50]/85"
+                            : "border-white/10 bg-white/[0.03] text-white/50"
+                        }`}
+                      >
+                        {card.unit}
+                      </span>
                     </div>
                   </article>
                 ))}
               </div>
-            ) : (
-              <div className="mt-8 rounded-xl border border-white/5 bg-black/20 px-6 py-5 text-sm text-white/45">
-                {vaultPositionError ??
-                  (!address
-                    ? "Connect your wallet to see vault positions."
-                    : "No vault shares were detected in your Agent wallet.")}
-              </div>
-            )}
-          </section>
+            </section>
 
-          <div className="mb-4">
-            <p className="font-label text-[10px] uppercase tracking-[0.18em] text-white/40">Your Holdings</p>
-            <h2 className="font-headline mt-1 text-2xl font-bold text-[#e5e2e1]">Allocation &amp; activity</h2>
-          </div>
-
-          {/* Lower grid: Allocation + Activity */}
-          <div id="portfolio-allocation-section" className="grid grid-cols-12 gap-8">
-            {/* Allocation Surface */}
-            <div className="col-span-12 rounded-xl bg-[#1c1b1b] p-10 lg:col-span-5">
-              <div className="mb-6 flex items-center justify-between">
-                <h4 className="font-headline text-xl font-bold">Allocation</h4>
-                <p className="font-label text-[10px] uppercase tracking-[0.18em] text-white/40">
-                  Live holdings
-                </p>
-              </div>
-              <div className="relative min-h-[5rem] rounded-xl border border-white/5 bg-black/30 px-2 py-2">
-                {execLoading ? (
-                  <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-black/80 font-label text-xs text-white/50">
-                    Loading agent wallet...
-                  </div>
-                ) : null}
-                <AllocationSparklines
-                  holdings={chartHoldings}
-                  maxUsd={maxHoldingValue}
-                  shareDenom={shareDenomAllocation}
-                  totalTokenCount={filteredHoldings.length}
-                  emptySlots={5}
+            {/* 3-Column Reserves Row */}
+            <section className="hidden grid gap-5 grid-cols-1 lg:grid-cols-3">
+              <div className="h-full">
+                <MetricCard
+                  label="DCW"
+                  title="DCW balance"
+                  value={summaryLoading ? "..." : formatAmount(dcwBalance)}
+                  unit="USDC"
+                  accent
+                  detail="Spendable USDC available in your dedicated chat wallet."
+                  supporting={
+                    <div className="rounded-2xl border border-white/5 bg-black/16 px-4 py-3 relative group/address">
+                      <div className="flex items-center justify-between">
+                        <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-[#f2ca50]/70">
+                          Address
+                        </p>
+                        {executionAddress && (
+                          <button
+                            type="button"
+                            onClick={handleCopy}
+                            className="text-[9px] font-bold uppercase tracking-wider text-white/40 hover:text-[#f2ca50] transition flex items-center gap-1"
+                          >
+                            {copied ? (
+                              <span className="text-[#f2ca50] animate-pulse">✓ Copied</span>
+                            ) : (
+                              <>
+                                <span className="material-symbols-outlined text-[10px] leading-none">content_copy</span>
+                                <span>Copy</span>
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                      <p className="mt-1.5 break-all font-mono text-[11px] text-white/80 select-all">
+                        {executionAddress ? shortenAddress(executionAddress) : "Sign session to load"}
+                      </p>
+                    </div>
+                  }
                 />
               </div>
-              {topHoldings.length > 0 ? (
-                <p className="mt-6 text-xs leading-relaxed text-white/45">
-                  {topHoldings.length > 0 && (topHoldings[0]?.symbol?.toUpperCase() === "USDC" || topHoldings[0]?.name?.toLowerCase().includes("usdc"))
-                    ? "Mostly stablecoin exposure, with a smaller EURC sleeve and vault allocation."
-                    : "Current allocation is shown by live Agent wallet balances and vault holdings."}
-                </p>
-              ) : null}
-              {!isLoading && chartHoldings.length === 0 ? (
-                <p className="mt-8 font-body text-sm text-white/40">
-                  {!address
-                    ? "Connect wallet to load holdings."
-                    : searchNeedle
-                      ? "No holdings match your search."
-                      : "No holdings found for this wallet."}
-                </p>
-              ) : null}
-            </div>
 
-            {/* Recent Activity */}
-            <div className="col-span-12 rounded-xl bg-[#1c1b1b] p-10 lg:col-span-7">
-              <div className="mb-10 flex items-center justify-between">
-                <h4 className="font-headline text-xl font-bold">Recent Activity</h4>
+              <div className="h-full">
+                <MetricCard
+                  label="Vault"
+                  title="Vault balance"
+                  value={summaryLoading && vaultLoading ? "..." : vaultHeadlineValue}
+                  unit={vaultTokenLabel}
+                  detail=""
+                />
               </div>
-              <div className="space-y-2">
-                {latestActivities.length === 0 && !isLoading ? (
-                  <div className="rounded-xl border border-white/5 bg-black/30 p-6 font-body text-sm text-white/40">
-                    {!address
-                      ? "Connect your wallet to see activity."
-                      : "No recent transactions found yet for the Agent wallet."}
+
+              <div className="h-full">
+                <MetricCard
+                  label="Gateway"
+                  title="Gateway reserve"
+                  value={summaryLoading ? "..." : formatAmount(gatewayReserve)}
+                  unit="USDC"
+                  detail=""
+                />
+              </div>
+            </section>
+
+            {/* Holdings & Sidebar Positions Section */}
+            <section className="mt-6 grid gap-5 xl:grid-cols-12">
+              
+              {/* Asset Allocation Table (Combined Holdings & PnL) */}
+              <article className="relative overflow-hidden rounded-[28px] border border-white/5 bg-gradient-to-b from-[#131313] to-[#0d0d0d] p-6 xl:col-span-8 transition-all duration-300 hover:border-white/10">
+                <p className="text-[9px] font-black uppercase tracking-[0.28em] text-[#f2ca50]">Holdings & Performance</p>
+                <div className="mt-4 flex items-end justify-between gap-4 border-b border-white/5 pb-4">
+                  <h2 className="font-headline text-[1.6rem] font-bold text-white">Asset Allocation</h2>
+                  <div className="text-right">
+                    <p className="text-[10px] uppercase tracking-[0.18em] text-white/35">Portfolio value</p>
+                    <p className="mt-0.5 font-headline text-xl font-black text-white">
+                      {snapshotLoading ? "..." : formatUsd(dcwHoldingsTotalUsd)}
+                    </p>
                   </div>
-                ) : null}
-                {latestActivities.slice(0, 6).map((activity) => {
-                  const meta = extractRecentActivityMeta(activity, execSnapshot?.walletAddress ?? address);
-                  return (
-                    <div
-                      key={activity.hash}
-                      className="group flex cursor-default items-center justify-between rounded-xl px-4 py-4 hover:bg-white/5 transition-colors duration-300"
-                    >
-                      <div className="flex items-center gap-6">
-                        <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-[#201f1f] text-white/40 group-hover:bg-[#f2ca50] group-hover:text-[#3c2f00] transition-all duration-500">
-                          <ActivityFeedIcon kind={meta.kind} direction={meta.transferDirection} />
+                </div>
+
+                <div className="mt-6 space-y-4">
+                  {/* Table Headers */}
+                  <div className="grid grid-cols-12 gap-4 text-[9px] font-black uppercase tracking-wider text-white/30 border-b border-white/5 pb-2">
+                    <div className="col-span-3">Asset</div>
+                    <div className="col-span-4 text-center">Allocation Trend</div>
+                    <div className="col-span-2 text-right">Weight</div>
+                    <div className="col-span-3 text-right">Balance & Value</div>
+                  </div>
+
+                  {/* Table Rows */}
+                  {dcwHoldingRows.length > 0 ? (
+                    dcwHoldingRows.map((holding, index) => {
+                      const max = Math.max(...dcwHoldings.map((h) => h.usdValue ?? 0), 1);
+                      const shareDenom = Math.max(dcwHoldingsTotalUsd, 1);
+                      const usd = holding.usdValue ?? 0;
+                      const amp = usd / max;
+                      const pct = shareDenom > 0 ? Math.max(1, Math.round((usd / shareDenom) * 100)) : 0;
+                      const stroke = strokeForHolding(holding.symbol, index);
+                      const series = sparkSeries(holding.id, 28, 28, amp);
+
+                      return (
+                        <div
+                          key={holding.id}
+                          className="grid grid-cols-12 gap-4 items-center border-b border-white/5 py-3 last:border-b-0 last:pb-0"
+                        >
+                          {/* Col 1: Asset */}
+                          <div className="col-span-3 flex items-center gap-3">
+                            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[#f2ca50]/20 bg-gradient-to-b from-white/[0.08] to-transparent text-[10px] font-black text-[#f2ca50] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+                              {holding.symbol.substring(0, 2).toUpperCase()}
+                            </div>
+                            <div className="truncate">
+                              <p className="text-sm font-semibold text-white leading-none truncate">{holding.symbol}</p>
+                              <p className="text-[10px] text-white/35 mt-1 font-medium truncate">{holding.name}</p>
+                            </div>
+                          </div>
+
+                          {/* Col 2: Sparkline Chart */}
+                          <div className="col-span-4 h-[28px] relative opacity-90">
+                            <ResponsiveContainer width="100%" height={28}>
+                              <LineChart data={series} margin={{ top: 1, right: 2, left: 2, bottom: 1 }}>
+                                <XAxis dataKey="i" type="number" domain={[0, 28]} hide allowDataOverflow />
+                                <YAxis domain={[0, 28]} hide allowDataOverflow />
+                                <Line
+                                  type="linear"
+                                  dataKey="y"
+                                  stroke={stroke}
+                                  strokeWidth={1.25}
+                                  dot={false}
+                                  isAnimationActive={false}
+                                />
+                              </LineChart>
+                            </ResponsiveContainer>
+                          </div>
+
+                          {/* Col 3: Weight */}
+                          <div className="col-span-2 text-right">
+                            <p className="text-sm font-semibold text-white leading-none">{pct}%</p>
+                            <p className="text-[9px] text-white/35 mt-1 uppercase tracking-wider font-semibold">Weight</p>
+                          </div>
+
+                          {/* Col 4: Value & PnL */}
+                          <div className="col-span-3 text-right">
+                            <p className="text-sm font-black text-white leading-none">
+                              {formatAmount(holding.balanceFormatted)} {holding.symbol}
+                            </p>
+                            <p className="text-[10px] text-white/45 mt-1 truncate">{formatUsd(holding.usdValue ?? 0)}</p>
+                          </div>
                         </div>
-                        <div>
-                          <p className="font-label font-bold text-[#e5e2e1] text-sm">{meta.title}</p>
-                          <p className="font-body text-xs text-white/40 mt-1">
-                            {meta.counterparty ? `${meta.counterparty} · ` : ""}
-                            {formatTimestamp(activity.timestamp)}
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+                      );
+                    })
+                  ) : (
+                    <p className="text-sm text-white/45 py-4">
+                      {snapshotLoading ? "Loading holdings..." : "No token holdings available yet."}
+                    </p>
+                  )}
+                </div>
+              </article>
+
+              {/* Stacked Positions Sidebar (col-span-4) */}
+              <article className="relative overflow-hidden rounded-[28px] border border-white/5 bg-gradient-to-b from-[#131313] to-[#0d0d0d] p-6 xl:col-span-4 transition-all duration-300 hover:border-white/10 flex flex-col">
+                <p className="text-[9px] font-black uppercase tracking-[0.28em] text-[#f2ca50]">Positions</p>
+                <div className="mt-4 border-b border-white/5 pb-4 mb-5">
+                  <h2 className="font-headline text-[1.6rem] font-bold text-white leading-none">Active Positions</h2>
+                </div>
+                <div className="space-y-3 flex-1 overflow-y-auto max-h-[420px] pr-1">
+                  {predictionPositions.length > 0 ? (
+                    predictionPositions.map((position) => (
+                      <PredictionMarketCard key={position.id} position={position} />
+                    ))
+                  ) : (
+                    <p className="text-sm text-white/45 py-4">
+                      {snapshotLoading ? "Loading market positions..." : "No active positions detected."}
+                    </p>
+                  )}
+                </div>
+              </article>
+
+            </section>
           </div>
 
-          {/* Positions */}
-          {gatewayPosition ? (
-            <section className="mt-8 overflow-hidden rounded-xl border border-white/5 bg-[#1c1b1b]">
-              <div className="flex items-center justify-between border-b border-white/5 p-8">
-                <div>
-                  <h3 className="font-headline text-xl font-bold">Gateway Reserve</h3>
-                  <p className="mt-1 text-sm text-white/40">
-                    USDC set aside for x402 and agent-to-agent nanopayments.
-                  </p>
+          {/* Connected / Authenticated Onboarding Screen */}
+          {(!address || !isAuthenticated) && (
+            <div className="absolute inset-0 z-30 flex items-center justify-center p-8 bg-black/40 backdrop-blur-[2px]">
+              <div className="w-full max-w-[480px] rounded-[32px] border border-[#f2ca50]/20 bg-[#0e0e0e]/95 p-8 shadow-[0_20px_50px_rgba(242,202,80,0.06)] backdrop-blur-xl text-center">
+                <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-full border border-[#f2ca50]/20 bg-gradient-to-b from-[#f2ca50]/10 to-transparent text-[#f2ca50]">
+                  <span className="material-symbols-outlined text-3xl">account_balance_wallet</span>
                 </div>
-                <span className="w-fit rounded-full border border-[#f2ca50]/35 bg-[#f2ca50]/10 px-3 py-1 font-label text-[10px] font-black tracking-[0.14em] text-[#f2ca50]">
-                  Live
-                </span>
+                <h2 className="font-headline text-2xl font-black italic tracking-wide text-white uppercase">
+                  Access Your <span className="text-[#f2ca50]">Portfolio</span>
+                </h2>
+                <p className="mt-3 text-sm leading-relaxed text-white/60">
+                  {!address
+                    ? "Connect your Web3 wallet to load execution balances, active vaults, reserves, and positions."
+                    : "Sign your session to authorize portfolio reads and view live execution data."}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!address) {
+                      openConnectModal?.();
+                      return;
+                    }
+                    if (!isAuthenticated) {
+                      void signIn().catch(() => {});
+                    }
+                  }}
+                  className="mt-8 w-full rounded-full border border-[#f2ca50]/30 bg-gradient-to-r from-[#f2ca50] to-[#f2ca50]/80 py-3.5 text-sm font-black uppercase tracking-wider text-black transition-all duration-300 hover:brightness-110 hover:shadow-[0_0_25px_rgba(242,202,80,0.2)]"
+                >
+                  {!address ? "Connect Wallet" : "Sign Session"}
+                </button>
               </div>
-              <div className="grid gap-3 p-6 md:grid-cols-3">
-                <div className="rounded-xl border border-white/5 bg-black/30 px-5 py-4">
-                  <p className="font-label text-[10px] uppercase tracking-[0.16em] text-white/40">Current Balance</p>
-                  <p className="mt-2 font-mono text-lg font-bold text-[#e5e2e1]">
-                    {gatewayPosition.amountFormatted}
-                  </p>
-                </div>
-                <div className="rounded-xl border border-white/5 bg-black/30 px-5 py-4">
-                  <p className="font-label text-[10px] uppercase tracking-[0.16em] text-white/40">Reserve Value</p>
-                  <p className="mt-2 font-mono text-lg font-bold text-[#e5e2e1]">
-                    {formatUsd(gatewayPosition.usdValue)}
-                  </p>
-                </div>
-                <div className="rounded-xl border border-white/5 bg-black/30 px-5 py-4">
-                  <p className="font-label text-[10px] uppercase tracking-[0.16em] text-white/40">Reserve Notes</p>
-                  <p className="mt-2 text-sm text-white/65">
-                    {gatewayPosition.notes.find(Boolean) ?? "Use this reserve for x402, A2A, and Gateway-backed payments."}
-                  </p>
-                </div>
-              </div>
-            </section>
-          ) : null}
-
-          {agentPositions.length > 0 ? (
-            <section className="mt-8 overflow-hidden rounded-xl border border-white/5 bg-[#1c1b1b]">
-              <div className="flex items-center justify-between border-b border-white/5 p-8">
-                <h3 className="font-headline text-xl font-bold">Agent Positions</h3>
-                <Link href="/agents" className="font-label text-[10px] font-bold uppercase tracking-[0.14em] text-[#f2ca50] hover:underline transition">
-                  Browse agents
-                </Link>
-              </div>
-              <div className="space-y-3 p-6">
-                {filteredPositions.map((position) => (
-                  <article
-                    key={position.id}
-                    className="rounded-xl border border-white/5 bg-black/30 p-6 hover:border-[#f2ca50]/20 transition-colors"
-                  >
-                    <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                      <div className="flex items-center gap-4">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#201f1f]">
-                          <span className="material-symbols-outlined icon-standard text-[#f2ca50]">smart_toy</span>
-                        </div>
-                        <div>
-                          <p className="font-label font-bold text-[#e5e2e1] text-sm">{position.name}</p>
-                          <p className="font-body text-[10px] uppercase tracking-[0.14em] text-white/40">{position.amountFormatted}</p>
-                        </div>
-                      </div>
-                      <span className="w-fit rounded-full border border-[#f2ca50]/35 bg-[#f2ca50]/10 px-3 py-1 font-label text-[10px] font-black tracking-[0.14em] text-[#f2ca50]">
-                        Live
-                      </span>
-                    </div>
-                    <div className="mt-4 grid grid-cols-3 gap-3">
-                      {[
-                        { label: "Cost Basis", value: formatUsd(position.costBasisUsd) },
-                        { label: "Current Value", value: formatUsd(position.usdValue) },
-                        { label: "Unrealized PnL", value: formatSignedUsd(position.pnlUsd), tone: (position.pnlUsd ?? 0) >= 0 ? "text-[#f2ca50]" : "text-rose-400" },
-                      ].map(({ label, value, tone }) => (
-                        <div key={label} className="rounded-lg border border-white/5 bg-black/30 px-4 py-3">
-                          <p className="font-label text-[10px] uppercase tracking-[0.16em] text-white/40">{label}</p>
-                          <p className={`mt-1 font-mono text-sm font-bold ${tone ?? "text-[#e5e2e1]"}`}>{value}</p>
-                        </div>
-                      ))}
-                    </div>
-                  </article>
-                ))}
-              </div>
-            </section>
-          ) : null}
-
-          {error ? (
-            <div className="mt-6 rounded-xl border border-rose-500/20 bg-rose-500/10 p-4 text-sm text-rose-300">{error}</div>
-          ) : null}
-          {authError ? (
-            <div className="mt-6 rounded-xl border border-rose-500/20 bg-rose-500/10 p-4 text-sm text-rose-300">{authError}</div>
-          ) : null}
-        </div>
-      </main>
+            </div>
+          )}
+        </main>
+      </div>
     </div>
+  );
+}
+
+function PredictionMarketCard({ position }: { position: PortfolioPosition }) {
+  const isPnlPositive = (position.pnlUsd ?? 0) >= 0;
+  return (
+    <article className="relative overflow-hidden rounded-[22px] border border-white/5 bg-gradient-to-b from-[#131313] to-[#0c0c0c] p-5 transition-all duration-300 hover:-translate-y-1 hover:border-[#f2ca50]/35 hover:shadow-[0_8px_25px_rgba(242,202,80,0.03)] group">
+      <div className="absolute right-0 top-0 h-[2px] w-0 bg-[#f2ca50] transition-all duration-500 group-hover:w-full" />
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <p className="text-sm font-semibold text-white group-hover:text-[#f2ca50] transition-colors duration-300">{position.name}</p>
+          <div className="mt-1.5 flex items-center gap-2">
+            <span className="text-[9px] font-black uppercase tracking-wider text-white/30 bg-white/5 px-2 py-0.5 rounded-full">
+              {position.protocol}
+            </span>
+            <span className="text-[9px] font-black uppercase tracking-wider text-[#f2ca50] bg-[#f2ca50]/10 px-2 py-0.5 rounded-full border border-[#f2ca50]/15">
+              Active
+            </span>
+          </div>
+        </div>
+        <div className="text-right">
+          <p className="text-sm font-black text-white">{formatUsd(position.usdValue ?? 0)}</p>
+        </div>
+      </div>
+      <div className="mt-5 grid grid-cols-2 gap-4 border-t border-white/5 pt-4">
+        <div>
+          <p className="text-[9px] font-bold uppercase tracking-wider text-white/30">Position</p>
+          <p className="mt-1 text-sm font-semibold text-white/80">{position.amountFormatted}</p>
+        </div>
+        <div className="text-right">
+          <p className="text-[9px] font-bold uppercase tracking-wider text-white/30">PnL</p>
+          <p className={`mt-1 text-sm font-bold ${isPnlPositive ? 'text-[#f2ca50]' : 'text-white/60'}`}>
+            {formatSignedUsd(position.pnlUsd)}
+          </p>
+        </div>
+      </div>
+    </article>
   );
 }

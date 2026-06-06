@@ -1,6 +1,7 @@
 import { getAddress } from 'viem';
 import { adminDb } from '../db/client';
 import { executeUsdcTransfer, explorerLinkTx } from './agentpay-transfer';
+import { executeGuardCheck } from './execution-guard';
 import { sendTelegramText } from './telegram-notify';
 
 export type ScheduleType = 'monthly_day' | 'weekly_day' | 'daily';
@@ -317,6 +318,23 @@ export async function processDuePayments(): Promise<void> {
 
   console.log(`[scheduled-payments] processing ${duePayments.length} payment(s)`);
 
+  async function markScheduledPaymentBlocked(id: string, reason: string): Promise<void> {
+    const patch = {
+      last_run: today,
+      status: 'blocked',
+      blocked_reason: reason,
+    };
+    const { error } = await adminDb.from('scheduled_payments').update(patch).eq('id', id);
+    if (error && /blocked_reason/i.test(error.message || '')) {
+      await adminDb
+        .from('scheduled_payments')
+        .update({ last_run: today, status: 'blocked' })
+        .eq('id', id);
+    } else if (error) {
+      console.error('[scheduled-payments] blocked status update failed:', error.message);
+    }
+  }
+
   for (const payment of duePayments as Array<{
     id: string;
     wallet_address: string;
@@ -336,13 +354,33 @@ export async function processDuePayments(): Promise<void> {
         throw new Error('Invalid amount');
       }
 
-      const { txHash } = await executeUsdcTransfer({
-        payerEoa,
-        toAddress: toAddr,
-        amountUsdc: amountNum,
-        remark: payment.remark ? String(payment.remark).slice(0, 500) : null,
-        actionType: 'scheduled_payment',
+      const guard = await executeGuardCheck({
+        walletAddress: payerEoa,
+        amount: amountNum,
+        recipients: [toAddr],
+        idempotencyKey: `scheduled-payment:${payment.id}:${today}`,
+        route: 'cron:scheduled_payments',
+        requireConfirmation: true,
+        logReason: 'cron_blocked',
+        logContext: { scheduledPaymentId: payment.id },
       });
+      if (!guard.allowed) {
+        await markScheduledPaymentBlocked(payment.id, guard.reason);
+        continue;
+      }
+
+      let txHash: string;
+      try {
+        ({ txHash } = await executeUsdcTransfer({
+          payerEoa,
+          toAddress: toAddr,
+          amountUsdc: amountNum,
+          remark: payment.remark ? String(payment.remark).slice(0, 500) : null,
+          actionType: 'scheduled_payment',
+        }));
+      } finally {
+        await guard.release();
+      }
 
       const after = new Date();
       const nextRun = calculateNextRun(

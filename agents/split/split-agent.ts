@@ -1,6 +1,8 @@
 import { getRedis } from '../../db/client';
 import { resolvePayee } from '../../lib/agentpay-payee';
 import { executeUsdcTransfer } from '../../lib/agentpay-transfer';
+import { executeGuardCheck } from '../../lib/execution-guard';
+import { arcscanTxViewUrl, shortHash } from '../../lib/telegramX402SuccessCopy';
 
 const SPLIT_PENDING_PREFIX = 'split:pending:';
 const SPLIT_TTL_SECONDS = 300;
@@ -155,15 +157,34 @@ export async function executeSplit(
   // Execute transfers — partial failures do not abort the loop
   const results: NonNullable<SplitAgentResponse['results']> = [];
 
-  for (const recipient of payload.recipients) {
+  for (let i = 0; i < payload.recipients.length; i++) {
+    const recipient = payload.recipients[i];
     try {
-      const { txHash } = await executeUsdcTransfer({
+      const guard = await executeGuardCheck({
+        walletAddress: payload.walletAddress,
+        amount: perPerson,
+        recipients: [recipient.address],
+        idempotencyKey: `split:${confirmId}:${i}`,
+        route: 'agent:split:execute',
+        requireConfirmation: true,
+        logReason: 'split_blocked',
+        logContext: { confirmId, recipientIndex: i },
+      });
+      if (!guard.allowed) {
+        throw new Error(guard.message);
+      }
+      let txHash: string;
+      try {
+        ({ txHash } = await executeUsdcTransfer({
         payerEoa: payload.walletAddress,
         toAddress: recipient.address,
         amountUsdc: perPerson,
         remark: payload.remark || null,
         actionType: 'split_payment',
-      });
+        }));
+      } finally {
+        await guard.release();
+      }
       results.push({
         recipient: recipient.name,
         amount: payload.perPerson,
@@ -192,8 +213,13 @@ export async function executeSplit(
     lines.push(`Sent (${successes.length}):`);
     for (const r of successes) {
       const hash = r.txHash ?? '';
-      const short = hash.length > 12 ? `${hash.slice(0, 10)}...` : hash;
-      lines.push(`- ${r.recipient}: ${r.amount} USDC | tx: ${short}`);
+      const txLabel = shortHash(hash);
+      const txUrl = hash ? arcscanTxViewUrl(hash) : '';
+      lines.push(
+        txUrl
+          ? `- ${r.recipient}: ${r.amount} USDC | Tx: ${txLabel}\n  ${txUrl}`
+          : `- ${r.recipient}: ${r.amount} USDC`,
+      );
     }
   }
 

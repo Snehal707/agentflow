@@ -1,6 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import dotenv from 'dotenv';
-import { getAddress, parseUnits } from 'viem';
+import { createPublicClient, formatUnits, getAddress, http, parseAbi, parseUnits } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
@@ -8,18 +8,18 @@ import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { ARC } from '../../lib/arc-config';
 import { getOrCreateUserAgentWallet } from '../../lib/dcw';
-import { calculateScore, recordReputationSafe } from '../../lib/reputation';
-import { getOrCreateAgentWallets } from '../../lib/dcw';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
-import { readVaultApyPercent } from '../../lib/vault-apy';
-import { checkEntitlement, redeemUSYC, subscribeUSYC } from '../../lib/usyc';
-import {
-  executeVaultAction,
-  getVaultOwnerWallet,
-  type VaultAction,
-} from './execution';
-import { adminDb } from '../../db/client';
 import { getFacilitatorBaseUrl } from '../../lib/facilitator-url';
+import { executionGuardMiddleware } from '../../lib/execution-guard';
+import {
+  executeDeposit,
+  executeWithdraw,
+  getProviderPosition,
+  getUserPositionsAcrossProviders,
+  getVaultApy,
+  listAllVaults,
+} from '../../lib/vault/router';
+import type { VaultPosition } from '../../lib/vault/types';
 
 dotenv.config();
 
@@ -29,9 +29,45 @@ app.use(express.json());
 const port = Number(process.env.VAULT_AGENT_PORT || 3012);
 const facilitatorUrl = getFacilitatorBaseUrl();
 const price = process.env.VAULT_AGENT_PRICE ? `$${process.env.VAULT_AGENT_PRICE}` : '$0.012';
+const fallbackVaultApy = Number(
+  process.env.VAULT_MOCK_APY || process.env.VAULT_TARGET_APY || '5.3',
+);
 const explorerBase =
   process.env.ARC_EXPLORER_TX_BASE?.trim() || 'https://testnet.arcscan.app/tx/';
-const ARC_NATIVE_USDC = '0x3600000000000000000000000000000000000000' as const;
+const readClient = createPublicClient({
+  transport: http(ARC.alchemyRpc || ARC.rpc),
+});
+const vaultPreviewAbi = parseAbi([
+  'function previewDeposit(uint256 assets) view returns (uint256)',
+  'function previewWithdraw(uint256 assets) view returns (uint256)',
+]);
+
+async function resolveVaultQueryWallet(
+  userWalletAddress: `0x${string}`,
+  executionTarget: string,
+): Promise<`0x${string}`> {
+  if (executionTarget === 'EOA') {
+    return userWalletAddress;
+  }
+  const executionWallet = await getOrCreateUserAgentWallet(userWalletAddress);
+  return getAddress(executionWallet.address) as `0x${string}`;
+}
+
+function serializePosition(position: VaultPosition): {
+  sharesRaw: string;
+  sharesFormatted: string;
+  underlyingValueRaw: string;
+  underlyingValueFormatted: string;
+  underlyingSymbol: string;
+} {
+  return {
+    sharesRaw: position.sharesRaw.toString(),
+    sharesFormatted: position.sharesFormatted,
+    underlyingValueRaw: position.underlyingValueRaw.toString(),
+    underlyingValueFormatted: position.underlyingValueFormatted,
+    underlyingSymbol: position.underlyingSymbol,
+  };
+}
 
 const account = privateKeyToAccount(resolveAgentPrivateKey());
 const sellerAddress =
@@ -43,6 +79,7 @@ app.get('/health', (_req, res) => {
 });
 
 const rateLimitMiddleware = async (req: Request, res: Response, next: NextFunction) => {
+  console.log('[vault.mw.rateLimitMiddleware]', { action: req.body?.action });
   try {
     const auth = (req as any).auth as JWTPayload | undefined;
     if (!auth) {
@@ -67,222 +104,313 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
   }
 };
 
-app.post('/run', paidInternalOrAuthMiddleware, rateLimitMiddleware, (req: Request, res: Response, next: NextFunction) => {
+const executionGuardIfConfirmed = (req: Request, res: Response, next: NextFunction) => {
+  console.log('[vault.mw.executionGuardIfConfirmed]', { action: req.body?.action });
+  if (req.body?.confirmed === true) {
+    executionGuardMiddleware(req, res, next);
+    return;
+  }
+  next();
+};
+
+const paymentIfConfirmed = (req: Request, res: Response, next: NextFunction) => {
+  console.log('[vault.mw.paymentIfConfirmed]', {
+    action: req.body?.action,
+    confirmed: req.body?.confirmed === true,
+  });
+  if (
+    req.body?.action === 'list' ||
+    req.body?.action === 'position' ||
+    req.body?.confirmed !== true
+  ) {
+    return next();
+  }
+
   const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
   const reqKey = (req.headers['x-agentflow-paid-internal'] as string | undefined)?.trim();
   if (internalKey && reqKey === internalKey) {
-    next();
-    return;
+    return next();
   }
+
   return gateway.require(price)(req, res, next);
-}, async (req, res) => {
-  const auth = (req as any).auth as JWTPayload;
-  const action = String(req.body?.action || '').toLowerCase();
-  const amount = Number(req.body?.amount ?? 0);
-  const walletAddress = String(req.body?.walletAddress || auth.walletAddress);
-  const executionTarget = String(req.body?.executionTarget || 'DCW').toUpperCase();
-  const vaultAddress = (ARC.vaultContract || process.env.VAULT_CONTRACT_ADDRESS || '').trim() as `0x${string}`;
+};
 
-  if (!walletAddress || walletAddress.toLowerCase() !== auth.walletAddress.toLowerCase()) {
-    return res.status(400).json({ error: 'walletAddress must match authenticated wallet' });
-  }
-
-  if (req.body?.benchmark === true) {
-    console.log('[benchmark] vault short-circuit');
-    return res.json({
-      ok: true,
-      benchmark: true,
-      agent: 'vault',
-      result: 'Benchmark mode - payment logged',
-    });
-  }
-
+app.post('/run', (req: Request, res: Response, next: NextFunction) => {
+  console.log(
+    '[vault.req.in]',
+    JSON.stringify({
+      ts: Date.now(),
+      action: req.body?.action,
+      hasAuth: !!req.headers.authorization,
+      hasInternal: !!req.headers['x-agentflow-paid-internal'],
+      ip: req.ip,
+    }),
+  );
+  res.on('finish', () =>
+    console.log('[vault.req.out]', {
+      status: res.statusCode,
+    }),
+  );
+  res.on('close', () =>
+    console.log('[vault.req.close]', {
+      status: res.statusCode,
+      finished: res.writableEnded,
+    }),
+  );
+  next();
+}, (req: Request, res: Response, next: NextFunction) => {
+  console.log('[vault.mw.paidInternalOrAuthMiddleware.before]', { action: req.body?.action });
+  paidInternalOrAuthMiddleware(req, res, next);
+}, rateLimitMiddleware, executionGuardIfConfirmed, paymentIfConfirmed, async (req, res) => {
   try {
-    if (action === 'check_apy') {
-      if (!vaultAddress) {
-        return res.status(500).json({ error: 'VAULT_CONTRACT_ADDRESS is required' });
-      }
-      const apy = await readVaultApyPercent(vaultAddress);
-      return res.json({ success: true, action, apy });
+    const auth = (req as any).auth as JWTPayload;
+    const action = String(req.body?.action || '').toLowerCase();
+    const amount = Number(req.body?.amount ?? 0);
+    const walletAddress = String(req.body?.walletAddress || auth.walletAddress);
+    const executionTarget = String(req.body?.executionTarget || 'DCW').toUpperCase();
+
+    if (!walletAddress || walletAddress.toLowerCase() !== auth.walletAddress.toLowerCase()) {
+      return res.status(400).json({ error: 'walletAddress must match authenticated wallet' });
     }
 
-    if (action === 'usyc_deposit' || action === 'usyc_withdraw') {
-      const teller = (ARC.usycTeller || '').trim();
-      const usyc = (ARC.usycAddress || '').trim();
-      if (!teller || !/^0x[a-fA-F0-9]{40}$/i.test(teller)) {
-        return res.status(500).json({ error: 'USYC_TELLER_ADDRESS is required' });
-      }
-      if (!usyc || !/^0x[a-fA-F0-9]{40}$/i.test(usyc)) {
-        return res.status(500).json({ error: 'USYC_ADDRESS is required' });
-      }
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return res.status(400).json({ error: 'amount must be a positive number' });
-      }
-
-      const normalizedUserWallet = getAddress(auth.walletAddress);
-      const receiver = normalizedUserWallet;
-
-      if (executionTarget === 'EOA') {
-        const entitled = await checkEntitlement(normalizedUserWallet);
-        if (!entitled) {
-          return res.status(400).json({
-            error:
-              '[usyc] This connected wallet is not entitled for USYC on Arc Testnet yet. Complete the hackathon or Hashnote onboarding for this wallet, then retry.',
-          });
+    if (action === 'list') {
+      const vaults = await listAllVaults();
+      const withApy = await Promise.all(
+        vaults.map(async (vault) => ({
+          ...vault,
+          apy: await getVaultApy(vault.provider, vault.address),
+        })),
+      );
+      const normalized = withApy.map((vault) => {
+        const apy = vault.apy;
+        if (typeof apy?.apy === 'number' && Number.isFinite(apy.apy) && apy.apy > 0) {
+          return vault;
         }
+        return {
+          ...vault,
+          apy: {
+            ...apy,
+            apy: fallbackVaultApy,
+            method: 'mock_fallback',
+          },
+        };
+      });
+      return res.json({
+        success: true,
+        action,
+        vaults: normalized,
+      });
+    }
 
+    if (action === 'position') {
+      const normalizedUserWallet = getAddress(walletAddress) as `0x${string}`;
+      const queryWallet = await resolveVaultQueryWallet(normalizedUserWallet, executionTarget);
+      const positions = await getUserPositionsAcrossProviders(queryWallet);
+      const serializable = positions.map((entry) => ({
+        provider: entry.provider,
+        vault: entry.vault,
+        ...serializePosition(entry),
+      }));
+      return res.json({
+        success: true,
+        action,
+        positions: serializable,
+        queriedWallet: queryWallet,
+        userWallet: normalizedUserWallet,
+      });
+    }
+
+    if (!['deposit', 'withdraw'].includes(action)) {
+      return res.status(400).json({
+        error: 'action must be list|position|deposit|withdraw',
+      });
+    }
+
+    const providerName =
+      typeof req.body?.provider === 'string' && req.body.provider.trim()
+        ? req.body.provider.trim()
+        : 'lunex';
+    const vaultAddress =
+      typeof req.body?.vaultAddress === 'string' && /^0x[a-fA-F0-9]{40}$/.test(req.body.vaultAddress)
+        ? getAddress(req.body.vaultAddress)
+        : null;
+
+    if (!vaultAddress) {
+      return res.status(400).json({ success: false, error: 'vaultAddress is required' });
+    }
+
+    const availableVaults = await listAllVaults();
+    const selectedVault = availableVaults.find(
+      (vault) => vault.provider === providerName && vault.address === vaultAddress,
+    );
+    if (!selectedVault) {
+      return res.status(400).json({
+        success: false,
+        error: 'vaultAddress/provider pair is not a known supported vault',
+      });
+    }
+
+    const assetAddress = getAddress(selectedVault.asset);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, error: 'amount must be a positive number' });
+    }
+
+    const amountRaw = parseUnits(String(amount), 6);
+
+    if (req.body?.confirmed !== true) {
+      if (action === 'deposit') {
+        const expectedSharesRaw = (await readClient.readContract({
+          address: vaultAddress,
+          abi: vaultPreviewAbi,
+          functionName: 'previewDeposit',
+          args: [amountRaw],
+        })) as bigint;
         return res.json({
           success: true,
-          action,
-          executionMode: 'EOA',
-          eoaPlan: {
-            action,
-            walletAddress: normalizedUserWallet,
-            receiverAddress: receiver,
-            tellerAddress: getAddress(teller),
-            usdcAddress: ARC_NATIVE_USDC,
-            usycAddress: getAddress(usyc),
-            amount: String(amount),
+          action: 'preview',
+          provider: selectedVault.provider,
+          preview: {
+            action: 'deposit',
+            vault: selectedVault.label,
+            vaultAddress,
+            assetAddress,
+            amount,
+            amountRaw: amountRaw.toString(),
+            expectedSharesRaw: expectedSharesRaw.toString(),
+            expectedSharesFormatted: formatUnits(expectedSharesRaw, 6),
+            provider: selectedVault.provider,
+            experimental: selectedVault.experimental,
+            notes: selectedVault.notes,
           },
         });
       }
 
-      const executionWallet = await getOrCreateUserAgentWallet(normalizedUserWallet);
+      const normalizedUserWallet = getAddress(walletAddress) as `0x${string}`;
+      const queryWallet = await resolveVaultQueryWallet(normalizedUserWallet, executionTarget);
+      const position = await getProviderPosition(
+        selectedVault.provider,
+        queryWallet,
+        vaultAddress,
+      );
+      const currentPosition = serializePosition(position);
+      const expectedSharesBurnedRaw = (await readClient.readContract({
+        address: vaultAddress,
+        abi: vaultPreviewAbi,
+        functionName: 'previewWithdraw',
+        args: [amountRaw],
+      })) as bigint;
+      return res.json({
+        success: true,
+        action: 'preview',
+        provider: selectedVault.provider,
+        preview: {
+          action: 'withdraw',
+          vault: selectedVault.label,
+          vaultAddress,
+          assetAddress,
+          amount,
+          amountRaw: amountRaw.toString(),
+          expectedSharesBurnedRaw: expectedSharesBurnedRaw.toString(),
+          expectedSharesBurnedFormatted: formatUnits(expectedSharesBurnedRaw, 6),
+          currentPosition,
+          queriedWallet: queryWallet,
+          provider: selectedVault.provider,
+          experimental: selectedVault.experimental,
+          notes: selectedVault.notes,
+        },
+      });
+    }
 
-      if (action === 'usyc_deposit') {
-        const result = await subscribeUSYC({
+    const executionWallet = await getOrCreateUserAgentWallet(getAddress(walletAddress));
+
+    if (action === 'deposit') {
+      try {
+        const result = await executeDeposit(selectedVault.provider, {
           walletId: executionWallet.wallet_id,
-          walletAddress: executionWallet.address,
-          usdcAmount: String(amount),
-          receiverAddress: receiver,
+          walletAddress: getAddress(executionWallet.address) as `0x${string}`,
+          vaultAddress,
+          assetAddress,
+          amountInRaw: amountRaw,
+          slippageBps: 100,
         });
-        if (result.txHash) {
-          await adminDb.from('transactions').insert({
-            from_wallet: executionWallet.address,
-            to_wallet: teller,
-            amount,
-            arc_tx_id: result.txHash,
-            agent_slug: 'vault',
-            action_type: 'vault_usyc_deposit',
-            status: 'complete',
-          });
-        }
         return res.json({
           success: true,
           action,
+          provider: result.provider,
+          txId: result.txId,
           txHash: result.txHash,
-          usycReceived: result.usycReceived,
+          approvalTxId: result.approvalTxId ?? null,
+          approvalTxHash: result.approvalTxHash ?? null,
           approvalSkipped: result.approvalSkipped,
-          explorerLink: `${explorerBase}${result.txHash}`,
+          sharesReceivedRaw: result.sharesReceivedRaw.toString(),
+          sharesReceivedFormatted: formatUnits(result.sharesReceivedRaw, 6),
+          assetsDepositedRaw: amountRaw.toString(),
+          assetsDepositedFormatted: formatUnits(amountRaw, 6),
+          vaultSymbol: selectedVault.vaultSymbol,
+          vaultLabel: selectedVault.label,
+          assetSymbol: selectedVault.assetSymbol,
+          network: selectedVault.network,
+          experimental: selectedVault.experimental,
+          notes: selectedVault.notes,
+          receipt: {
+            explorerLink: `${explorerBase}${result.txHash}`,
+            approvalExplorerLink: result.approvalTxHash
+              ? `${explorerBase}${result.approvalTxHash}`
+              : null,
+          },
         });
+      } catch (error) {
+        return res.status(502).json({ success: false, error: toMessage(error) });
       }
+    }
 
-      const result = await redeemUSYC({
+    try {
+      const result = await executeWithdraw(selectedVault.provider, {
         walletId: executionWallet.wallet_id,
-        walletAddress: executionWallet.address,
-        usycAmount: String(amount),
-        receiverAddress: receiver,
+        walletAddress: getAddress(executionWallet.address) as `0x${string}`,
+        vaultAddress,
+        assetAddress,
+        amountOutRaw: amountRaw,
       });
-      if (result.txHash) {
-        await adminDb.from('transactions').insert({
-          from_wallet: executionWallet.address,
-          to_wallet: receiver,
-          amount,
-          arc_tx_id: result.txHash,
-          agent_slug: 'vault',
-          action_type: 'vault_usyc_withdraw',
-          status: 'complete',
-        });
-      }
       return res.json({
         success: true,
         action,
+        provider: result.provider,
+        txId: result.txId,
         txHash: result.txHash,
-        usdcReceived: result.usdcReceived,
-        approvalSkipped: result.approvalSkipped,
-        explorerLink: `${explorerBase}${result.txHash}`,
+        sharesBurnedRaw: result.sharesBurnedRaw.toString(),
+        sharesBurnedFormatted: formatUnits(result.sharesBurnedRaw, 6),
+        assetsReceivedRaw: result.assetsReceivedRaw.toString(),
+        assetsReceivedFormatted: formatUnits(result.assetsReceivedRaw, 6),
+        vaultSymbol: selectedVault.vaultSymbol,
+        vaultLabel: selectedVault.label,
+        assetSymbol: selectedVault.assetSymbol,
+        network: selectedVault.network,
+        experimental: selectedVault.experimental,
+        notes: selectedVault.notes,
+        receipt: {
+          explorerLink: `${explorerBase}${result.txHash}`,
+        },
       });
+    } catch (error) {
+      return res.status(502).json({ success: false, error: toMessage(error) });
     }
-
-    if (!vaultAddress) {
-      return res.status(500).json({ error: 'VAULT_CONTRACT_ADDRESS is required' });
-    }
-
-    if (!['deposit', 'withdraw', 'compound'].includes(action)) {
-      return res.status(400).json({
-        error: 'action must be deposit|withdraw|compound|check_apy|usyc_deposit|usyc_withdraw',
-      });
-    }
-
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ error: 'amount must be a positive number' });
-    }
-
-    const amountRaw = parseUnits(Math.max(amount, 0).toFixed(6), 6);
-    const normalizedUserWallet = getAddress(auth.walletAddress);
-    const executionWallet =
-      action === 'compound'
-        ? await getVaultOwnerWallet()
-        : await getOrCreateUserAgentWallet(normalizedUserWallet);
-
-    const result = await executeVaultAction({
-      action: action as VaultAction,
-      walletAddress:
-        action === 'compound' ? executionWallet.address : executionWallet.address,
-      walletId: executionWallet.wallet_id,
-      vaultAddress,
-      amountRaw,
-      amountUsdc: amount,
-    });
-
-    if (result.txHash) {
-      const fromWallet =
-        action === 'withdraw'
-          ? vaultAddress
-          : action === 'compound'
-            ? executionWallet.address
-            : executionWallet.address;
-      const toWallet =
-        action === 'withdraw' ? executionWallet.address : vaultAddress;
-
-      await adminDb.from('transactions').insert({
-        from_wallet: fromWallet,
-        to_wallet: toWallet,
-        amount,
-        arc_tx_id: result.txHash,
-        agent_slug: 'vault',
-        action_type: `vault_${action}`,
-        status: 'complete',
-      });
-    }
-
-    let reputation: { success: boolean; txHash?: string } | null = null;
-    const { ownerWallet, validatorWallet } = await getOrCreateAgentWallets('vault');
-    if (ownerWallet.erc8004_token_id) {
-      const score = calculateScore('vault', {
-        actualAPY: await readVaultApyPercent(vaultAddress),
-        quotedAPY: Number(process.env.VAULT_TARGET_APY || '8'),
-      });
-      await recordReputationSafe(
-        ownerWallet.erc8004_token_id,
-        score,
-        `vault_${action}`,
-        validatorWallet.address,
-      );
-    }
-
-    return res.json({
-      success: true,
-      action,
-      txId: result.txId,
-      txHash: result.txHash,
-      approvalTxId: result.approvalTxId ?? null,
-      approvalSkipped: result.approvalSkipped,
-      explorerLink: result.txHash ? `${explorerBase}${result.txHash}` : null,
-      reputation,
-    });
   } catch (error) {
-    return res.status(500).json({ success: false, error: toMessage(error) });
+    console.error('[vault.handler.error]', {
+      action: req.body?.action,
+      message: error instanceof Error ? error.message : String(error),
+      stack:
+        error instanceof Error
+          ? error.stack?.split('\n').slice(0, 5)
+          : undefined,
+    });
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 });
 

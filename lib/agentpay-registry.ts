@@ -182,6 +182,21 @@ export async function getOwnerRegisteredName(owner: `0x${string}`): Promise<stri
   }
 }
 
+export async function getPreferredAgentpayPaymentLinkHandle(
+  fallbackAddress: string,
+  registeredNameOwner?: string,
+): Promise<string> {
+  const fallback = getAddress(fallbackAddress);
+  if (!registeredNameOwner) return fallback;
+
+  try {
+    const registeredName = await getOwnerRegisteredName(getAddress(registeredNameOwner));
+    return registeredName ? `${cleanRegistryName(registeredName)}.arc` : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export async function readRegistrationFee(): Promise<bigint> {
   const addr = getAgentPayRegistryAddress();
   if (!addr) return 1_000_000n;

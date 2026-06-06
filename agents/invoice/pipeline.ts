@@ -44,6 +44,13 @@ export interface RunInvoicePipelineResult {
   txHash?: `0x${string}`;
 }
 
+function invoiceVendorHandle(invoice: NormalizedInvoice): string | null {
+  const vendor = invoice.vendor.trim().toLowerCase();
+  if (!vendor) return null;
+  if (/^[a-z0-9][a-z0-9._-]*\.arc$/i.test(vendor)) return vendor;
+  return null;
+}
+
 async function resolveInvoice(input: RunInvoicePipelineInput): Promise<NormalizedInvoice> {
   if (input.invoice) {
     return input.invoice;
@@ -89,6 +96,7 @@ export async function runInvoicePipeline(
       business_wallet: input.businessWallet,
       vendor_name: invoice.vendor,
       vendor_email: invoice.vendorEmail,
+      vendor_handle: invoiceVendorHandle(invoice),
       amount: invoice.amount,
       currency: invoice.currency,
       invoice_number: invoice.invoiceNumber,
@@ -109,7 +117,10 @@ export async function runInvoicePipeline(
     invoice,
   });
 
-  const nextStatus = validation.approved ? 'approved' : 'review';
+  const wantExecute =
+    input.executePayment !== false &&
+    Boolean(input.payerWalletAddress?.trim());
+  const nextStatus = validation.approved ? (wantExecute ? 'approved' : 'pending') : 'review';
   await adminDb.from('invoices').update({ status: nextStatus }).eq('id', invoiceId);
 
   if (!validation.approved) {
@@ -121,9 +132,6 @@ export async function runInvoicePipeline(
     return { invoiceId, invoice, validation, executed: false, businessWallet: input.businessWallet };
   }
 
-  const wantExecute =
-    input.executePayment !== false &&
-    Boolean(input.payerWalletAddress?.trim());
   const inAutoSettleBand = Boolean(validation.flags?.includes('auto_settle_band'));
 
   if (!wantExecute) {

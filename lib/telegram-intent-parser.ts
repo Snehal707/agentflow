@@ -2,8 +2,8 @@ import { callHermesFast } from './hermes';
 
 export type TelegramIntentAction =
   | 'swap'
-  | 'bridge'
   | 'vault'
+  | 'vault_list'
   | 'balance'
   | 'portfolio'
   | 'help'
@@ -15,7 +15,7 @@ export type TelegramIntent = {
   tokenIn: 'USDC' | 'EURC' | null;
   tokenOut: 'USDC' | 'EURC' | null;
   sourceChain: 'ethereum-sepolia' | 'base-sepolia' | null;
-  vaultAction: 'deposit' | 'withdraw' | 'usyc_deposit' | 'usyc_withdraw' | null;
+  vaultAction: 'deposit' | 'withdraw' | null;
   confidence: 'high' | 'medium' | 'low';
 };
 
@@ -35,23 +35,21 @@ const PARSER_SYSTEM_PROMPT = [
   '',
   'Action normalization:',
   '- swap, trade, exchange, convert, buy, sell -> swap',
-  '- bridge, transfer, move, send cross-chain -> bridge',
+  '- show vaults, list vaults, all vaults, vault options, earn opportunities, yield options -> vault_list',
   '- deposit, stake, put in vault, earn -> vault deposit',
   '- withdraw, unstake, take out, remove -> vault withdraw',
-  '- stake in usyc, usyc deposit, buy usyc -> vault usyc_deposit',
-  '- redeem usyc -> vault usyc_withdraw',
   '- balance, how much, funds, wallet -> balance',
   '- portfolio, holdings, pnl, performance -> portfolio',
   '',
   'Return ONLY valid JSON. No explanation. No markdown.',
   'Schema:',
   '{',
-  '  "action": "swap" | "bridge" | "vault" | "balance" | "portfolio" | "help" | "unknown",',
+  '  "action": "swap" | "vault" | "vault_list" | "balance" | "portfolio" | "help" | "unknown",',
   '  "amount": number | null,',
   '  "tokenIn": "USDC" | "EURC" | null,',
   '  "tokenOut": "USDC" | "EURC" | null,',
   '  "sourceChain": "ethereum-sepolia" | "base-sepolia" | null,',
-  '  "vaultAction": "deposit" | "withdraw" | "usyc_deposit" | "usyc_withdraw" | null,',
+  '  "vaultAction": "deposit" | "withdraw" | null,',
   '  "confidence": "high" | "medium" | "low"',
   '}',
   '',
@@ -76,14 +74,11 @@ const DEFAULT_UNKNOWN_INTENT: TelegramIntent = {
 export async function parseTelegramIntent(message: string): Promise<TelegramIntent | null> {
   const prompt = [
     'Examples:',
-    '"bridge 1 usdc from sepolia to arc" -> {"action":"bridge","amount":1,"tokenIn":"USDC","tokenOut":null,"sourceChain":"ethereum-sepolia","vaultAction":null,"confidence":"high"}',
-    '"bridge 0.5 from base to arc" -> {"action":"bridge","amount":0.5,"tokenIn":"USDC","tokenOut":null,"sourceChain":"base-sepolia","vaultAction":null,"confidence":"high"}',
     '"swap 10 usdc to eurc" -> {"action":"swap","amount":10,"tokenIn":"USDC","tokenOut":"EURC","sourceChain":null,"vaultAction":null,"confidence":"high"}',
     '"trade 5 usdc for eurc" -> {"action":"swap","amount":5,"tokenIn":"USDC","tokenOut":"EURC","sourceChain":null,"vaultAction":null,"confidence":"high"}',
     '"put 10 usdc in the vault" -> {"action":"vault","amount":10,"tokenIn":"USDC","tokenOut":null,"sourceChain":null,"vaultAction":"deposit","confidence":"high"}',
     '"take out 5 from vault" -> {"action":"vault","amount":5,"tokenIn":"USDC","tokenOut":null,"sourceChain":null,"vaultAction":"withdraw","confidence":"high"}',
-    '"stake 100 in usyc" -> {"action":"vault","amount":100,"tokenIn":"USDC","tokenOut":null,"sourceChain":null,"vaultAction":"usyc_deposit","confidence":"high"}',
-    '"redeem 50 usyc" -> {"action":"vault","amount":50,"tokenIn":null,"tokenOut":null,"sourceChain":null,"vaultAction":"usyc_withdraw","confidence":"high"}',
+    '"show me all vaults" -> {"action":"vault_list","amount":null,"tokenIn":null,"tokenOut":null,"sourceChain":null,"vaultAction":null,"confidence":"high"}',
     '"how much do i have" -> {"action":"balance","amount":null,"tokenIn":null,"tokenOut":null,"sourceChain":null,"vaultAction":null,"confidence":"high"}',
     '"show my portfolio" -> {"action":"portfolio","amount":null,"tokenIn":null,"tokenOut":null,"sourceChain":null,"vaultAction":null,"confidence":"high"}',
     '"what is arc network" -> {"action":"unknown","amount":null,"tokenIn":null,"tokenOut":null,"sourceChain":null,"vaultAction":null,"confidence":"medium"}',
@@ -158,13 +153,7 @@ function normalizeIntent(input: unknown): TelegramIntent {
     const actionText = stringify(value.action);
     const vaultText = stringify(value.vaultAction);
     const full = `${actionText} ${vaultText}`.toLowerCase();
-    if (containsAny(full, ['usyc', 'us yc'])) {
-      if (containsAny(full, ['redeem', 'withdraw', 'sell', 'cash out'])) {
-        normalized.vaultAction = 'usyc_withdraw';
-      } else {
-        normalized.vaultAction = 'usyc_deposit';
-      }
-    } else if (containsAny(actionText, ['withdraw']) || containsAny(vaultText, ['withdraw', 'unstake', 'take out', 'remove'])) {
+    if (containsAny(actionText, ['withdraw']) || containsAny(vaultText, ['withdraw', 'unstake', 'take out', 'remove'])) {
       normalized.vaultAction = 'withdraw';
     } else if (
       containsAny(actionText, ['deposit']) ||
@@ -180,8 +169,8 @@ function normalizeIntent(input: unknown): TelegramIntent {
 function normalizeAction(value: unknown): TelegramIntentAction {
   const text = stringify(value);
   if (!text) return 'unknown';
+  if (containsAny(text, ['vault_list', 'vault list', 'show vaults', 'list vaults', 'all vaults', 'vault options', 'earn opportunities', 'yield options'])) return 'vault_list';
   if (containsAny(text, ['swap', 'trade', 'exchange', 'convert', 'buy', 'sell'])) return 'swap';
-  if (containsAny(text, ['bridge', 'transfer', 'move', 'send cross-chain'])) return 'bridge';
   if (containsAny(text, ['vault', 'deposit', 'withdraw', 'unstake', 'stake', 'earn', 'take out', 'remove'])) return 'vault';
   if (containsAny(text, ['balance', 'how much', 'funds', 'wallet'])) return 'balance';
   if (containsAny(text, ['portfolio', 'holdings', 'pnl', 'performance'])) return 'portfolio';
@@ -227,12 +216,6 @@ function normalizeSourceChain(value: unknown): 'ethereum-sepolia' | 'base-sepoli
 function normalizeVaultAction(value: unknown): TelegramIntent['vaultAction'] {
   const text = stringify(value);
   if (!text) return null;
-  if (containsAny(text, ['usyc_deposit', 'usyc-deposit', 'usyc deposit'])) return 'usyc_deposit';
-  if (containsAny(text, ['usyc_withdraw', 'usyc-withdraw', 'usyc withdraw'])) return 'usyc_withdraw';
-  if (containsAny(text, ['usyc', 'us yc'])) {
-    if (containsAny(text, ['redeem', 'withdraw', 'sell'])) return 'usyc_withdraw';
-    return 'usyc_deposit';
-  }
   if (containsAny(text, ['withdraw', 'unstake', 'take out', 'remove'])) return 'withdraw';
   if (containsAny(text, ['deposit', 'stake', 'put in vault', 'earn'])) return 'deposit';
   return null;

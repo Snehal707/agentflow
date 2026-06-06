@@ -1,11 +1,13 @@
 import { formatUnits, parseUnits } from 'viem';
 import { getOrCreateUserAgentWallet } from '../../../lib/dcw';
+import type { RouteSegment } from '../../../lib/dex/types';
 import { evaluateSwapSanity } from '../../../lib/swap-sanity';
 import { fetchSwapQuote } from './price';
 import { calculateOptimalSlippage } from './slippage';
 import { preflightSwapExecution } from './execute';
 
 const DEFAULT_SLIPPAGE = Number(process.env.TELEGRAM_SWAP_DEFAULT_SLIPPAGE ?? '1');
+const LOGICAL_STABLE_DECIMALS = 6;
 
 /** Same min-out math as runners / swap server. */
 export function applySwapSlippage(amountOut: bigint, slippagePercent: number): bigint {
@@ -24,8 +26,9 @@ export async function computeSwapPriceImpactPercent(input: {
   tokenOut: `0x${string}`;
   amountInFull: bigint;
   quoteFullOut: bigint;
+  tokenInDecimals: number;
 }): Promise<number | null> {
-  const probeIn = choosePriceImpactProbeAmount(input.amountInFull);
+  const probeIn = choosePriceImpactProbeAmount(input.amountInFull, input.tokenInDecimals);
   if (probeIn === null) {
     return null;
   }
@@ -49,13 +52,16 @@ export async function computeSwapPriceImpactPercent(input: {
   }
 }
 
-function choosePriceImpactProbeAmount(amountInFull: bigint): bigint | null {
+function choosePriceImpactProbeAmount(
+  amountInFull: bigint,
+  tokenInDecimals: number,
+): bigint | null {
   if (amountInFull <= 1n) {
     return null;
   }
 
-  const minProbe = 10_000n; // 0.01 token at 6 decimals, avoids fee-rounding-to-zero probes.
-  const maxProbe = 1_000_000n; // 1 token at 6 decimals.
+  const minProbe = parseUnits('0.01', tokenInDecimals);
+  const maxProbe = parseUnits('1', tokenInDecimals);
   let probe = amountInFull / 100n; // 1% of trade size.
 
   if (probe < minProbe) {
@@ -72,8 +78,11 @@ function choosePriceImpactProbeAmount(amountInFull: bigint): bigint | null {
 
 export interface SwapSimulationExecutionPayload {
   walletAddress: string;
+  provider: string;
   tokenIn: `0x${string}`;
   tokenOut: `0x${string}`;
+  tokenInDecimals: number;
+  tokenOutDecimals: number;
   amount: number;
   amountRaw: string;
   minAmountOutRaw: string;
@@ -83,6 +92,8 @@ export interface SwapSimulationExecutionPayload {
   quoteAmountOutRaw: string;
   quoteFeeRaw: string | null;
   quoteSource: string;
+  routeData: string;
+  routeSegments: RouteSegment[];
   fromSym: string;
   toSym: string;
 }
@@ -114,7 +125,9 @@ export async function simulateSwapExecution(input: {
     return { ok: false, blockReason: 'Amount must be positive.', warnings: [], summaryLines: [] };
   }
 
-  const amountRaw = parseUnits(input.amount.toFixed(6), 6);
+  const tokenInDecimals = LOGICAL_STABLE_DECIMALS;
+  const tokenOutDecimals = LOGICAL_STABLE_DECIMALS;
+  const amountRaw = parseUnits(String(input.amount), tokenInDecimals);
   const userAgentWallet = await getOrCreateUserAgentWallet(input.walletAddress);
 
   await preflightSwapExecution({
@@ -152,6 +165,7 @@ export async function simulateSwapExecution(input: {
     tokenOut: input.tokenOut,
     amountInFull: amountRaw,
     quoteFullOut: quote.amountOut,
+    tokenInDecimals,
   });
 
   const sanity = evaluateSwapSanity({
@@ -160,6 +174,9 @@ export async function simulateSwapExecution(input: {
     tokenIn: input.tokenIn,
     tokenOut: input.tokenOut,
     priceImpactPct,
+    tokenInDecimals,
+    tokenOutDecimals,
+    provider: quote.source,
   });
   if (!sanity.ok) {
     return { ok: false, blockReason: sanity.reason, warnings: [], summaryLines: [] };
@@ -175,11 +192,11 @@ export async function simulateSwapExecution(input: {
     warnings.push(`Price impact ~${priceImpactPct.toFixed(2)}% (> 5%).`);
   }
 
-  const outFormatted = formatUnits(quote.amountOut, 6);
-  const minOutFormatted = formatUnits(minAmountOutRaw, 6);
+  const outFormatted = formatUnits(quote.amountOut, tokenOutDecimals);
+  const minOutFormatted = formatUnits(minAmountOutRaw, tokenOutDecimals);
   const feeLine =
     quote.feeRaw !== undefined && quote.feeRaw !== null
-      ? `${formatTokenAmount(formatUnits(quote.feeRaw, 6))} USDC`
+      ? `${formatTokenAmount(formatUnits(quote.feeRaw, tokenOutDecimals))} USDC`
       : '—';
 
   const impactLine = formatPercentForTelegram(priceImpactPct);
@@ -205,8 +222,11 @@ export async function simulateSwapExecution(input: {
 
   const payload: SwapSimulationExecutionPayload = {
     walletAddress: input.walletAddress,
+    provider: quote.source,
     tokenIn: input.tokenIn,
     tokenOut: input.tokenOut,
+    tokenInDecimals,
+    tokenOutDecimals,
     amount: input.amount,
     amountRaw: amountRaw.toString(),
     minAmountOutRaw: minAmountOutRaw.toString(),
@@ -216,6 +236,8 @@ export async function simulateSwapExecution(input: {
     quoteAmountOutRaw: quote.amountOut.toString(),
     quoteFeeRaw: quote.feeRaw?.toString() ?? null,
     quoteSource: quote.source,
+    routeData: '0x',
+    routeSegments: [],
     fromSym: input.fromSym,
     toSym: input.toSym,
   };

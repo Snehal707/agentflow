@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import dotenv from 'dotenv';
+import { pathToFileURL } from 'url';
 import { adminDb } from '../db/client';
 import { getCronState, upsertCronState } from '../lib/cron-state';
 
@@ -97,7 +98,7 @@ async function main(): Promise<void> {
   await runTrainingExport();
 }
 
-if (require.main === module) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
     console.error('[training-export] failed:', err);
     process.exit(1);

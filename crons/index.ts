@@ -6,6 +6,7 @@ import { runYieldMonitor } from './yield-monitor';
 import { generateDailyReport, sendDailyReportsToPlanUsers } from '../lib/daily-report';
 import { processDuePayments } from '../lib/scheduled-payments';
 import { runTreasuryTopUp } from '../lib/agent-treasury';
+import { runSemanticMemoryConsolidationJob } from '../lib/semantic-memory-cron';
 
 dotenv.config();
 
@@ -20,6 +21,16 @@ cron.schedule(
   '0 */6 * * *',
   () => {
     void runYieldMonitor().catch((e) => console.error('[cron] yield-monitor', e));
+  },
+  { timezone: tz },
+);
+
+cron.schedule(
+  '15 */6 * * *',
+  () => {
+    void runSemanticMemoryConsolidationJob().catch((e) =>
+      console.error('[cron] semantic-memory-consolidation', e),
+    );
   },
   { timezone: tz },
 );
@@ -87,5 +98,5 @@ cron.schedule(
 );
 
 console.log(
-  '[crons] Scheduler started (production): yield-monitor (6h), treasury top-up (hourly), monthly (09:00 1st), training (03:00), daily reports + scheduled USDC payments (09:00).',
+  '[crons] Scheduler started (production): yield-monitor (6h), semantic-memory-consolidation (every 6h at :15), treasury top-up (hourly), monthly (09:00 1st), training (03:00), daily reports + scheduled USDC payments (09:00).',
 );

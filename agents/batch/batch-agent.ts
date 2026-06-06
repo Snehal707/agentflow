@@ -2,6 +2,7 @@ import { createPublicClient, formatUnits, getAddress, http, parseAbi } from 'vie
 import { adminDb, getRedis } from '../../db/client';
 import { resolvePayee } from '../../lib/agentpay-payee';
 import { executeUsdcTransfer } from '../../lib/agentpay-transfer';
+import { executeGuardCheck } from '../../lib/execution-guard';
 import { resolveArcRpcUrl } from '../../lib/arc-config';
 import { getOrCreateUserAgentWallet } from '../../lib/dcw';
 import { sendTelegramText } from '../../lib/telegram-notify';
@@ -107,7 +108,7 @@ export async function previewBatch(params: {
 
   const unresolved = resolveResults.filter((r) => !r.resolved);
   if (unresolved.length > 0) {
-    const names = unresolved.map((r) => `• ${r.displayName}: ${(r as any).error}`).join('\n');
+    const names = unresolved.map((r) => `- ${r.displayName}: ${(r as any).error}`).join('\n');
     return {
       action: 'error',
       message: `${unresolved.length} recipient(s) could not be resolved:\n${names}\n\nCheck that names are registered on AgentPay.`,
@@ -171,7 +172,7 @@ export async function previewBatch(params: {
     '',
     ...resolvedPayments.map(
       (p, i) =>
-        `${i + 1}. ${p.displayName} → ${p.amount} USDC${p.remark ? ` (${p.remark})` : ''}`,
+        `${i + 1}. ${p.displayName} -> ${p.amount} USDC${p.remark ? ` (${p.remark})` : ''}`,
     ),
     '',
     `Total: ${total.toFixed(2)} USDC across ${payments.length} recipients.`,
@@ -229,16 +230,34 @@ export async function executeBatch(
   for (let i = 0; i < payload.payments.length; i++) {
     const p = payload.payments[i];
     const amountUsdc = parseFloat(p.amount);
-    const remarkStr = p.remark ? `batch:${shortId} · ${p.remark}` : `batch:${shortId}`;
+    const remarkStr = p.remark ? `batch:${shortId} - ${p.remark}` : `batch:${shortId}`;
 
     try {
-      const { txHash } = await executeUsdcTransfer({
+      const guard = await executeGuardCheck({
+        walletAddress: payload.walletAddress,
+        amount: amountUsdc,
+        recipients: [p.address],
+        idempotencyKey: `batch:${confirmId}:${i}`,
+        route: 'agent:batch:execute',
+        requireConfirmation: true,
+        logReason: 'batch_blocked',
+        logContext: { confirmId, recipientIndex: i },
+      });
+      if (!guard.allowed) {
+        throw new Error(guard.message);
+      }
+      let txHash: string;
+      try {
+        ({ txHash } = await executeUsdcTransfer({
         payerEoa: payload.walletAddress,
         toAddress: p.address,
         amountUsdc,
         remark: remarkStr,
         actionType: 'batch_payment',
-      });
+        }));
+      } finally {
+        await guard.release();
+      }
       results.push({
         to: p.displayName,
         amount: p.amount,
@@ -270,13 +289,13 @@ export async function executeBatch(
     .reduce((sum, r) => sum + parseFloat(r.amount), 0);
 
   // Build receipt message
-  const lines: string[] = [`Batch payment complete!\n`];
-  lines.push(`✅ Sent: ${successCount}/${results.length}`);
-  lines.push(`💰 Total: ${totalSent.toFixed(2)} USDC`);
+  const lines: string[] = ['Batch payment complete!', ''];
+  lines.push(`**Sent:** ${successCount}/${results.length}`);
+  lines.push(`**Total:** ${totalSent.toFixed(2)} USDC`);
 
   const successes = results.filter((r) => r.status === 'success');
   if (successes.length) {
-    lines.push('\nSent:');
+    lines.push('', '**Sent:**');
     for (const r of successes) {
       const hash = r.txHash ?? '';
       const short = hash.length > 12 ? `${hash.slice(0, 10)}...` : hash;
@@ -284,16 +303,14 @@ export async function executeBatch(
       const txCell = explorerUrl
         ? `[\`${short}\`](${explorerUrl})`
         : `\`${short}\``;
-      lines.push(
-        `  • ${r.to}: ${r.amount} USDC${r.remark ? ` (${r.remark})` : ''} — tx: ${txCell}`,
-      );
+      lines.push(`- ${r.to}: ${r.amount} USDC${r.remark ? ` (${r.remark})` : ''} - tx: ${txCell}`);
     }
   }
 
   if (failedCount > 0) {
-    lines.push(`\n❌ Failed (${failedCount}):`);
+    lines.push('', `**Failed (${failedCount}):**`);
     for (const r of results.filter((r) => r.status === 'failed')) {
-      lines.push(`  • ${r.to}: ${r.error}`);
+      lines.push(`- ${r.to}: ${r.error}`);
     }
   }
 
@@ -307,12 +324,12 @@ export async function executeBatch(
 
     if (user?.telegram_id) {
       const tgLines = [
-        `📦 Batch Payment Complete`,
-        `✅ Sent: ${successCount}/${results.length} payments`,
-        `💰 Total: ${totalSent.toFixed(2)} USDC`,
+        'Batch Payment Complete',
+        `Sent: ${successCount}/${results.length} payments`,
+        `Total: ${totalSent.toFixed(2)} USDC`,
       ];
       if (failedCount > 0) {
-        tgLines.push(`❌ Failed: ${failedCount}`);
+        tgLines.push(`Failed: ${failedCount}`);
       }
       await sendTelegramText(user.telegram_id, tgLines.join('\n'));
     }

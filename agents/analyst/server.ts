@@ -2,7 +2,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import dotenv from 'dotenv';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
-import { callHermesDeep, callHermesFast } from '../../lib/hermes';
+import { callHermesFast } from '../../lib/hermes';
 import { ANALYST_SYSTEM_PROMPT } from '../../lib/agentPrompts';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
 import { resolveAgentSellerAddress } from '../../lib/agentSellerAddress';
@@ -33,8 +33,6 @@ const facilitatorUrl = getFacilitatorBaseUrl();
 const internalBrainKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
 let gateway: ReturnType<typeof createGatewayMiddleware>;
 
-type InternalRequest = Request & { _internalAuth?: boolean };
-
 app.get('/health', (_req, res) => {
   res.status(200).json({ status: 'ok', agent: 'analyst' });
 });
@@ -64,36 +62,24 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
-const internalKeyMiddleware = (req: Request, _res: Response, next: NextFunction) => {
+const internalKeyMiddleware = (req: Request, res: Response, next: NextFunction) => {
   const reqKey =
     typeof req.headers['x-agentflow-brain-internal'] === 'string'
       ? req.headers['x-agentflow-brain-internal'].trim()
       : '';
   if (internalBrainKey && reqKey === internalBrainKey) {
-    (req as InternalRequest)._internalAuth = true;
-  }
-  next();
-};
-
-const maybeRequirePayment = (req: Request, res: Response, next: NextFunction) => {
-  if ((req as InternalRequest)._internalAuth) {
     next();
     return;
   }
+  res.status(404).json({ error: 'Not found' });
+};
+
+const requirePayment = (req: Request, res: Response, next: NextFunction) => {
   return gateway.require(price)(req, res, next);
 };
 
 const runHandler = async (req: Request, res: Response) => {
   try {
-    if (req.body?.benchmark === true || req.query?.benchmark === 'true') {
-      console.log('[benchmark] analyst short-circuit');
-      return res.json({
-        ok: true,
-        benchmark: true,
-        agent: 'analyst',
-        result: 'Benchmark mode - payment logged',
-      });
-    }
     const research =
       (req.body?.research as string) ?? (req.query.research as string) ?? '';
     const task = (req.body?.task as string) ?? (req.query.task as string) ?? '';
@@ -102,6 +88,10 @@ const runHandler = async (req: Request, res: Response) => {
       safeParseObject(research);
     const liveData =
       (req.body?.liveData as Record<string, unknown> | undefined) ?? null;
+    const portfolioImpact =
+      req.body?.portfolioImpact === true ||
+      req.query.portfolioImpact === 'true' ||
+      liveData?.portfolio_impact === true;
     const reasoningMode = inferResearchReasoningMode({
       task,
       explicitMode: req.body?.reasoningMode ?? req.query.reasoningMode,
@@ -113,11 +103,10 @@ const runHandler = async (req: Request, res: Response) => {
       researchText: research,
       research: researchJson,
       liveData,
+      portfolioImpact,
     });
     const result = await withTimeout(
-      reasoningMode === 'deep'
-        ? callHermesDeep(ANALYST_SYSTEM_PROMPT, analystInput)
-        : callHermesFast(ANALYST_SYSTEM_PROMPT, analystInput),
+      callHermesFast(ANALYST_SYSTEM_PROMPT, analystInput),
       HERMES_TIMEOUT_MS,
       `Analyst Hermes timed out after ${HERMES_TIMEOUT_MS / 1000}s`,
     );
@@ -129,8 +118,8 @@ const runHandler = async (req: Request, res: Response) => {
     res.status(statusCode).json({ error: 'Analyst agent failed', details: message });
   }
 };
-app.get('/run', internalKeyMiddleware, maybeRequirePayment, runHandler);
-app.post('/run', internalKeyMiddleware, maybeRequirePayment, runHandler);
+app.get('/run', internalKeyMiddleware, requirePayment, runHandler);
+app.post('/run', internalKeyMiddleware, requirePayment, runHandler);
 
 async function start(): Promise<void> {
   const sellerAddress = await resolveAgentSellerAddress({

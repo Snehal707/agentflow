@@ -1,0 +1,599 @@
+import { Router } from 'express';
+import { adminDb } from '../db/client';
+
+const router = Router();
+
+type CoreAgentSlug =
+  | 'research'
+  | 'swap'
+  | 'vault'
+  | 'predmarket'
+  | 'bridge'
+  | 'portfolio'
+  | 'invoice'
+  | 'vision'
+  | 'transcribe'
+  | 'schedule'
+  | 'split'
+  | 'batch';
+
+type StoreAgent = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  category: string;
+  priceUsdc: number | null;
+  reputationScore: number;
+  status: string;
+  available: boolean;
+  source: 'system' | 'published';
+  arcHandle: string | null;
+  devWallet: string | null;
+  tokenId: string | null;
+  agentCardUrl: string | null;
+};
+
+export const CORE_AGENT_SPECS: Array<{
+  slug: CoreAgentSlug;
+  name: string;
+  description: string;
+  category: string;
+  envPriceKey: string;
+  fallbackPrice: number;
+}> = [
+  {
+    slug: 'research',
+    name: 'Research',
+    description: 'Three-stage research pipeline: Research gathers live evidence, Analyst interprets it, and Writer delivers the final report.',
+    category: 'Research',
+    envPriceKey: 'RESEARCH_AGENT_PRICE',
+    fallbackPrice: 0.005,
+  },
+  {
+    slug: 'swap',
+    name: 'Swap',
+    description: 'Quotes and executes live Arc USDC swap flows with guardrails and verification.',
+    category: 'DeFi',
+    envPriceKey: 'SWAP_AGENT_PRICE',
+    fallbackPrice: 0.01,
+  },
+  {
+    slug: 'vault',
+    name: 'Vault',
+    description: 'Multi-protocol yield vaults. Currently: Lunex (testnet, experimental). More providers coming.',
+    category: 'DeFi',
+    envPriceKey: 'VAULT_AGENT_PRICE',
+    fallbackPrice: 0.012,
+  },
+  {
+    slug: 'predmarket',
+    name: 'Prediction Markets',
+    description: 'Multi-protocol prediction markets. Currently: AchMarket (testnet, experimental). LMSR pricing, admin-resolved with public proof. More providers coming.',
+    category: 'DeFi',
+    envPriceKey: 'PREDMARKET_AGENT_PRICE',
+    fallbackPrice: 0.012,
+  },
+  {
+    slug: 'bridge',
+    name: 'Bridge',
+    description: 'Bridges USDC into Arc and streams CCTP progress in real time.',
+    category: 'DeFi',
+    envPriceKey: 'BRIDGE_AGENT_PRICE',
+    fallbackPrice: 0.009,
+  },
+  {
+    slug: 'portfolio',
+    name: 'Portfolio',
+    description: 'Analyzes Arc wallet balances, positions, transfers, and PnL.',
+    category: 'Analytics',
+    envPriceKey: 'PORTFOLIO_AGENT_PRICE',
+    fallbackPrice: 0.015,
+  },
+  {
+    slug: 'invoice',
+    name: 'Invoice',
+    description: 'Automates invoice review, approvals, and business settlement flows.',
+    category: 'Custom',
+    envPriceKey: 'INVOICE_AGENT_PRICE',
+    fallbackPrice: 0.025,
+  },
+  {
+    slug: 'vision',
+    name: 'Vision',
+    description: 'Analyzes screenshots, images, text files, and single-page PDFs with Hermes-first reasoning.',
+    category: 'Perception',
+    envPriceKey: 'VISION_AGENT_PRICE',
+    fallbackPrice: 0.004,
+  },
+  {
+    slug: 'transcribe',
+    name: 'Voice Input',
+    description: 'Converts short voice notes into chat-ready text with guarded daily caps.',
+    category: 'Perception',
+    envPriceKey: 'TRANSCRIBE_AGENT_PRICE',
+    fallbackPrice: 0,
+  },
+  {
+    slug: 'schedule',
+    name: 'Schedule Agent',
+    description:
+      'Creates and manages recurring USDC payments on Arc. Supports daily, weekly, and monthly automated schedules.',
+    category: 'Payments',
+    envPriceKey: 'SCHEDULE_AGENT_PRICE',
+    fallbackPrice: 0.005,
+  },
+  {
+    slug: 'split',
+    name: 'Split Agent',
+    description:
+      'Splits USDC equally between 2-10 recipients in one command. Executes all transfers automatically on Arc.',
+    category: 'Payments',
+    envPriceKey: 'SPLIT_AGENT_PRICE',
+    fallbackPrice: 0.005,
+  },
+  {
+    slug: 'batch',
+    name: 'Batch Agent',
+    description:
+      'Processes bulk USDC payments from CSV. Perfect for payroll, DAO distributions, and team payments up to 500 recipients.',
+    category: 'Payments',
+    envPriceKey: 'BATCH_AGENT_PRICE',
+    fallbackPrice: 0.01,
+  },
+];
+
+router.get('/agents', async (_req, res) => {
+  try {
+    const [systemAgents, publishedAgents] = await Promise.all([
+      fetchSystemAgents(),
+      fetchPublishedAgents(),
+    ]);
+
+    return res.json({
+      agents: mergeStoreAgents(systemAgents, publishedAgents),
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message ?? 'agent store list failed' });
+  }
+});
+
+router.get('/agent/:slug', async (req, res) => {
+  try {
+    const raw = String(req.params.slug ?? '').trim().toLowerCase();
+    if (!raw) {
+      return res.status(400).json({ error: 'slug required' });
+    }
+
+    const [systemAgents, publishedAgents] = await Promise.all([
+      fetchSystemAgents(),
+      fetchPublishedAgents(),
+    ]);
+    const mergedAgents = mergeStoreAgents(systemAgents, publishedAgents);
+
+    const agent =
+      mergedAgents.find((item) => item.slug === raw || item.id === raw);
+
+    if (!agent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    return res.json({ agent });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message ?? 'agent lookup failed' });
+  }
+});
+
+export default router;
+
+function mergeStoreAgents(systemAgents: StoreAgent[], publishedAgents: StoreAgent[]): StoreAgent[] {
+  const merged = new Map<string, StoreAgent>();
+
+  for (const agent of systemAgents) {
+    merged.set(agent.slug, applyCorePresentationOverrides(agent));
+  }
+  for (const agent of publishedAgents) {
+    merged.set(agent.slug, applyCorePresentationOverrides(agent));
+  }
+
+  return Array.from(merged.values());
+}
+
+function applyCorePresentationOverrides(agent: StoreAgent): StoreAgent {
+  if (agent.slug === 'transcribe') {
+    return {
+      ...agent,
+      name: 'Voice Input',
+      description: 'Converts short voice notes into chat-ready text with guarded daily caps.',
+      category: 'Perception',
+      priceUsdc: 0,
+    };
+  }
+  return agent;
+}
+
+async function fetchPublishedAgents(): Promise<StoreAgent[]> {
+  const primary = await selectPublishedAgentsFrom('agent_store_agents');
+  const result = isMissingTableError(primary.error)
+    ? await selectPublishedAgentsFrom('marketplace_agents')
+    : primary;
+
+  if (isMissingTableError(result.error)) {
+    return [];
+  }
+
+  if (result.error) {
+    throw new Error(result.error.message);
+  }
+
+  const rows = result.data ?? [];
+  const slugs = rows.map((a) => String(a.arc_handle ?? a.id ?? '').trim()).filter(Boolean);
+  const scores = await fetchUserRatingScoresBySlug(slugs);
+
+  return rows.map((row) => {
+    const slug = String(row.arc_handle ?? row.id ?? '').trim();
+    return normalizePublishedAgent(row, scores[slug] ?? 0);
+  });
+}
+
+function selectPublishedAgentsFrom(table: 'agent_store_agents' | 'marketplace_agents') {
+  return adminDb
+    .from(table)
+    .select('*')
+    .in('status', ['active', 'pending']);
+}
+
+function isMissingTableError(error: { code?: string; message?: string } | null): boolean {
+  if (!error) {
+    return false;
+  }
+  const message = String(error.message ?? '').toLowerCase();
+  return (
+    error.code === '42P01' ||
+    error.code === 'PGRST205' ||
+    message.includes('does not exist') ||
+    message.includes('not found') ||
+    message.includes('schema cache') ||
+    message.includes('could not find the table')
+  );
+}
+
+async function fetchSystemAgents(): Promise<StoreAgent[]> {
+  const slugs = CORE_AGENT_SPECS.map((spec) => spec.slug);
+  const { data: wallets, error } = await adminDb
+    .from('wallets')
+    .select('agent_slug, address, erc8004_token_id')
+    .eq('purpose', 'owner')
+    .in('agent_slug', slugs);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const ownerWalletBySlug = new Map<string, { address: string | null; tokenId: string | null }>();
+  for (const row of wallets ?? []) {
+    ownerWalletBySlug.set(String(row.agent_slug ?? ''), {
+      address: row.address ? String(row.address) : null,
+      tokenId: row.erc8004_token_id ? String(row.erc8004_token_id) : null,
+    });
+  }
+
+  const scores = await fetchUserRatingScoresBySlug(slugs);
+
+  const healthChecks = await Promise.all(
+    CORE_AGENT_SPECS.map(async (spec) => {
+      const ok = await checkHealth(resolveHealthUrl(spec.slug));
+      return [spec.slug, ok] as const;
+    }),
+  );
+
+  const healthBySlug = new Map<CoreAgentSlug, boolean>(healthChecks);
+
+  return CORE_AGENT_SPECS.map((spec) => {
+    const owner = ownerWalletBySlug.get(spec.slug);
+    const available = healthBySlug.get(spec.slug) ?? false;
+    return {
+      id: `system:${spec.slug}`,
+      slug: spec.slug,
+      name: spec.name,
+      description: spec.description,
+      category: spec.category,
+      priceUsdc: spec.slug === 'transcribe' ? 0 : parseUsdcPrice(spec.envPriceKey, spec.fallbackPrice),
+      reputationScore: scores[spec.slug] ?? 0,
+      status: available ? 'live' : 'unavailable',
+      available,
+      source: 'system',
+      arcHandle: null,
+      devWallet: owner?.address ?? null,
+      tokenId: owner?.tokenId ?? null,
+      agentCardUrl: null,
+    } satisfies StoreAgent;
+  });
+}
+
+async function fetchUserRatingScoresBySlug(slugs: string[]): Promise<Record<string, number>> {
+  if (!slugs.length) {
+    return {};
+  }
+
+  const { data, error } = await adminDb
+    .from('agent_ratings')
+    .select('agent_slug, score')
+    .eq('status', 'confirmed')
+    .in('agent_slug', slugs);
+
+  if (isMissingTableError(error)) {
+    return {};
+  }
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const sums = new Map<string, { total: number; count: number }>();
+  for (const row of data ?? []) {
+    const slug = String(row.agent_slug ?? '');
+    const score = Number(row.score ?? 0);
+    if (!slug || !Number.isFinite(score)) continue;
+    const current = sums.get(slug) ?? { total: 0, count: 0 };
+    sums.set(slug, { total: current.total + score, count: current.count + 1 });
+  }
+
+  return Object.fromEntries(
+    Array.from(sums.entries()).map(([slug, value]) => [
+      slug,
+      value.count > 0 ? value.total / value.count : 0,
+    ]),
+  );
+}
+
+function normalizePublishedAgent(row: Record<string, unknown>, reputationScore: number): StoreAgent {
+  const card = parseAgentCardJson(row.agent_card_json);
+  const slug = String(row.arc_handle ?? row.id ?? '').trim();
+
+  return {
+    id: String(row.id ?? slug),
+    slug,
+    name: card.name || slug || 'Published Agent',
+    description:
+      card.description ?? 'Published AgentFlow agent routed from the Agent Store registry.',
+    category: card.category ?? String(row.category ?? 'Custom'),
+    priceUsdc: card.priceUsdc,
+    reputationScore,
+    status: String(row.status ?? 'pending'),
+    available: String(row.status ?? '').toLowerCase() === 'active',
+    source: 'published',
+    arcHandle: row.arc_handle ? String(row.arc_handle) : null,
+    devWallet: row.dev_wallet ? String(row.dev_wallet) : null,
+    tokenId: row.erc8004_token_id ? String(row.erc8004_token_id) : null,
+    agentCardUrl: row.agent_card_url ? String(row.agent_card_url) : null,
+  };
+}
+
+function parseAgentCardJson(value: unknown): {
+  name: string | null;
+  description: string | null;
+  category: string | null;
+  priceUsdc: number | null;
+} {
+  const card =
+    typeof value === 'string'
+      ? safeParseObject(value)
+      : value && typeof value === 'object'
+        ? (value as Record<string, unknown>)
+        : null;
+
+  const priceValue = card?.priceUsdc ?? card?.price ?? null;
+  const parsedPrice =
+    typeof priceValue === 'number'
+      ? priceValue
+      : typeof priceValue === 'string'
+        ? Number(priceValue.replace(/^\$/, ''))
+        : null;
+
+  return {
+    name: typeof card?.name === 'string' ? card.name : null,
+    description: typeof card?.description === 'string' ? card.description : null,
+    category: typeof card?.category === 'string' ? card.category : null,
+    priceUsdc: Number.isFinite(parsedPrice ?? NaN) ? parsedPrice : null,
+  };
+}
+
+function safeParseObject(value: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function parseUsdcPrice(envKey: string, fallback: number): number {
+  const raw = process.env[envKey]?.trim();
+  const candidate = raw ? Number(raw.replace(/^\$/, '')) : fallback;
+  return Number.isFinite(candidate) ? candidate : fallback;
+}
+
+function resolveHealthUrl(slug: CoreAgentSlug): string {
+  switch (slug) {
+    case 'research':
+      return normalizeHealthUrl(process.env.RESEARCH_AGENT_URL?.trim(), 'http://127.0.0.1:3001');
+    case 'swap':
+      return normalizeHealthUrl(process.env.SWAP_AGENT_URL?.trim(), 'http://127.0.0.1:3011');
+    case 'vault':
+      return normalizeHealthUrl(process.env.VAULT_AGENT_URL?.trim(), 'http://127.0.0.1:3012');
+    case 'predmarket':
+      return normalizeHealthUrl(
+        process.env.PREDMARKET_AGENT_URL?.trim(),
+        'http://127.0.0.1:3013',
+      );
+    case 'bridge':
+      return normalizeHealthUrl(process.env.BRIDGE_AGENT_URL?.trim(), 'http://127.0.0.1:3021');
+    case 'portfolio':
+      return normalizeHealthUrl(process.env.PORTFOLIO_AGENT_URL?.trim(), 'http://127.0.0.1:3014');
+    case 'invoice':
+      return normalizeHealthUrl(process.env.INVOICE_AGENT_URL?.trim(), 'http://127.0.0.1:3015');
+    case 'vision':
+      return normalizeHealthUrl(process.env.VISION_AGENT_URL?.trim(), 'http://127.0.0.1:3016');
+    case 'transcribe':
+      return normalizeHealthUrl(
+        process.env.TRANSCRIBE_AGENT_URL?.trim(),
+        'http://127.0.0.1:3017',
+      );
+    case 'schedule':
+      return normalizeHealthUrl(process.env.SCHEDULE_AGENT_URL?.trim(), 'http://127.0.0.1:3018');
+    case 'split':
+      return normalizeHealthUrl(process.env.SPLIT_AGENT_URL?.trim(), 'http://127.0.0.1:3019');
+    case 'batch':
+      return normalizeHealthUrl(process.env.BATCH_AGENT_URL?.trim(), 'http://127.0.0.1:3020');
+  }
+}
+
+function normalizeHealthUrl(configured: string | undefined, fallback: string): string {
+  const value = (configured || fallback).trim();
+  try {
+    const url = new URL(value);
+    url.pathname = '/health';
+    url.search = '';
+    return url.toString();
+  } catch {
+    const base = value.replace(/\/+$/, '');
+    return `${base}/health`;
+  }
+}
+
+async function checkHealth(url: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+router.get('/leaderboard', async (_req, res) => {
+  try {
+    const { getRedis } = await import('../db/client');
+    const redis = getRedis();
+    const cacheKey = 'leaderboard:v1';
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
+
+    const leaderboard = await buildLeaderboard();
+    await redis.set(cacheKey, JSON.stringify(leaderboard), 'EX', 300);
+    return res.json(leaderboard);
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message ?? 'leaderboard failed' });
+  }
+});
+
+type LeaderboardRow = {
+  rank: number;
+  slug: string;
+  name: string;
+  totalExecutions: number;
+  successRate: number;
+  totalVolumeUsdc: number;
+  reputationScore: number;
+  erc8004AgentId: number;
+};
+
+async function buildLeaderboard(): Promise<LeaderboardRow[]> {
+  const [systemAgents, publishedAgents, interactionsRes, txRes] = await Promise.all([
+    fetchSystemAgents(),
+    fetchPublishedAgents(),
+    adminDb.from('agent_interactions').select('agent_slug, agent_output'),
+    adminDb.from('transactions').select('agent_slug, amount'),
+  ]);
+
+  if (interactionsRes.error) {
+    throw new Error(interactionsRes.error.message);
+  }
+  if (txRes.error) {
+    throw new Error(txRes.error.message);
+  }
+
+  const agents = [...systemAgents, ...publishedAgents];
+  const metadataBySlug = new Map(
+    agents.map((agent) => [
+      agent.slug,
+      {
+        slug: agent.slug,
+        name: agent.name,
+        reputationScore: agent.reputationScore,
+        erc8004AgentId: Number.parseInt(agent.tokenId ?? '0', 10) || 0,
+      },
+    ]),
+  );
+
+  const executionStats = new Map<string, { totalExecutions: number; successfulExecutions: number }>();
+  for (const row of interactionsRes.data ?? []) {
+    const slug = String(row.agent_slug ?? '').trim().toLowerCase();
+    if (!slug) continue;
+    const current = executionStats.get(slug) ?? { totalExecutions: 0, successfulExecutions: 0 };
+    current.totalExecutions += 1;
+    if (row.agent_output !== null && row.agent_output !== undefined) {
+      current.successfulExecutions += 1;
+    }
+    executionStats.set(slug, current);
+  }
+
+  const volumeStats = new Map<string, number>();
+  for (const row of txRes.data ?? []) {
+    const slug = String(row.agent_slug ?? '').trim().toLowerCase();
+    if (!slug) continue;
+    const amount = Number(row.amount ?? 0);
+    volumeStats.set(slug, (volumeStats.get(slug) ?? 0) + (Number.isFinite(amount) ? amount : 0));
+  }
+
+  const slugs = new Set<string>([
+    ...metadataBySlug.keys(),
+    ...executionStats.keys(),
+    ...volumeStats.keys(),
+  ]);
+
+  const rows = Array.from(slugs)
+    .map((slug) => {
+      const meta = metadataBySlug.get(slug);
+      const execution = executionStats.get(slug) ?? { totalExecutions: 0, successfulExecutions: 0 };
+      const totalExecutions = execution.totalExecutions;
+      const successRate =
+        totalExecutions > 0 ? execution.successfulExecutions / totalExecutions : 0;
+
+      return {
+        rank: 0,
+        slug,
+        name: meta?.name ?? slug,
+        totalExecutions,
+        successRate,
+        totalVolumeUsdc: Number((volumeStats.get(slug) ?? 0).toFixed(6)),
+        reputationScore: meta?.reputationScore ?? 0,
+        erc8004AgentId: meta?.erc8004AgentId ?? 0,
+      } satisfies LeaderboardRow;
+    })
+    .sort((a, b) => {
+      if (b.reputationScore !== a.reputationScore) {
+        return b.reputationScore - a.reputationScore;
+      }
+      if (b.totalExecutions !== a.totalExecutions) {
+        return b.totalExecutions - a.totalExecutions;
+      }
+      return b.totalVolumeUsdc - a.totalVolumeUsdc;
+    })
+    .map((row, index) => ({
+      ...row,
+      rank: index + 1,
+      successRate: Number((row.successRate * 100).toFixed(2)),
+      totalVolumeUsdc: Number(row.totalVolumeUsdc.toFixed(2)),
+    }));
+
+  return rows;
+}

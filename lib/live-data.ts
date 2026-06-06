@@ -3,11 +3,22 @@
  * CoinGecko is used for current token market metrics.
  * DefiLlama is used for chain-level TVL and stablecoin liquidity.
  * GDELT is used for current-event and geopolitical article context.
- * Firecrawl is used to search and scrape the newest article bodies into compact snapshots.
+ * Firecrawl is used to scrape targeted article URLs into compact snapshots.
  * DuckDuckGo is used for lightweight background context and descriptive snippets.
  */
-import { fetchUrlViaFirecrawl, searchFirecrawlNews, type FirecrawlSearchResult } from './firecrawl';
-import { classifyTopic, selectSources, type SourceConfig } from './source-registry';
+import { fetchUrlViaFirecrawl, type FirecrawlSearchResult } from './firecrawl';
+import { SOURCE_REGISTRY, classifyTopic, type SourceConfig } from './source-registry';
+import { detectProtocolQueryShape } from './protocol-query-shape';
+import {
+  isAuthoritativeSportsEvidenceUrl,
+  isCircularResearchSourceUrl,
+  isCreatorAudienceMetricTask,
+  isLowValueSourceForTask,
+  isLowValueSocialSourceUrl,
+  isLowValueVideoUrl,
+  isOfficialCreatorPlatformUrl,
+} from './source-policy';
+import { decodeTextResponse, normalizeSourceText, repairMojibake } from './text-normalization';
 
 type ResearchDomain = 'crypto' | 'geopolitics' | 'general';
 
@@ -70,6 +81,15 @@ type FirecrawlArticleSnapshot = {
   summary: string;
 };
 
+type CreatorAudienceMetricSnapshot = {
+  source: string;
+  channel_name?: string;
+  channel_id?: string;
+  current_subscribers?: number;
+  current_subscribers_display?: string;
+  observed_at?: string;
+};
+
 type CurrentEventSignalSupport = {
   title: string;
   source_name: string;
@@ -105,14 +125,30 @@ type DefiLlamaChainSnapshot = {
   }>;
 };
 
+type BitcoinOnchainSnapshot = {
+  source: 'Mempool.space blocks API';
+  chain: 'Bitcoin';
+  window: 'last_24h_from_tip';
+  latest_block_height: number;
+  latest_block_time: string;
+  window_start_time: string;
+  confirmed_transaction_count_24h: number;
+  block_count_24h: number;
+  average_transactions_per_block?: number;
+  total_fees_btc_24h?: number;
+  total_output_btc_24h?: number;
+};
+
 type CacheEntry<T> = {
   value: T;
   expiresAt: number;
 };
 
 const LIVE_DATA_FETCH_TIMEOUT_MS = 4_000;
+const FAST_GDELT_FETCH_TIMEOUT_MS = 2_000;
 const LIVE_DATA_CACHE_TTL_MS = 60_000;
 const COINGECKO_CACHE_TTL_MS = 30_000;
+const BITCOIN_ONCHAIN_CACHE_TTL_MS = 60_000;
 const DEFILLAMA_CACHE_TTL_MS = 300_000;
 const DUCKDUCKGO_CACHE_TTL_MS = 120_000;
 const GDELT_CACHE_TTL_MS = 120_000;
@@ -120,6 +156,8 @@ const NEWS_RSS_CACHE_TTL_MS = 120_000;
 const THN_RSS_CACHE_TTL_MS = 120_000;
 const WIKIPEDIA_CACHE_TTL_MS = 300_000;
 const FIRECRAWL_CACHE_TTL_MS = 300_000;
+const FIRECRAWL_EMPTY_RETRY_DELAY_MS = 1_500;
+const HYBRID_FIRECRAWL_SEARCH_TIMEOUT_MS = 35_000;
 const GDELT_MIN_INTERVAL_MS = 6_000;
 const THN_RSS_URL = 'https://feeds.feedburner.com/TheHackersNews';
 const CURRENT_EVENT_RECENCY_WINDOW_DAYS = Number(
@@ -128,6 +166,7 @@ const CURRENT_EVENT_RECENCY_WINDOW_DAYS = Number(
 
 const liveDataCache = new Map<string, CacheEntry<string>>();
 const coinGeckoCache = new Map<string, CacheEntry<CoinGeckoAssetSnapshot[]>>();
+const bitcoinOnchainCache = new Map<string, CacheEntry<BitcoinOnchainSnapshot | null>>();
 const duckDuckGoCache = new Map<string, CacheEntry<DuckDuckGoSnapshot | null>>();
 const gdeltCache = new Map<string, CacheEntry<GdeltArticleSnapshot[]>>();
 const newsRssCache = new Map<string, CacheEntry<GdeltArticleSnapshot[]>>();
@@ -158,6 +197,251 @@ function stripExecutionContext(task: string): string {
   return task.replace(/\bExecution context:[\s\S]*$/i, '').replace(/\s+/g, ' ').trim();
 }
 
+function cleanPredictionMarketResearchTaskForSearch(task: string): string {
+  const cleaned = task
+    .replace(/\r?\n+/g, ' ')
+    .replace(/^research\s+(?:the\s+)?(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
+    .replace(/\bListed outcomes in AgentFlow:[\s\S]*?(?=\bFocus on the real-world event\b|$)/i, ' ')
+    .replace(/\bFocus on the real-world event[\s\S]*$/i, ' ')
+    .replace(/\bthe\s+prediction\s+market\s+topic\b[:\s-]*/i, ' ')
+    .replace(/\bprediction\s+market\s+topic\b[:\s-]*/i, ' ')
+    .replace(/\bmarket\s+topic\b[:\s-]*/i, ' ')
+    .replace(/\bprediction\b/gi, ' ')
+    .replace(/\b0x[a-fA-F0-9]{40}\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned || task.trim();
+}
+
+function normalizeLiveDataSearchTask(task: string): string {
+  const stripped = task.replace(/\bExecution context:[\s\S]*$/i, '').trim();
+  if (/\bprediction\s+market\b/i.test(stripped)) {
+    return cleanPredictionMarketResearchTaskForSearch(stripped);
+  }
+  return stripped.replace(/\s+/g, ' ').trim();
+}
+
+function extractPredictionMarketListedOutcomes(task: string): string[] {
+  const match = task.match(
+    /\bListed outcomes in AgentFlow:\s*([\s\S]*?)(?=\bFocus on the real-world event\b|$)/i,
+  );
+  if (!match?.[1]) return [];
+  return match[1]
+    .split(/[\/,]|(?:\s+\|\s+)/)
+    .map((value) => value.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .filter((value) => value.length > 1)
+    .slice(0, 8);
+}
+
+function normalizeSportsTeamName(value: string): string {
+  return value
+    .replace(/\bPSG\b/gi, 'Paris Saint-Germain')
+    .replace(/\bAthletico Madrid\b/gi, 'Atletico Madrid')
+    .replace(/\bBayern\b(?!\s+Munich\b)/gi, 'Bayern Munich')
+    .replace(/\bMan Utd\b/gi, 'Manchester United')
+    .replace(/\bMan City\b/gi, 'Manchester City')
+    .replace(/[?.,:;()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeSportsPredictionTopic(value: string): string {
+  return value
+    .replace(/\bUCL\b/gi, 'UEFA Champions League')
+    .replace(/\bEPL\b/gi, 'English Premier League')
+    .replace(/\bWinner Prediction\b/gi, 'winner')
+    .replace(/\bPrediction\b/gi, ' ')
+    .replace(/\bEurope(?:'|’)?s Giants Clash\b/gi, ' ')
+    .replace(/\bclash of giants\b/gi, ' ')
+    .replace(/[?.,:;()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isSportsPredictionMarketTask(task: string): boolean {
+  return (
+    /\bprediction market\b/i.test(task) &&
+    /\b(ucl|champions league|uefa|premier league|nba|nfl|mlb|nhl|fifa|world cup|arsenal|bayern|atletico|psg|france|argentina|brazil|england|spain|portugal|netherlands|germany|morocco|belgium)\b/i.test(
+      task,
+    )
+  );
+}
+
+function buildSportsPredictionMarketQueries(task: string, cleanedTask: string): string[] {
+  if (!isSportsPredictionMarketTask(task) && !isSportsPredictionMarketTask(cleanedTask)) {
+    return [];
+  }
+
+  const queries: string[] = [];
+  const normalizedBase = normalizeSportsPredictionTopic(cleanedTask || task);
+  const outcomes = extractPredictionMarketListedOutcomes(task)
+    .map(normalizeSportsTeamName)
+    .filter(Boolean);
+  const teamsText = outcomes.join(' ');
+  const competition =
+    /\b(uefa champions league|champions league|ucl)\b/i.test(`${task} ${cleanedTask}`)
+      ? 'UEFA Champions League 2025/26'
+      : /\b(fifa world cup|world cup)\b/i.test(`${task} ${cleanedTask}`)
+        ? 'FIFA World Cup 2026'
+      : normalizedBase;
+
+  addUniqueQuery(queries, normalizedBase);
+  if (teamsText) {
+    addUniqueQuery(queries, `${competition} ${teamsText}`);
+    addUniqueQuery(queries, `${competition} ${teamsText} semi finals`);
+    addUniqueQuery(queries, `${competition} ${teamsText} final result`);
+    addUniqueQuery(queries, `${competition} ${teamsText} odds predictions`);
+    addUniqueQuery(queries, `${competition} ${teamsText} opta analyst`);
+    addUniqueQuery(queries, `${competition} ${teamsText} current form injuries`);
+  } else {
+    addUniqueQuery(queries, `${competition} odds predictions`);
+    addUniqueQuery(queries, `${competition} current form injuries`);
+  }
+
+  addUniqueQuery(queries, `site:uefa.com ${competition} winners`);
+  if (/\bFIFA World Cup 2026\b/i.test(competition)) {
+    addUniqueQuery(queries, `site:fifa.com ${competition} favorites odds`);
+    addUniqueQuery(queries, `site:espn.com ${competition} predictions`);
+    addUniqueQuery(queries, `${competition} fifa rankings favorites`);
+  }
+  addUniqueQuery(queries, `${competition} winner latest`);
+  addUniqueQuery(queries, `${competition} latest`);
+  return queries.slice(0, 8);
+}
+
+function filterCreatorAudienceEvidence(
+  snapshots: FirecrawlArticleSnapshot[],
+): FirecrawlArticleSnapshot[] {
+  const preferred = snapshots.filter((snapshot) => {
+    const haystack = `${snapshot.title} ${snapshot.publisher || ''} ${snapshot.url} ${snapshot.summary}`.toLowerCase();
+    if (/\b(socialcounts|livecounts|socialblade|viewstats)\b/.test(haystack)) return true;
+    if (/\bkalshi\b/.test(haystack)) return true;
+    if (isOfficialCreatorPlatformUrl(snapshot.url)) return true;
+    return false;
+  });
+
+  const filtered = preferred.filter((snapshot) => {
+    const haystack = `${snapshot.title} ${snapshot.publisher || ''} ${snapshot.url} ${snapshot.summary}`.toLowerCase();
+    if (/\breddit\.com\b/.test(haystack)) return false;
+    if (isLowValueVideoUrl(snapshot.url) && !/\blive subscriber|subscriber count\b/i.test(haystack)) {
+      return false;
+    }
+    return true;
+  });
+
+  return filtered.length > 0 ? filtered : snapshots;
+}
+
+function filterLowValueEvidenceForTask(
+  task: string,
+  snapshots: FirecrawlArticleSnapshot[],
+): FirecrawlArticleSnapshot[] {
+  return snapshots.filter((snapshot) =>
+    !isLowValueSourceForTask(task, {
+      domain: snapshot.publisher,
+      url: snapshot.url,
+      title: snapshot.title,
+      summary: snapshot.summary,
+      publisher: snapshot.publisher,
+    }),
+  );
+}
+
+function extractYoutubeChannelId(url: string): string | null {
+  const match = url.match(/youtube\.com\/channel\/([A-Za-z0-9_-]{20,})/i);
+  return match?.[1] ?? null;
+}
+
+function augmentCreatorAudienceEvidence(
+  snapshots: FirecrawlArticleSnapshot[],
+): FirecrawlArticleSnapshot[] {
+  const channelSnapshot = snapshots.find((snapshot) => isOfficialCreatorPlatformUrl(snapshot.url));
+  if (!channelSnapshot) return snapshots;
+  const channelId = extractYoutubeChannelId(channelSnapshot.url);
+  if (!channelId) return snapshots;
+
+  const titleBase = channelSnapshot.title.replace(/\s*-\s*youtube\s*$/i, '').trim() || 'Creator';
+  const augmented = [...snapshots];
+
+  if (!augmented.some((snapshot) => /\bsocialcounts\.org\b/i.test(snapshot.url))) {
+    augmented.push({
+      title: `${titleBase} - YouTube Live Subscriber Count - SocialCounts.org`,
+      url: `https://socialcounts.org/youtube-live-subscriber-count/${channelId}`,
+      publisher: 'socialcounts.org',
+      summary: `Live subscriber tracker for ${titleBase}.`,
+    });
+  }
+
+  if (!augmented.some((snapshot) => /\blivecounts\.io\b/i.test(snapshot.url))) {
+    augmented.push({
+      title: `${titleBase} Realtime YouTube Live Subscriber Counter - Livecounts.io`,
+      url: `https://livecounts.io/youtube-live-subscriber-counter/${channelId}`,
+      publisher: 'livecounts.io',
+      summary: `Realtime subscriber tracker for ${titleBase}.`,
+    });
+  }
+
+  return augmented;
+}
+
+function parseDisplaySubscriberCount(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const digits = value.replace(/[^\d]/g, '');
+  if (!digits) return undefined;
+  const parsed = Number(digits);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function extractCreatorAudienceMetricFromMarkdown(
+  markdown: string,
+  url: string,
+): CreatorAudienceMetricSnapshot | null {
+  const currentCountMatch =
+    markdown.match(/(?:^|\n)(\d{3}(?:,\d{3})+)\n\nSocialcounts\.Org/i) ||
+    markdown.match(/(?:^|\n)(\d{3}(?:,\d{3})+)\n\nSubscribers/i);
+  const currentSubscribersDisplay = currentCountMatch?.[1]?.trim();
+  const currentSubscribers = parseDisplaySubscriberCount(currentSubscribersDisplay);
+
+  const channelName =
+    markdown.match(/\[([^\]]+)\]\(https:\/\/www\.youtube\.com\/channel\/[A-Za-z0-9_-]+\s+"Visit channel on YouTube"\)/i)?.[1]?.trim() ||
+    markdown.match(/^([^\n]+)\n\n[-=]{3,}\n\n\d{3}(?:,\d{3})+/m)?.[1]?.trim();
+  const channelId = url.match(/\/([A-Za-z0-9_-]{20,})$/)?.[1];
+  const observedAtLabel =
+    markdown.match(/\|\s*([A-Z][a-z]{2}\s+\d{1,2},\s+20\d{2})<br><br>/)?.[1]?.trim();
+  const observedAt = observedAtLabel
+    ? new Date(`${observedAtLabel} 00:00:00 UTC`).toISOString().slice(0, 10)
+    : undefined;
+
+  if (!currentSubscribersDisplay || !currentSubscribers) {
+    return null;
+  }
+
+  return {
+    source: new URL(url).hostname.replace(/^www\./, ''),
+    ...(channelName ? { channel_name: channelName } : {}),
+    ...(channelId ? { channel_id: channelId } : {}),
+    current_subscribers: currentSubscribers,
+    current_subscribers_display: currentSubscribersDisplay,
+    ...(observedAt ? { observed_at: observedAt } : {}),
+  };
+}
+
+async function fetchCreatorAudienceMetricSnapshot(
+  snapshots: FirecrawlArticleSnapshot[],
+): Promise<CreatorAudienceMetricSnapshot | null> {
+  const preferred = snapshots.find((snapshot) => /\bsocialcounts\.org\b/i.test(snapshot.url));
+  if (!preferred) return null;
+
+  try {
+    const markdown = await fetchUrlViaFirecrawl(preferred.url);
+    return extractCreatorAudienceMetricFromMarkdown(markdown, preferred.url);
+  } catch {
+    return null;
+  }
+}
+
 function splitExpandedTaskQueries(task: string): string[] {
   return task
     .split('|')
@@ -171,22 +455,44 @@ function addUniqueQuery(queries: string[], query: string | undefined): void {
   queries.push(value);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isArcNetworkTask(task: string): boolean {
   return /\barc network\b|\barc blockchain\b|\barc testnet\b|\barc ecosystem\b/i.test(task);
 }
 
 function buildResearchQueryVariants(task: string): string[] {
-  const cleanedTask = stripExecutionContext(task);
+  const cleanedTask = normalizeLiveDataSearchTask(task);
+  const sportsPredictionQueries = buildSportsPredictionMarketQueries(task, cleanedTask);
+  if (sportsPredictionQueries.length > 0) {
+    return sportsPredictionQueries;
+  }
   const queries: string[] = [];
   const splitQueries = splitExpandedTaskQueries(cleanedTask);
 
   for (const variant of splitQueries) {
-    addUniqueQuery(queries, variant);
-    addUniqueQuery(queries, normalizeCurrentEventQuery(variant));
+    const stripped = stripFirecrawlResearchScaffolding(variant);
+    const expanded = expandFirecrawlCryptoSymbols(stripped || variant);
+    const normalized = normalizeCurrentEventQuery(expanded || stripped || variant);
+    const primary = normalized || expanded || stripped || variant;
+    addUniqueQuery(queries, primary);
+    addUniqueQuery(queries, normalizeCurrentEventQuery(primary));
+    for (const enrichmentVariant of buildCurrentStateFirecrawlVariants(primary)) {
+      addUniqueQuery(queries, enrichmentVariant);
+    }
   }
 
   if (splitQueries.length === 0) {
-    addUniqueQuery(queries, normalizeCurrentEventQuery(cleanedTask));
+    const stripped = stripFirecrawlResearchScaffolding(cleanedTask);
+    const expanded = expandFirecrawlCryptoSymbols(stripped || cleanedTask);
+    const normalized = normalizeCurrentEventQuery(expanded || stripped || cleanedTask);
+    const primary = normalized || expanded || stripped || cleanedTask;
+    addUniqueQuery(queries, primary);
+    for (const enrichmentVariant of buildCurrentStateFirecrawlVariants(primary)) {
+      addUniqueQuery(queries, enrichmentVariant);
+    }
   }
 
   if (isArcNetworkTask(cleanedTask)) {
@@ -205,7 +511,285 @@ function buildResearchQueryVariants(task: string): string[] {
   return queries.slice(0, 10);
 }
 
+const FIRECRAWL_SCAFFOLDING_PREFIXES: RegExp[] = [
+  /^\s*(?:make|write|create|generate|prepare|give)(?:\s+(?:me|us))?(?:\s+a)?\s+research\s+on\s+/i,
+  /^\s*research\s+on\s+/i,
+  /^\s*research\s+/i,
+  /^\s*tell\s+me\s+about\s+/i,
+  /^\s*what\s+is\s+/i,
+  /^\s*give\s+me\s+(?:a\s+)?report\s+on\s+/i,
+  /^\s*report\s+on\s+/i,
+  /^\s*analy[sz]e\s+/i,
+  /^\s*analysis\s+of\s+/i,
+  /^\s*brief\s+on\s+/i,
+];
+
+const FIRECRAWL_SYMBOL_EXPANSIONS: Array<{ pattern: RegExp; replacement: string }> = [
+  { pattern: /\bbtc\b/gi, replacement: 'bitcoin' },
+  { pattern: /\beth\b/gi, replacement: 'ethereum' },
+  { pattern: /\bsol\b/gi, replacement: 'solana' },
+  { pattern: /\bbnb\b/gi, replacement: 'binance coin' },
+  { pattern: /\bxrp\b/gi, replacement: 'ripple' },
+];
+
+export type ForecastingIntent = {
+  forecasting: boolean;
+  horizonLabel?: string;
+  targetYear?: number;
+};
+
+function stripFirecrawlResearchScaffolding(task: string): string {
+  let stripped = stripExecutionContext(task);
+  for (const pattern of FIRECRAWL_SCAFFOLDING_PREFIXES) {
+    stripped = stripped.replace(pattern, '');
+  }
+  return stripped.replace(/\s+/g, ' ').trim();
+}
+
+function expandFirecrawlCryptoSymbols(task: string): string {
+  let expanded = task;
+  for (const rule of FIRECRAWL_SYMBOL_EXPANSIONS) {
+    expanded = expanded.replace(rule.pattern, rule.replacement);
+  }
+  return expanded.replace(/\s+/g, ' ').trim();
+}
+
+function singularizeForecastUnit(unit: string): string {
+  return unit.replace(/s$/i, '');
+}
+
+export function detectForecastingIntent(task: string): ForecastingIntent {
+  const lower = task.toLowerCase();
+  const currentYear = new Date().getUTCFullYear();
+
+  const horizonMatch =
+    lower.match(/\bover the next\s+(\d+)\s+(years?|months?|decades?)\b/) ||
+    lower.match(/\bwhere will .+? be in\s+(\d+)\s+(years?|months?|decades?)\b/) ||
+    lower.match(/\bin\s+(\d+)\s+(years?|months?)\b/) ||
+    lower.match(/\bnext\s+(\d+)\s+(years?|months?|decades?)\b/);
+  if (horizonMatch) {
+    const amount = Number(horizonMatch[1]);
+    const unit = singularizeForecastUnit(horizonMatch[2]);
+    if (Number.isFinite(amount) && amount > 0) {
+      const targetYear =
+        unit === 'year' ? currentYear + amount : unit === 'decade' ? currentYear + amount * 10 : undefined;
+      return {
+        forecasting: true,
+        horizonLabel: `${amount} ${amount === 1 ? unit : `${unit}s`}`,
+        targetYear,
+      };
+    }
+  }
+
+  const explicitYearMatch = lower.match(/\bby\s+(20\d{2}|21\d{2})\b/);
+  if (explicitYearMatch) {
+    const targetYear = Number(explicitYearMatch[1]);
+    return {
+      forecasting: true,
+      horizonLabel: `by ${targetYear}`,
+      targetYear,
+    };
+  }
+
+  if (
+    /\b(long[\s-]?term\s+(?:outlook|forecast))\b/.test(lower) ||
+    /\bfuture of\b/.test(lower) ||
+    /\bprice prediction\b/.test(lower) ||
+    /\bgrowth potential\b/.test(lower) ||
+    /\bforecast\b/.test(lower) ||
+    /\bprojection\b/.test(lower)
+  ) {
+    return { forecasting: true };
+  }
+
+  return { forecasting: false };
+}
+
+function buildForecastingEntityQuery(baseQuery: string): string {
+  return baseQuery
+    .replace(/\bover the next\s+\d+\s+(?:year|years|month|months|decade|decades)\b/gi, '')
+    .replace(/\bwhere will\s+/gi, '')
+    .replace(/\bbe in\s+\d+\s+(?:year|years|month|months|decade|decades)\b/gi, '')
+    .replace(/\bin\s+\d+\s+(?:year|years|month|months)\b/gi, '')
+    .replace(/\bnext\s+\d+\s+(?:year|years|month|months|decade|decades)\b/gi, '')
+    .replace(/\bnext decade\b/gi, '')
+    .replace(/\bby\s+(?:20\d{2}|21\d{2})\b/gi, '')
+    .replace(/\blong[\s-]?term\s+(?:outlook|forecast)\b/gi, '')
+    .replace(/\bfuture of\b/gi, '')
+    .replace(/\bprice prediction\b/gi, '')
+    .replace(/\bgrowth potential\b/gi, '')
+    .replace(/\bforecast\b/gi, '')
+    .replace(/\bprojection\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildForecastingFirecrawlVariants(baseQuery: string, intent: ForecastingIntent): string[] {
+  const variants: string[] = [];
+  const entityQuery = buildForecastingEntityQuery(baseQuery) || baseQuery;
+  const lowerEntity = entityQuery.toLowerCase();
+  const targetYear = intent.targetYear;
+
+  if (targetYear && /\b(bitcoin|ethereum|solana|binance coin|ripple)\b/.test(lowerEntity)) {
+    addUniqueQuery(variants, `${entityQuery} price prediction ${targetYear}`);
+  } else if (/\bprice prediction\b/i.test(baseQuery) && targetYear) {
+    addUniqueQuery(variants, `${entityQuery} price prediction ${targetYear}`);
+  } else if (/\b(bitcoin|ethereum|solana|binance coin|ripple)\b/.test(lowerEntity)) {
+    addUniqueQuery(variants, `${entityQuery} price prediction`);
+  }
+
+  addUniqueQuery(variants, `${entityQuery} long term forecast`);
+  if (intent.horizonLabel) {
+    addUniqueQuery(variants, `${entityQuery} ${intent.horizonLabel} outlook`);
+  } else {
+    addUniqueQuery(variants, `${entityQuery} future outlook`);
+  }
+  addUniqueQuery(variants, `${entityQuery} growth potential`);
+
+  if (/\bbitcoin\b/.test(lowerEntity)) {
+    addUniqueQuery(variants, 'bitcoin halving cycle analysis');
+  }
+
+  return variants;
+}
+
+function buildCurrentStateFirecrawlVariants(baseQuery: string): string[] {
+  const variants: string[] = [];
+  const lower = baseQuery.toLowerCase();
+  const broadAssetLike =
+    /^(bitcoin|ethereum|solana|binance coin|ripple)\b/.test(lower) ||
+    /\b(bitcoin|ethereum|solana|binance coin|ripple)\b/.test(lower);
+  const creatorAudienceLike = isCreatorAudienceMetricTask(baseQuery);
+
+  if (broadAssetLike) {
+    addUniqueQuery(variants, `${baseQuery} market analysis`);
+    addUniqueQuery(variants, `${baseQuery} news ${new Date().getUTCFullYear()}`);
+  } else if (creatorAudienceLike) {
+    addUniqueQuery(variants, `${baseQuery} current subscriber count`);
+    addUniqueQuery(variants, `${baseQuery} live subscriber count`);
+    addUniqueQuery(variants, `${baseQuery} official YouTube channel subscribers`);
+    addUniqueQuery(variants, `${baseQuery} SocialBlade subscribers`);
+  } else if (/\bmainnet\b|\blaunch\b/i.test(baseQuery)) {
+    addUniqueQuery(variants, `${baseQuery} official announcement`);
+    addUniqueQuery(variants, `${baseQuery} roadmap`);
+    addUniqueQuery(variants, `${baseQuery} latest news`);
+    if (/\barc\b/i.test(baseQuery)) {
+      addUniqueQuery(variants, 'ARC blockchain mainnet launch 2026');
+      addUniqueQuery(variants, 'Circle ARC mainnet 2026');
+    }
+  } else if (/\blandscape\b|\becosystem\b/i.test(baseQuery)) {
+    addUniqueQuery(variants, `${baseQuery} analysis`);
+  }
+
+  return variants;
+}
+
+export function buildPrimaryFirecrawlQueryVariants(task: string): string[] {
+  const cleanedTask = normalizeLiveDataSearchTask(task);
+  const sportsPredictionQueries = buildSportsPredictionMarketQueries(task, cleanedTask);
+  if (sportsPredictionQueries.length > 0) {
+    return sportsPredictionQueries;
+  }
+  const splitQueries = splitExpandedTaskQueries(cleanedTask);
+  const baseQueries = splitQueries.length > 0 ? splitQueries : [cleanedTask];
+  const queries: string[] = [];
+
+  for (const query of baseQueries) {
+    const stripped = stripFirecrawlResearchScaffolding(query);
+    const expanded = expandFirecrawlCryptoSymbols(stripped || query);
+    const normalized = normalizeCurrentEventQuery(expanded || stripped || query);
+    const primary = normalized || expanded || stripped || query;
+    const forecastingIntent = detectForecastingIntent(primary);
+
+    addUniqueQuery(queries, primary);
+
+    const enrichmentVariants = forecastingIntent.forecasting
+      ? buildForecastingFirecrawlVariants(primary, forecastingIntent)
+      : buildCurrentStateFirecrawlVariants(primary);
+
+    for (const variant of enrichmentVariants) {
+      addUniqueQuery(queries, variant);
+    }
+  }
+
+  if (queries.length === 0) {
+    addUniqueQuery(queries, normalizeCurrentEventQuery(expandFirecrawlCryptoSymbols(cleanedTask)));
+  }
+
+  return queries.slice(0, 10);
+}
+
+function filterPredictionMarketResearchEvidence(
+  task: string,
+  snapshots: FirecrawlArticleSnapshot[],
+): FirecrawlArticleSnapshot[] {
+  if (!/\bprediction market\b/i.test(task)) return snapshots;
+
+  const withoutCircularMarketSources = snapshots.filter((snapshot) => {
+    if (isCircularResearchSourceUrl(task, snapshot.url)) return false;
+    return true;
+  });
+  const authoritative = withoutCircularMarketSources.filter((snapshot) =>
+    isAuthoritativeSportsEvidenceUrl(snapshot.url, snapshot.publisher),
+  );
+
+  if (authoritative.length >= 2) {
+    return authoritative;
+  }
+
+  const nonSocial = withoutCircularMarketSources.filter(
+    (snapshot) => !isLowValueSocialSourceUrl(snapshot.url) && !isLowValueVideoUrl(snapshot.url),
+  );
+  if (nonSocial.length >= 2) {
+    return nonSocial;
+  }
+
+  return withoutCircularMarketSources;
+}
+
+function sanitizePredictionMarketCurrentEvents(
+  task: string,
+  currentEvents: CurrentEventsSnapshot | null,
+): CurrentEventsSnapshot | null {
+  if (!currentEvents || !/\bprediction market\b/i.test(task)) {
+    return currentEvents;
+  }
+
+  const filterUrl = (url: string | undefined): boolean => {
+    if (!url) return false;
+    if (isCircularResearchSourceUrl(task, url)) return false;
+    return true;
+  };
+
+  const filteredArticles = (currentEvents.articles || []).filter((article) =>
+    filterUrl(article.url),
+  );
+  const filteredSnapshots = (currentEvents.article_snapshots || []).filter((article) =>
+    filterUrl(article.url),
+  );
+
+  const authoritativeCount =
+    filteredArticles.filter((article) =>
+      isAuthoritativeSportsEvidenceUrl(article.url, article.publisher),
+    ).length +
+    filteredSnapshots.filter((article) =>
+      isAuthoritativeSportsEvidenceUrl(article.url, article.publisher),
+    ).length;
+
+  const trimLowValueSocial = authoritativeCount >= 2;
+  const socialFilter = (url: string) =>
+    !trimLowValueSocial ||
+    (!isLowValueSocialSourceUrl(url) && !isLowValueVideoUrl(url));
+
+  return {
+    ...currentEvents,
+    articles: filteredArticles.filter((article) => socialFilter(article.url)),
+    article_snapshots: filteredSnapshots.filter((article) => socialFilter(article.url)),
+  };
+}
+
 const COIN_KEYWORDS: Array<{ pattern: RegExp; coinId: string; symbol: string }> = [
+  { pattern: /\btether gold\b|\bxaut\b/i, coinId: 'tether-gold', symbol: 'XAUT' },
   { pattern: /\bbitcoin\b|\bbtc\b/i, coinId: 'bitcoin', symbol: 'BTC' },
   { pattern: /\bethereum\b|\beth\b/i, coinId: 'ethereum', symbol: 'ETH' },
   { pattern: /\bsolana\b|\bsol\b/i, coinId: 'solana', symbol: 'SOL' },
@@ -347,9 +931,9 @@ function setTimedCache<T>(
   return value;
 }
 
-async function fetchJsonWithTimeout<T>(url: string): Promise<T> {
+async function fetchJsonWithTimeout<T>(url: string, timeoutMs = LIVE_DATA_FETCH_TIMEOUT_MS): Promise<T> {
   const response = await fetch(url, {
-    signal: AbortSignal.timeout(LIVE_DATA_FETCH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {
@@ -359,16 +943,16 @@ async function fetchJsonWithTimeout<T>(url: string): Promise<T> {
   return (await response.json()) as T;
 }
 
-async function fetchTextWithTimeout(url: string): Promise<string> {
+async function fetchTextWithTimeout(url: string, timeoutMs = LIVE_DATA_FETCH_TIMEOUT_MS): Promise<string> {
   const response = await fetch(url, {
-    signal: AbortSignal.timeout(LIVE_DATA_FETCH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {
     throw new Error(`Request failed with HTTP ${response.status}: ${url}`);
   }
 
-  return response.text();
+  return decodeTextResponse(response);
 }
 
 function detectResearchDomain(task: string): ResearchDomain {
@@ -458,6 +1042,11 @@ function pickChainTargets(task: string): string[] {
   return [...deduped].slice(0, 5);
 }
 
+function isBitcoinTransactionMetricsTask(task: string): boolean {
+  return /\b(bitcoin|btc)\b/i.test(task) &&
+    /\b(transaction|transactions|txs?|on[-\s]?chain|network activity|block activity)\b/i.test(task);
+}
+
 function unixToIso(value: unknown): string | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   return new Date(value * 1000).toISOString();
@@ -517,7 +1106,7 @@ function normalizeCurrentEventQuery(task: string): string {
 }
 
 function buildCurrentEventQueries(task: string): string[] {
-  const cleanedTask = stripExecutionContext(task);
+  const cleanedTask = normalizeLiveDataSearchTask(task);
   const queries: string[] = [];
   const entities = extractGeopoliticalEntities(cleanedTask);
   const shippingFocused = /\bshipping\b|\bhormuz\b|\bstrait of hormuz\b|\bred sea\b|\bsuez\b/i.test(
@@ -531,7 +1120,7 @@ function buildCurrentEventQueries(task: string): string[] {
     }
   };
 
-  for (const query of buildResearchQueryVariants(cleanedTask)) {
+  for (const query of buildResearchQueryVariants(task)) {
     addQuery(query);
   }
 
@@ -561,12 +1150,45 @@ function buildCurrentEventQueries(task: string): string[] {
   return queries.slice(0, 10);
 }
 
-function shouldGatherCurrentEvents(task: string): boolean {
-  const cleanedTask = stripExecutionContext(task);
+function isBroadLongHorizonOverviewTask(task: string): boolean {
+  const cleanedTask = stripExecutionContext(task).trim().toLowerCase();
+  if (!cleanedTask) return false;
+
+  if (
+    /\bover the next\s+\d+\s+(?:year|years|month|months|decade|decades)\b/.test(cleanedTask) ||
+    /\bnext\s+\d+\s+(?:year|years|month|months|decade|decades)\b/.test(cleanedTask) ||
+    /\bnext decade\b/.test(cleanedTask) ||
+    /\b10\s+years\b/.test(cleanedTask) ||
+    /\blong[\s-]?term\b/.test(cleanedTask)
+  ) {
+    return true;
+  }
+
+  return /^(?:make\s+a\s+)?research\s+on\b/.test(cleanedTask) &&
+    /\b(outlook|ecosystem|economy|regulation|market outlook)\b/.test(cleanedTask);
+}
+
+export function shouldGatherCurrentEvents(task: string): boolean {
+  const cleanedTask = normalizeLiveDataSearchTask(task);
+  if (isSportsPredictionMarketTask(task) || isSportsPredictionMarketTask(cleanedTask)) {
+    return true;
+  }
+  if (isBroadLongHorizonOverviewTask(cleanedTask)) {
+    return false;
+  }
+  if (isBroadCurrentStateResearchTask(cleanedTask)) {
+    return true;
+  }
+  if (
+    classifyTopic(cleanedTask).labels.length === 0 &&
+    detectProtocolQueryShape(cleanedTask) !== 'none'
+  ) {
+    return false;
+  }
   return (
     detectResearchDomain(cleanedTask) === 'geopolitics' ||
     isTimeSensitiveTask(cleanedTask) ||
-    /\bresearch\b|\becosystem\b|\bdefi projects?\b|\bdevelopments?\b|\bmarket analysis\b/i.test(
+    /\b(latest|recent|current|today|news|update|updates|developments?|what changed|market analysis)\b/i.test(
       cleanedTask,
     ) ||
     isArcNetworkTask(cleanedTask)
@@ -755,17 +1377,19 @@ function currentEventUrlQualityScore(article: GdeltArticleSnapshot): number {
 }
 
 function decodeXmlEntities(value: string): string {
-  return value
+  return repairMojibake(
+    value
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'");
+    .replace(/&#x27;/g, "'"),
+  );
 }
 
 function markdownToSnippet(markdown: string, maxChars = 520): string | null {
-  const text = markdown
+  const text = normalizeSourceText(markdown, { stripChrome: true, collapseWhitespace: true })
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/!\[[^\]]*\]\([^)]+\)/g, ' ')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
@@ -809,9 +1433,13 @@ function extractFirecrawlSeenAt(result: FirecrawlSearchResult): string | undefin
     'publishedTime',
     'article:published_time',
     'article_published_time',
+    'article:published',
+    'datePublished',
+    'og:updated_time',
+    'article:modified',
     'modifiedTime',
     'last_updated_date',
-  ]);
+  ]) || result.date;
 
   if (!candidate) return undefined;
   const timestamp = Date.parse(candidate);
@@ -831,16 +1459,22 @@ function buildFirecrawlSearchSnapshot(
     return null;
   }
 
-  const title =
-    result.title?.trim() ||
-    getMetadataString(metadata, ['og_title', 'og:title', 'title']) ||
+  const normalizedTitle =
+    normalizeSourceText(result.title?.trim() || '', { stripChrome: true }) ||
+    normalizeSourceText(getMetadataString(metadata, ['og_title', 'og:title', 'title']) || '', {
+      stripChrome: true,
+    }) ||
     'Untitled article';
   const rawPublisher =
     getMetadataString(metadata, ['ogSiteName', 'og:site_name', 'og_site_name']) ||
     extractHostname(url);
   const publisher = normalizePublisherLabel(rawPublisher, url) || rawPublisher;
+  const normalizedSummaryText = normalizeSourceText(result.description || result.snippet || '', {
+    stripChrome: true,
+    collapseWhitespace: true,
+  });
   const summary =
-    truncateSentences(result.description || result.snippet, 320) ||
+    truncateSentences(normalizedSummaryText, 320) ||
     (result.markdown ? markdownToSnippet(result.markdown, 420) : null);
 
   if (!summary) {
@@ -848,7 +1482,7 @@ function buildFirecrawlSearchSnapshot(
   }
 
   return {
-    title,
+    title: normalizedTitle,
     url,
     publisher,
     seen_at: extractFirecrawlSeenAt(result),
@@ -872,6 +1506,7 @@ function snapshotToCurrentEventArticle(
 function firecrawlSnapshotRelevance(snapshot: FirecrawlArticleSnapshot, task: string): number {
   const haystack = `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''}`.toLowerCase();
   let score = currentEventSourceScore(snapshotToCurrentEventArticle(snapshot));
+  const creatorAudienceTask = isCreatorAudienceMetricTask(task);
 
   const shippingTerms = [
     'shipping',
@@ -899,12 +1534,366 @@ function firecrawlSnapshotRelevance(snapshot: FirecrawlArticleSnapshot, task: st
   if (/\bunited states\b|\busa\b|\bu\.s\.?\b|\bus\b/i.test(task) && /\bunited states\b|\bu\.s\b|\bus\b/.test(haystack)) score += 6;
   if (/\bhormuz\b|\bstrait of hormuz\b/i.test(task) && /\bhormuz\b|\bstrait of hormuz\b/.test(haystack)) score += 10;
   if (/\bshipping\b|\bmaritime\b|\binsurance\b|\btanker\b/i.test(task) && /\bshipping\b|\bmaritime\b|\binsurance\b|\btanker\b/.test(haystack)) score += 8;
+  if (creatorAudienceTask && /\b(socialcounts|livecounts|socialblade|viewstats)\b/.test(haystack)) score += 50;
+  if (creatorAudienceTask && isOfficialCreatorPlatformUrl(snapshot.url)) score += 25;
   if (/\/live\//i.test(snapshot.url)) score -= 2;
   if (/^(here'?s what|what is|why\b|how\b|potential\b)/i.test(snapshot.title)) score -= 20;
   if (/\bcould\b|\bmay\b|\bwhat needs to happen\b/.test(haystack)) score -= 10;
   if (/^[A-Z][A-Za-z'. -]{1,40}\s+says\b/i.test(snapshot.title)) score -= 15;
 
   return score;
+}
+
+type SourceQualityStrictness = 'strict' | 'soft';
+
+type SourceQualityContext = {
+  task: string;
+  strictness: SourceQualityStrictness;
+  cryptoTopic: boolean;
+};
+
+const GENERIC_ASSET_PATH_RE = /\/(?:price|prices|currencies|coins|quote|quotes|symbols?|markets?|chart|charts?)(?:\/|$)/i;
+const GENERIC_REFERENCE_PATH_RE = /\/(?:wiki|wikipedia|learn|get-started|getting-started|what-is|about)(?:\/|$)/i;
+const ARTICLE_PATH_RE = /\/(?:article|articles|news|analysis|research|insight|insights|blog|post|posts|report|reports|markets)(?:\/|$)/i;
+const DATED_PATH_RE = /\/20\d{2}\/(?:0?[1-9]|1[0-2])(?:\/|$)|\/20\d{2}[-/](?:0?[1-9]|1[0-2])[-/](?:0?[1-9]|[12]\d|3[01])(?:\/|$)/i;
+const LOCALIZED_PATH_RE = /^\/(?:de|fr|es|it|pt|ru|zh|ja|ko|tr|id|vi|nl|pl|sv|ar)(?:\/|$)/i;
+const NON_ENGLISH_TITLE_RE = /\b(?:aktuelle|nachrichten|heute|kurs|vollstandige|vollständige|leitfaden|preis|marktkapitalisierung|kryptowaehrungen|kryptowährungen|devisen|wechselkurs)\b/i;
+
+const GENERIC_DESTINATION_HOSTS = [
+  'coinmarketcap.com',
+  'coingecko.com',
+  'tradingview.com',
+  'finance.yahoo.com',
+  'coinbase.com',
+  'binance.com',
+  'kraken.com',
+  'forbes.com/digital-assets/assets',
+  'finanzen.net',
+  'investing.com',
+];
+
+const OFFICIAL_PROTOCOL_ROOT_HOSTS = [
+  'bitcoin.org',
+  'ethereum.org',
+  'solana.com',
+  'solana.org',
+];
+
+const CRYPTO_RESEARCH_HOST_BOOSTS: Array<{ host: string; boost: number }> = [
+  { host: 'coindesk.com', boost: 18 },
+  { host: 'theblock.co', boost: 18 },
+  { host: 'decrypt.co', boost: 16 },
+  { host: 'bankless.com', boost: 15 },
+  { host: 'coinmetrics.io', boost: 18 },
+  { host: 'glassnode.com', boost: 18 },
+  { host: 'insights.glassnode.com', boost: 20 },
+  { host: 'messari.io', boost: 18 },
+  { host: 'galaxy.com', boost: 14 },
+  { host: 'ark-invest.com', boost: 14 },
+  { host: 'bitmex.com', boost: 14 },
+  { host: 'blog.bitmex.com', boost: 16 },
+  { host: 'dune.com', boost: 12 },
+  { host: 'l2beat.com', boost: 12 },
+  { host: 'defillama.com', boost: 10 },
+  { host: 'mempool.space', boost: 12 },
+];
+
+const NON_ENGLISH_SOURCE_HOSTS = [
+  'wiwo.de',
+  'finanzen.net',
+  'btc-echo.de',
+  'kryptovergleich.de',
+  'wallstreet-online.de',
+  'tagesschau.de',
+  'handelsblatt.com',
+  'zeit.de',
+  'srf.ch',
+  'zdfheute.de',
+  'focus.de',
+];
+
+function parseSnapshotUrl(snapshot: FirecrawlArticleSnapshot): URL | null {
+  try {
+    return new URL(snapshot.url);
+  } catch {
+    return null;
+  }
+}
+
+function normalizedHostnameFromUrl(parsed: URL | null): string {
+  return parsed?.hostname.replace(/^www\./i, '').toLowerCase() || '';
+}
+
+function hostnameMatches(hostname: string, candidate: string): boolean {
+  return hostname === candidate || hostname.endsWith(`.${candidate}`);
+}
+
+function isBroadCurrentStateResearchTask(task: string): boolean {
+  const cleanedTask = stripFirecrawlResearchScaffolding(task).toLowerCase();
+  if (!cleanedTask) return false;
+
+  const words = cleanedTask.split(/\s+/).filter(Boolean);
+  const broadAsset =
+    /^(bitcoin|btc|ethereum|eth|solana|sol|crypto|cryptocurrency|crypto market|market)$/i.test(cleanedTask) ||
+    /\b(bitcoin|btc|ethereum|eth|solana|sol)\b/i.test(cleanedTask);
+  if (!broadAsset || isArcNetworkTask(task)) return false;
+  const currentState =
+    words.length <= 5 ||
+    /\b(current|latest|today|news|market analysis|state|landscape|research|report)\b/i.test(task);
+
+  return currentState && !isBroadLongHorizonOverviewTask(task);
+}
+
+function isCryptoResearchTopic(task: string): boolean {
+  return (
+    detectResearchDomain(task) === 'crypto' ||
+    pickCoinTargets(task).length > 0 ||
+    /\b(crypto|bitcoin|btc|ethereum|eth|solana|sol|defi|web3|on[-\s]?chain|l2|stablecoin)\b/i.test(task)
+  );
+}
+
+function buildSourceQualityContext(task: string): SourceQualityContext {
+  return {
+    task,
+    strictness: isBroadCurrentStateResearchTask(task) ? 'strict' : 'soft',
+    cryptoTopic: isCryptoResearchTopic(task),
+  };
+}
+
+function titleLooksGenericDestination(title: string): boolean {
+  const normalized = title.trim().toLowerCase();
+  if (!normalized) return true;
+  if (/^(bitcoin|btc|ethereum|eth|solana|sol)$/i.test(title.trim())) return true;
+  return /\b(price today|live price|market cap|price chart|price prediction|kurs|usd|btc usd|eth usd|sol usd|wikipedia|get started|getting started)\b/i.test(
+    normalized,
+  );
+}
+
+function hasArticleLikePath(snapshot: FirecrawlArticleSnapshot): boolean {
+  const parsed = parseSnapshotUrl(snapshot);
+  const path = parsed?.pathname || '';
+  const segments = path.split('/').filter(Boolean);
+  const longestHyphenatedSegment = segments.reduce(
+    (max, segment) => Math.max(max, segment.split('-').filter(Boolean).length),
+    0,
+  );
+  const titleWords = snapshot.title.split(/\s+/).filter(Boolean).length;
+
+  return (
+    ARTICLE_PATH_RE.test(path) ||
+    DATED_PATH_RE.test(path) ||
+    longestHyphenatedSegment >= 5 ||
+    (longestHyphenatedSegment >= 4 && titleWords >= 6)
+  );
+}
+
+function isPreferredCryptoResearchDomain(snapshot: FirecrawlArticleSnapshot): boolean {
+  const hostname = normalizedHostnameFromUrl(parseSnapshotUrl(snapshot));
+  if (!hostname) return false;
+  return CRYPTO_RESEARCH_HOST_BOOSTS.some((item) => hostnameMatches(hostname, item.host));
+}
+
+function cryptoPreferredDomainBoost(snapshot: FirecrawlArticleSnapshot): number {
+  const hostname = normalizedHostnameFromUrl(parseSnapshotUrl(snapshot));
+  const match = CRYPTO_RESEARCH_HOST_BOOSTS.find((item) => hostnameMatches(hostname, item.host));
+  return match?.boost || 0;
+}
+
+function isGenericDestination(snapshot: FirecrawlArticleSnapshot): boolean {
+  const parsed = parseSnapshotUrl(snapshot);
+  const hostname = normalizedHostnameFromUrl(parsed);
+  const path = parsed?.pathname || '';
+  const normalizedPath = path.replace(/\/+$/, '') || '/';
+  const title = snapshot.title || '';
+
+  if (!parsed || !hostname) return true;
+  if (hostnameMatches(hostname, 'wikipedia.org')) return true;
+  if (GENERIC_ASSET_PATH_RE.test(path) || GENERIC_REFERENCE_PATH_RE.test(path)) return true;
+  if (GENERIC_DESTINATION_HOSTS.some((candidate) => hostnameMatches(hostname, candidate))) {
+    return !hasArticleLikePath(snapshot);
+  }
+  if (
+    OFFICIAL_PROTOCOL_ROOT_HOSTS.some((candidate) => hostnameMatches(hostname, candidate)) &&
+    (normalizedPath === '/' || LOCALIZED_PATH_RE.test(path) || /^\/(?:en|de)?\/?(?:get-started|getting-started|learn|about)?\/?$/i.test(path))
+  ) {
+    return true;
+  }
+  if (LOCALIZED_PATH_RE.test(path) && titleLooksGenericDestination(title)) return true;
+  if (titleLooksGenericDestination(title) && !hasArticleLikePath(snapshot)) return true;
+
+  return false;
+}
+
+function isLikelyNonEnglishSource(snapshot: FirecrawlArticleSnapshot): boolean {
+  const parsed = parseSnapshotUrl(snapshot);
+  const hostname = normalizedHostnameFromUrl(parsed);
+  const path = parsed?.pathname || '';
+  const title = repairMojibake(snapshot.title || '');
+
+  if (!parsed || !hostname) return false;
+  if (LOCALIZED_PATH_RE.test(path)) return true;
+  if (NON_ENGLISH_SOURCE_HOSTS.some((candidate) => hostnameMatches(hostname, candidate))) return true;
+  if (NON_ENGLISH_TITLE_RE.test(title)) return true;
+  return /[^\x00-\x7F]/.test(title) && /\b(?:kurs|nachrichten|aktuell|preis)\b/i.test(title);
+}
+
+function sourcePublishedAgeDays(snapshot: FirecrawlArticleSnapshot): number | null {
+  if (!snapshot.seen_at) return null;
+  const timestamp = Date.parse(snapshot.seen_at);
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.max(0, (Date.now() - timestamp) / 86_400_000);
+}
+
+function sourceQualityScore(snapshot: FirecrawlArticleSnapshot, context: SourceQualityContext): number {
+  const parsed = parseSnapshotUrl(snapshot);
+  const path = parsed?.pathname || '';
+  const hostname = normalizedHostnameFromUrl(parsed);
+  const generic = isGenericDestination(snapshot);
+  const articleLike = hasArticleLikePath(snapshot);
+  const ageDays = sourcePublishedAgeDays(snapshot);
+  let score = 0;
+  const creatorAudienceTask = isCreatorAudienceMetricTask(context.task);
+
+  if (generic) score -= context.strictness === 'strict' ? 45 : 16;
+  if (articleLike) score += 26;
+  if (ARTICLE_PATH_RE.test(path)) score += 10;
+  if (DATED_PATH_RE.test(path)) score += 8;
+  if (LOCALIZED_PATH_RE.test(path)) score -= context.strictness === 'strict' ? 16 : 5;
+  if (isLikelyNonEnglishSource(snapshot)) score -= context.strictness === 'strict' ? 80 : 20;
+  if (hostnameMatches(hostname, 'wikipedia.org')) score -= 40;
+
+  if (context.cryptoTopic && isPreferredCryptoResearchDomain(snapshot) && !generic) {
+    score += cryptoPreferredDomainBoost(snapshot);
+  }
+  if (creatorAudienceTask && /\b(socialcounts\.org|livecounts\.io|socialblade\.com|viewstats\.com)\b/.test(`${hostname} ${snapshot.title} ${snapshot.summary}`.toLowerCase())) {
+    score += 70;
+  }
+  if (creatorAudienceTask && isOfficialCreatorPlatformUrl(snapshot.url)) {
+    score += 35;
+  }
+
+  if (context.strictness === 'strict') {
+    if (ageDays !== null && ageDays <= 90) score += 12;
+    if (ageDays !== null && ageDays > 90) score -= 12;
+    if (generic && !snapshot.seen_at) score -= 20;
+    if (generic && !articleLike) score -= 10;
+  } else if (ageDays !== null && ageDays <= 90) {
+    score += 4;
+  }
+
+  return score;
+}
+
+function genericSourceFamilyKey(snapshot: FirecrawlArticleSnapshot): string {
+  const parsed = parseSnapshotUrl(snapshot);
+  const hostname = normalizedHostnameFromUrl(parsed);
+  if (!hostname) return snapshot.url;
+  if (hostnameMatches(hostname, 'wikipedia.org')) return 'wikipedia';
+  const matchedGeneric = GENERIC_DESTINATION_HOSTS.find((candidate) => hostnameMatches(hostname, candidate));
+  if (matchedGeneric) return matchedGeneric;
+  const matchedOfficial = OFFICIAL_PROTOCOL_ROOT_HOSTS.find((candidate) => hostnameMatches(hostname, candidate));
+  if (matchedOfficial) return matchedOfficial;
+  return hostname;
+}
+
+function selectQualityDiverseSnapshots(
+  ranked: FirecrawlArticleSnapshot[],
+  context: SourceQualityContext,
+  limit: number,
+): FirecrawlArticleSnapshot[] {
+  if (context.strictness !== 'strict') {
+    return ranked.slice(0, limit);
+  }
+
+  const selected: FirecrawlArticleSnapshot[] = [];
+  const genericFamilies = new Set<string>();
+  let genericCount = 0;
+
+  for (const snapshot of ranked) {
+    const generic = isGenericDestination(snapshot);
+    if (generic) {
+      const family = genericSourceFamilyKey(snapshot);
+      if (genericCount >= 2 || genericFamilies.has(family)) {
+        continue;
+      }
+      genericFamilies.add(family);
+      genericCount += 1;
+    }
+
+    selected.push(snapshot);
+    if (selected.length >= limit) {
+      return selected;
+    }
+  }
+
+  for (const snapshot of ranked) {
+    if (selected.some((item) => item.url === snapshot.url)) continue;
+    if (isGenericDestination(snapshot) && genericCount >= 2) continue;
+    selected.push(snapshot);
+    if (selected.length >= limit) break;
+  }
+
+  return selected;
+}
+
+function hasRequiredFirecrawlTopicAnchor(
+  snapshot: FirecrawlArticleSnapshot,
+  task: string,
+): boolean {
+  const haystack = `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase();
+  const anchors: RegExp[] = [];
+
+  if (/\bbitcoin\b|\bbtc\b/i.test(task)) anchors.push(/\bbitcoin\b|\bbtc\b/i);
+  if (/\bethereum\b|\beth\b/i.test(task)) anchors.push(/\bethereum\b|\beth\b/i);
+  if (/\bsolana\b|\bsol\b/i.test(task)) anchors.push(/\bsolana\b|\bsol\b/i);
+  if (/\bx402\b/i.test(task)) anchors.push(/\bx402\b/i);
+  if (/\barc network\b|\barc blockchain\b|\barc testnet\b/i.test(task)) {
+    anchors.push(/\barc\b|\barc\.network\b/i);
+  }
+  if (/\barc\b/i.test(task) && /\bmainnet\b|\blaunch\b|\btestnet\b/i.test(task)) {
+    anchors.push(/\barc\b|\barc\.network\b/i);
+  }
+  if (/\bstablecoin\b|\busdc\b|\busd coin\b/i.test(task)) {
+    anchors.push(/\bstablecoin\b|\busdc\b|\busd[- ]coin\b/i);
+  }
+  if (isCreatorAudienceMetricTask(task)) {
+    anchors.push(/\bmrbeast\b/i);
+    anchors.push(/\bsubscriber\b|\bsubscribers\b|\byoutube\b/i);
+  }
+
+  if (anchors.length > 0) {
+    return anchors.some((anchor) => anchor.test(haystack));
+  }
+
+  const normalizedTask = stripFirecrawlResearchScaffolding(task).toLowerCase();
+  const meaningfulTerms = normalizedTask
+    .replace(/[^\w\s-]/g, ' ')
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter(
+      (term) =>
+        (term.length >= 5 || ['fed'].includes(term)) &&
+        ![
+          'research',
+          'report',
+          'current',
+          'state',
+          'status',
+          'options',
+          'opportunities',
+          'market',
+          'analysis',
+          'latest',
+          'about',
+          'show',
+          'vault',
+          'yield',
+          'yields',
+        ].includes(term),
+    )
+    .slice(0, 4);
+
+  return meaningfulTerms.length === 0 || meaningfulTerms.some((term) => haystack.includes(term));
 }
 
 function shippingEvidenceScore(snapshot: FirecrawlArticleSnapshot): number {
@@ -1124,14 +2113,25 @@ async function fetchFirecrawlSearchSnapshots(
   task: string,
   options?: { bypassCache?: boolean },
 ): Promise<FirecrawlArticleSnapshot[]> {
+  const { searchFirecrawlNews, searchSearxng } = await import('./firecrawl');
+  const forecastingIntent = detectForecastingIntent(task);
   const shippingFocused = /\bshipping\b|\bhormuz\b|\bstrait\b|\binsurance\b|\btanker\b|\bred sea\b|\bsuez\b/i.test(
     task,
   );
+  const sourceQualityContext = buildSourceQualityContext(task);
   const uniqueQueries = [...new Set(queryVariants.map((query) => query.trim()).filter(Boolean))];
   const scoreQuery = (query: string): number => {
     let score = 0;
     const normalized = query.toLowerCase();
     if (normalized === task.trim().toLowerCase()) score += 30;
+    if (sourceQualityContext.strictness === 'strict') {
+      if (/\b(news|analysis|research|insights?|report|market analysis|landscape)\b/i.test(query)) {
+        score += 35;
+      }
+      if (/^(bitcoin|btc|ethereum|eth|solana|sol)$/i.test(normalized.trim())) {
+        score -= 35;
+      }
+    }
     if (shippingFocused && /\bshipping\b|\bhormuz\b|\bstrait\b|\binsurance\b|\btanker\b|\bred sea\b|\bsuez\b/i.test(query)) {
       score += 25;
     }
@@ -1142,7 +2142,7 @@ async function fetchFirecrawlSearchSnapshots(
     if (/\bunited states\b|\busa\b|\bu\.s\.?\b|\bus-iran\b|\biran-us\b/i.test(query)) score += 8;
     if (/\blatest\b/i.test(query)) score += 4;
     if (/\bconflict\b/i.test(query)) score -= 2;
-    if (/\breport\b|\bresearch\b|\bimpact\b|\bdisruptions?\b/i.test(query)) score -= 20;
+    if (sourceQualityContext.strictness !== 'strict' && /\breport\b|\bresearch\b|\bimpact\b|\bdisruptions?\b/i.test(query)) score -= 20;
     return score;
   };
   const maxQueries = Math.min(uniqueQueries.length, 5);
@@ -1154,44 +2154,96 @@ async function fetchFirecrawlSearchSnapshots(
     return [];
   }
 
-  const snapshotGroups = await Promise.all(
-    selectedQueries.map(async (query) => {
-      const cached = options?.bypassCache ? null : getCacheValue(firecrawlSearchCache.get(query));
-      if (cached) {
-        return cached;
+  const searchFirecrawlWithBudget = async (query: string): Promise<FirecrawlSearchResult[]> =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Firecrawl search budget exceeded for "${query}"`)),
+        HYBRID_FIRECRAWL_SEARCH_TIMEOUT_MS,
+      );
+
+      searchFirecrawlNews(query, 6, {
+        recency: forecastingIntent.forecasting ? 'all' : 'week',
+      })
+        .then((results) => {
+          clearTimeout(timer);
+          resolve(results);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
+
+  const fetchSnapshotsForQuery = async (
+    query: string,
+    attempt: 'primary' | 'retry',
+    bypassCacheForAttempt = false,
+  ): Promise<FirecrawlArticleSnapshot[]> => {
+    const cached = bypassCacheForAttempt ? null : getCacheValue(firecrawlSearchCache.get(query));
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const [firecrawlResults, searxngResults] = await Promise.allSettled([
+        searchFirecrawlWithBudget(query),
+        searchSearxng(query, 6, {
+          timeoutMs: 15_000,
+        }),
+      ]);
+
+      const mergedResults = new Map<string, FirecrawlSearchResult>();
+      const pushResults = (results: FirecrawlSearchResult[]) => {
+        for (const result of results) {
+          const resultUrl = result.url?.trim();
+          if (!resultUrl || mergedResults.has(resultUrl)) continue;
+          mergedResults.set(resultUrl, result);
+        }
+      };
+
+      if (firecrawlResults.status === 'fulfilled') {
+        pushResults(firecrawlResults.value);
+      }
+      if (searxngResults.status === 'fulfilled') {
+        pushResults(searxngResults.value);
       }
 
-      try {
-        const results = await searchFirecrawlNews(query, 6);
-        const snapshots = results
-          .map((result) => buildFirecrawlSearchSnapshot(result))
-          .filter((snapshot): snapshot is FirecrawlArticleSnapshot => Boolean(snapshot))
-          .filter(isUsableCurrentEventArticle);
+      const snapshots = [...mergedResults.values()]
+        .map((result) => buildFirecrawlSearchSnapshot(result))
+        .filter((snapshot): snapshot is FirecrawlArticleSnapshot => Boolean(snapshot))
+        .filter(isUsableCurrentEventArticle);
 
-        if (options?.bypassCache) {
-          return snapshots;
-        }
-
-        return setTimedCache(
-          firecrawlSearchCache,
-          query,
-          snapshots,
-          FIRECRAWL_CACHE_TTL_MS,
-        );
-      } catch {
-        if (options?.bypassCache) {
-          return [];
-        }
-
-        return setTimedCache(
-          firecrawlSearchCache,
-          query,
-          [],
-          FIRECRAWL_CACHE_TTL_MS,
-        );
+      if (bypassCacheForAttempt || snapshots.length === 0) {
+        return snapshots;
       }
-    }),
+
+      return setTimedCache(
+        firecrawlSearchCache,
+        query,
+        snapshots,
+        FIRECRAWL_CACHE_TTL_MS,
+      );
+    } catch {
+      return [];
+    }
+  };
+
+  const loadSnapshotGroups = (
+    attempt: 'primary' | 'retry',
+    bypassCacheForAttempt = false,
+  ): Promise<FirecrawlArticleSnapshot[][]> =>
+    Promise.all(
+      selectedQueries.map((query) => fetchSnapshotsForQuery(query, attempt, bypassCacheForAttempt)),
+    );
+
+  let snapshotGroups = await loadSnapshotGroups(
+    'primary',
+    options?.bypassCache === true,
   );
+  if (snapshotGroups.every((group) => group.length === 0)) {
+    await sleep(FIRECRAWL_EMPTY_RETRY_DELAY_MS);
+    snapshotGroups = await loadSnapshotGroups('retry', true);
+  }
 
   const deduped = new Map<string, FirecrawlArticleSnapshot>();
   for (const group of snapshotGroups) {
@@ -1204,7 +2256,14 @@ async function fetchFirecrawlSearchSnapshots(
 
   const ranked = [...deduped.values()]
     .filter(isUsableCurrentEventArticle)
+    .filter((snapshot) => hasRequiredFirecrawlTopicAnchor(snapshot, task))
+    .filter((snapshot) => sourceQualityContext.strictness !== 'strict' || !isLikelyNonEnglishSource(snapshot))
     .sort((a, b) => {
+      const qualityDelta =
+        sourceQualityScore(b, sourceQualityContext) - sourceQualityScore(a, sourceQualityContext);
+      if (qualityDelta !== 0) {
+        return qualityDelta;
+      }
       const relevanceDelta = firecrawlSnapshotRelevance(b, task) - firecrawlSnapshotRelevance(a, task);
       if (relevanceDelta !== 0) {
         return relevanceDelta;
@@ -1216,11 +2275,11 @@ async function fetchFirecrawlSearchSnapshots(
   if (shippingFocused) {
     const shippingSpecific = ranked.filter((snapshot) => shippingEvidenceScore(snapshot) >= 4);
     if (shippingSpecific.length > 0) {
-      return shippingSpecific.slice(0, 4);
+      return selectQualityDiverseSnapshots(shippingSpecific, sourceQualityContext, 4);
     }
   }
 
-  return ranked.slice(0, 5);
+  return selectQualityDiverseSnapshots(ranked, sourceQualityContext, 5);
 }
 
 function isLikelyHomepageUrl(url: string): boolean {
@@ -1387,6 +2446,119 @@ async function fetchCoinGeckoData(task: string): Promise<CoinGeckoAssetSnapshot[
   }
 
   return setTimedCache(coinGeckoCache, cacheKey, snapshots, COINGECKO_CACHE_TTL_MS);
+}
+
+type MempoolBlock = {
+  height?: number;
+  timestamp?: number;
+  tx_count?: number;
+  extras?: {
+    totalFees?: number;
+    totalOutputAmt?: number;
+  };
+};
+
+function validMempoolBlocks(value: unknown): MempoolBlock[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is MempoolBlock => {
+        if (!entry || typeof entry !== 'object') return false;
+        const block = entry as MempoolBlock;
+        return Number.isFinite(block.height) &&
+          Number.isFinite(block.timestamp) &&
+          Number.isFinite(block.tx_count);
+      })
+    : [];
+}
+
+async function fetchMempoolBlocksPage(height?: number): Promise<MempoolBlock[]> {
+  const path = height === undefined
+    ? 'https://mempool.space/api/v1/blocks'
+    : `https://mempool.space/api/v1/blocks/${encodeURIComponent(String(height))}`;
+  const json = await fetchJsonWithTimeout<unknown>(path, 8_000);
+  return validMempoolBlocks(json);
+}
+
+async function fetchBitcoinOnchainData(task: string): Promise<BitcoinOnchainSnapshot | null> {
+  if (!isBitcoinTransactionMetricsTask(task)) return null;
+
+  const cached = getCacheValue(bitcoinOnchainCache.get('bitcoin'));
+  if (cached !== null) return cached;
+
+  const firstPage = await fetchMempoolBlocksPage();
+  const tip = firstPage[0];
+  if (!tip?.height || !tip.timestamp) {
+    return setTimedCache(bitcoinOnchainCache, 'bitcoin', null, BITCOIN_ONCHAIN_CACHE_TTL_MS);
+  }
+
+  const tipTimestamp = tip.timestamp;
+  const tipHeight = tip.height;
+  const windowStartTimestamp = tipTimestamp - 86_400;
+  const collected = new Map<number, MempoolBlock>();
+  let page = firstPage;
+  let nextHeight = tipHeight;
+
+  for (let pageIndex = 0; pageIndex < 24; pageIndex += 1) {
+    for (const block of page) {
+      if (typeof block.height !== 'number') continue;
+      collected.set(block.height, block);
+    }
+
+    const oldest = page[page.length - 1];
+    if (!oldest?.height || !oldest.timestamp || oldest.timestamp < windowStartTimestamp) {
+      break;
+    }
+
+    nextHeight = oldest.height - 1;
+    page = await fetchMempoolBlocksPage(nextHeight);
+    if (page.length === 0) break;
+  }
+
+  const blocksInWindow = [...collected.values()]
+    .filter((block) =>
+      typeof block.timestamp === 'number' &&
+      block.timestamp >= windowStartTimestamp &&
+      block.timestamp <= tipTimestamp,
+    )
+    .sort((a, b) => (a.height ?? 0) - (b.height ?? 0));
+
+  const confirmedTransactionCount = blocksInWindow.reduce(
+    (sum, block) => sum + (typeof block.tx_count === 'number' ? block.tx_count : 0),
+    0,
+  );
+  const totalFeesSats = blocksInWindow.reduce(
+    (sum, block) => sum + (typeof block.extras?.totalFees === 'number' ? block.extras.totalFees : 0),
+    0,
+  );
+  const totalOutputSats = blocksInWindow.reduce(
+    (sum, block) =>
+      sum + (typeof block.extras?.totalOutputAmt === 'number' ? block.extras.totalOutputAmt : 0),
+    0,
+  );
+
+  if (blocksInWindow.length === 0 || confirmedTransactionCount === 0) {
+    return setTimedCache(bitcoinOnchainCache, 'bitcoin', null, BITCOIN_ONCHAIN_CACHE_TTL_MS);
+  }
+
+  return setTimedCache(
+    bitcoinOnchainCache,
+    'bitcoin',
+    {
+      source: 'Mempool.space blocks API',
+      chain: 'Bitcoin',
+      window: 'last_24h_from_tip',
+      latest_block_height: tipHeight,
+      latest_block_time: unixToIso(tipTimestamp) ?? new Date(tipTimestamp * 1000).toISOString(),
+      window_start_time: new Date(windowStartTimestamp * 1000).toISOString(),
+      confirmed_transaction_count_24h: confirmedTransactionCount,
+      block_count_24h: blocksInWindow.length,
+      average_transactions_per_block: Number(
+        (confirmedTransactionCount / blocksInWindow.length).toFixed(2),
+      ),
+      ...(totalFeesSats > 0 ? { total_fees_btc_24h: Number((totalFeesSats / 100_000_000).toFixed(8)) } : {}),
+      ...(totalOutputSats > 0 ? { total_output_btc_24h: Number((totalOutputSats / 100_000_000).toFixed(8)) } : {}),
+    },
+    BITCOIN_ONCHAIN_CACHE_TTL_MS,
+  );
 }
 
 async function fetchDefiLlamaData(task: string): Promise<DefiLlamaChainSnapshot[]> {
@@ -1722,6 +2894,7 @@ async function fetchGdeltData(
     `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(
       buildGdeltQuery(task),
     )}&mode=artlist&maxrecords=6&sort=DateDesc&format=json`,
+    FAST_GDELT_FETCH_TIMEOUT_MS,
   );
 
   const articles = Array.isArray(json.articles) ? json.articles : [];
@@ -1783,12 +2956,12 @@ async function fetchGoogleNewsRssData(
 
     if (!rawTitle || !rawLink) continue;
 
-    const title = decodeXmlEntities(rawTitle.trim());
+    const title = normalizeSourceText(decodeXmlEntities(rawTitle.trim()), { stripChrome: true });
     const link = decodeXmlEntities(rawLink.trim());
     const sourceUrl = rawSourceUrl ? decodeXmlEntities(rawSourceUrl.trim()) : undefined;
     const lastSeparator = title.lastIndexOf(' - ');
     const publisher = rawSourceName
-      ? decodeXmlEntities(rawSourceName.trim())
+      ? normalizeSourceText(decodeXmlEntities(rawSourceName.trim()), { stripChrome: true })
       : lastSeparator > 0
         ? title.slice(lastSeparator + 3).trim()
         : undefined;
@@ -1848,7 +3021,109 @@ function buildRelevantQueryWords(task: string): string[] {
     .replace(/[^\w\s-]/g, ' ')
     .split(/\s+/)
     .map((word) => word.trim())
-    .filter((word) => word.length > 3);
+    .filter((word) => word.length > 3)
+    .filter(
+      (word) =>
+        ![
+          'what',
+          'when',
+          'where',
+          'which',
+          'about',
+          'from',
+          'with',
+          'current',
+          'latest',
+          'recent',
+          'today',
+          'president',
+          'prime',
+          'minister',
+          'person',
+          'people',
+        ].includes(word),
+    );
+}
+
+function isSimpleIdentityLookup(task: string): boolean {
+  const cleaned = stripExecutionContext(task).trim();
+  if (!cleaned) return false;
+  if (isTimeSensitiveTask(cleaned) && !/\bcurrent president\b|\bpresident of\b/i.test(cleaned)) {
+    return false;
+  }
+  return /^(?:who|what)\s+(?:is|was|are|were)\s+[^?]{2,80}\??$/i.test(cleaned) ||
+    /^[a-z][\w.'-]*(?:\s+[a-z][\w.'-]*){0,4}\s+(?:the\s+)?(?:current\s+)?(?:president|prime minister|ceo|founder|chair|leader)(?:\s+of\s+[\w\s.'-]+)?\??$/i.test(cleaned);
+}
+
+function normalizeIdentityLookupQuery(task: string): string {
+  const cleaned = stripExecutionContext(task)
+    .replace(/[?.,:;()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const whoMatch = cleaned.match(/^(?:who|what)\s+(?:is|was|are|were)\s+(.+)$/i);
+  const subject = (whoMatch?.[1] ?? cleaned)
+    .replace(/\b(?:the\s+)?(?:current\s+)?(?:president|prime minister|ceo|founder|chair|leader)(?:\s+of\s+[\w\s.'-]+)?$/i, '')
+    .replace(/\b(?:of|from|for)\s+(?:the\s+)?(?:usa|u\.s\.a\.|united states|america)$/i, '')
+    .replace(/\bthe\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return subject || cleaned;
+}
+
+function isArticleRelevantToTask(article: GdeltArticleSnapshot, task: string): boolean {
+  const queryWords = buildRelevantQueryWords(task);
+  if (queryWords.length === 0) return true;
+  const haystack = [
+    article.title,
+    (article as { description?: string }).description,
+    article.url,
+    article.article_url,
+    article.publisher,
+    article.domain,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return queryWords.some((word) =>
+    new RegExp(`\\b${escapeRegex(word)}\\b`, 'i').test(haystack),
+  );
+}
+
+function currentEventTopicAnchors(task: string): RegExp[] {
+  const anchors: RegExp[] = [];
+  if (/\bx402\b/i.test(task)) anchors.push(/\bx402\b/i);
+  if (/\bopenai\b|\bchatgpt\b/i.test(task)) anchors.push(/\bopenai\b|\bchatgpt\b/i);
+  if (/\bstablecoin\b|\busdc\b|\busd coin\b/i.test(task)) {
+    anchors.push(/\bstablecoin\b|\busdc\b|\busd[- ]coin\b/i);
+  }
+  if (/\bbitcoin\b|\bbtc\b/i.test(task)) anchors.push(/\bbitcoin\b|\bbtc\b/i);
+  if (/\bethereum\b|\beth\b/i.test(task)) anchors.push(/\bethereum\b|\beth\b/i);
+  if (/\bsolana\b|\bsol\b/i.test(task)) anchors.push(/\bsolana\b|\bsol\b/i);
+  if (/\biran\b/i.test(task)) anchors.push(/\biran\b/i);
+  if (isArcNetworkTask(task)) anchors.push(/\barc\b|\barc\.network\b/i);
+  return anchors;
+}
+
+function isStronglyRelevantCurrentEventArticle(
+  article: GdeltArticleSnapshot,
+  task: string,
+): boolean {
+  if (!isArticleRelevantToTask(article, task)) return false;
+  const anchors = currentEventTopicAnchors(task);
+  if (anchors.length === 0) return true;
+  const haystack = [
+    article.title,
+    (article as { description?: string }).description,
+    article.url,
+    article.article_url,
+    article.publisher,
+    article.domain,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return anchors.some((anchor) => anchor.test(haystack));
 }
 
 async function fetchHackerNewsRSS(
@@ -1874,7 +3149,7 @@ async function fetchHackerNewsRSS(
       return setTimedCache(thnRssCache, query, [], THN_RSS_CACHE_TTL_MS);
     }
 
-    const xml = await response.text();
+    const xml = await decodeTextResponse(response);
     const itemBlocks = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
     const queryWords = buildRelevantQueryWords(task);
     const securityPattern =
@@ -1898,9 +3173,12 @@ async function fetchHackerNewsRSS(
         '';
       const rawPubDate = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i)?.[1] || '';
 
-      const title = decodeXmlEntities(rawTitle.trim());
+      const title = normalizeSourceText(decodeXmlEntities(rawTitle.trim()), { stripChrome: true });
       const link = decodeXmlEntities(rawLink.trim());
-      const description = stripHtml(decodeXmlEntities(rawDescription.trim())).replace(/\s+/g, ' ').trim();
+      const description = normalizeSourceText(
+        stripHtml(decodeXmlEntities(rawDescription.trim())),
+        { stripChrome: true, collapseWhitespace: true },
+      );
       const seenAt = rawPubDate && Number.isFinite(Date.parse(rawPubDate))
         ? new Date(rawPubDate).toISOString()
         : undefined;
@@ -1963,9 +3241,14 @@ async function fetchCurrentEventsData(
   const groups = [...gdeltGroups, ...rssGroups];
   const statusGroups = [...statusGdeltGroups, ...statusRssGroups];
 
-  let merged = mergeCurrentEventArticles(groups);
-  if (merged.length === 0 && firecrawlSearchSnapshots.length > 0) {
-    merged = firecrawlSearchSnapshots.map(snapshotToCurrentEventArticle);
+  const relevantFirecrawlSearchSnapshots = firecrawlSearchSnapshots.filter((snapshot) =>
+    isStronglyRelevantCurrentEventArticle(snapshotToCurrentEventArticle(snapshot), task),
+  );
+  let merged = mergeCurrentEventArticles(groups).filter((article) =>
+    isStronglyRelevantCurrentEventArticle(article, task),
+  );
+  if (merged.length === 0 && relevantFirecrawlSearchSnapshots.length > 0) {
+    merged = relevantFirecrawlSearchSnapshots.map(snapshotToCurrentEventArticle);
   }
 
   if (merged.length === 0) {
@@ -1981,7 +3264,7 @@ async function fetchCurrentEventsData(
   const gdeltCandidates = mergeCurrentEventArticles(gdeltGroups);
   const statusArticles = mergeCurrentEventArticles(statusGroups).slice(0, 6);
   const fallbackSnapshots =
-    firecrawlSearchSnapshots.length > 0
+    relevantFirecrawlSearchSnapshots.length > 0
       ? []
       : await fetchFirecrawlArticleSnapshots(
           gdeltCandidates.length > 0
@@ -1992,7 +3275,11 @@ async function fetchCurrentEventsData(
           options,
         );
   const articleSnapshots =
-    firecrawlSearchSnapshots.length > 0 ? firecrawlSearchSnapshots : fallbackSnapshots;
+    relevantFirecrawlSearchSnapshots.length > 0
+      ? relevantFirecrawlSearchSnapshots
+      : fallbackSnapshots.filter((snapshot) =>
+          isStronglyRelevantCurrentEventArticle(snapshotToCurrentEventArticle(snapshot), task),
+        );
   const snapshotArticles = articleSnapshots.map(snapshotToCurrentEventArticle);
   const selectedArticles =
     snapshotArticles.length > 0
@@ -2010,7 +3297,7 @@ async function fetchCurrentEventsData(
   return {
     source:
       articleSnapshots.length > 0
-        ? 'Firecrawl news search with GDELT document API and Google News RSS support'
+        ? 'Targeted Firecrawl scrape with GDELT document API and Google News RSS support'
         : 'Merged GDELT document API and Google News RSS',
     query_variants: queryVariants,
     recency_window_days: CURRENT_EVENT_RECENCY_WINDOW_DAYS,
@@ -2169,17 +3456,69 @@ const RSS_MATCH_STOPWORDS = new Set([
   'them',
 ]);
 
-function buildRssMatchTerms(task: string): string[] {
+const GENERIC_QUERY_STOPWORDS = new Set([
+  'research',
+  'researching',
+  'news',
+  'newest',
+  'latest',
+  'recent',
+  'current',
+  'updates',
+  'update',
+  'analysis',
+  'analyze',
+  'report',
+  'reports',
+  'reporting',
+  'about',
+  'on',
+  'regarding',
+  'today',
+  'now',
+  'state',
+  'status',
+  'make',
+  'give',
+  'tell',
+  'show',
+  'find',
+  'me',
+  'my',
+]);
+
+const GENERIC_RSS_LABEL_TERMS = new Set([
+  'ai',
+  'research',
+  'crypto',
+  'defi',
+  'markets',
+  'economy',
+  'world',
+  'news',
+  'business',
+  'government',
+  'regulation',
+  'legal',
+  'community',
+]);
+
+export function buildRssMatchTerms(task: string): string[] {
   const terms = new Set<string>();
   const cleaned = task.toLowerCase().replace(/[^\w\s-]/g, ' ');
   for (const raw of cleaned.split(/\s+/)) {
     const w = raw.trim();
-    if (w.length < 2 || RSS_MATCH_STOPWORDS.has(w)) continue;
+    if (w.length < 2 || RSS_MATCH_STOPWORDS.has(w) || GENERIC_QUERY_STOPWORDS.has(w)) continue;
     terms.add(w);
   }
   for (const label of classifyTopic(task).labels) {
     const l = label.toLowerCase().trim();
-    if (l.length >= 2 && !RSS_MATCH_STOPWORDS.has(l)) {
+    if (
+      l.length >= 2 &&
+      !RSS_MATCH_STOPWORDS.has(l) &&
+      !GENERIC_QUERY_STOPWORDS.has(l) &&
+      !GENERIC_RSS_LABEL_TERMS.has(l)
+    ) {
       terms.add(l);
     }
   }
@@ -2203,11 +3542,12 @@ function parseRssItemBlock(block: string): {
     '';
   const rawPubDate = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i)?.[1] || '';
 
-  const title = decodeXmlEntities(rawTitle.trim());
+  const title = normalizeSourceText(decodeXmlEntities(rawTitle.trim()), { stripChrome: true });
   const link = decodeXmlEntities(rawLink.trim());
-  const description = stripHtml(decodeXmlEntities(rawDescription.trim()))
-    .replace(/\s+/g, ' ')
-    .trim();
+  const description = normalizeSourceText(
+    stripHtml(decodeXmlEntities(rawDescription.trim())),
+    { stripChrome: true, collapseWhitespace: true },
+  );
   const seenAt =
     rawPubDate && Number.isFinite(Date.parse(rawPubDate))
       ? new Date(rawPubDate).toISOString()
@@ -2225,7 +3565,6 @@ async function fetchRSSFromRegistry(
 
   const matchTerms = buildRssMatchTerms(task);
   const results: GdeltArticleSnapshot[] = [];
-  const fallback: GdeltArticleSnapshot[] = [];
 
   for (const rssUrl of source.rssUrls.slice(0, 2)) {
     try {
@@ -2236,7 +3575,7 @@ async function fetchRSSFromRegistry(
 
       if (!res.ok) continue;
 
-      const xml = await res.text();
+      const xml = await decodeTextResponse(res);
       const itemBlocks = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
 
       for (const match of itemBlocks) {
@@ -2261,8 +3600,6 @@ async function fetchRSSFromRegistry(
         if (isRelevant) {
           results.push(snapshot);
           if (results.length >= 5) break;
-        } else if (fallback.length < 4) {
-          fallback.push(snapshot);
         }
       }
     } catch (err) {
@@ -2273,9 +3610,7 @@ async function fetchRSSFromRegistry(
   if (results.length > 0) {
     return results.slice(0, 5);
   }
-  // Broad queries (e.g. "latest AI breakthroughs") often share no token with a headline;
-  // return a few recent items so downstream agents have real URLs to cite.
-  return fallback.slice(0, 3);
+  return [];
 }
 
 export async function fetchDynamicSources(task: string): Promise<GdeltArticleSnapshot[]> {
@@ -2284,22 +3619,34 @@ export async function fetchDynamicSources(task: string): Promise<GdeltArticleSna
   if (cached) return cached;
 
   const { labels } = classifyTopic(task);
-  let sources = selectSources(task, 8).filter((s) => s.rssUrls?.length);
+  const protocolQueryShape = detectProtocolQueryShape(task);
+  let sources = SOURCE_REGISTRY.filter((source) => source.enabled && source.rssUrls?.length);
   if (labels.length > 0) {
     const narrowed = sources.filter((s) => s.topics.some((t) => labels.includes(t)));
     if (narrowed.length > 0) {
-      sources = narrowed.slice(0, 5);
+      sources = narrowed;
     } else {
       // e.g. Arc / DefiLlama are API-only in the registry — do not fall back to unrelated world-news RSS.
       sources = [];
     }
-  } else {
-    sources = sources.slice(0, 5);
+  } else if (protocolQueryShape !== 'none') {
+    const narrowed = sources.filter((s) =>
+      s.topics.some((topic) =>
+        ['crypto', 'defi', 'blockchain', 'token', 'web3', 'onchain', 'stablecoin', 'ethereum', 'l2'].includes(
+          topic,
+        ),
+      ),
+    );
+    if (narrowed.length > 0) {
+      sources = narrowed;
+    }
   }
+
+  sources = rankDynamicRssSources(task, sources).slice(0, 5);
 
   if (sources.length === 0) {
     console.log(
-      `[live-data] selected sources: (no RSS feeds in registry match topic labels: ${labels.join(', ') || 'none'})`,
+      `[live-data] selected sources: (no RSS-capable sources matched topic labels: ${labels.join(', ') || 'none'})`,
     );
     return setTimedCache(dynamicRssCache, cacheKey, [], DYNAMIC_RSS_CACHE_TTL_MS);
   }
@@ -2331,8 +3678,51 @@ export async function fetchDynamicSources(task: string): Promise<GdeltArticleSna
   return setTimedCache(dynamicRssCache, cacheKey, result, DYNAMIC_RSS_CACHE_TTL_MS);
 }
 
+function rankDynamicRssSources(task: string, sources: SourceConfig[]): SourceConfig[] {
+  const { labels } = classifyTopic(task);
+  const queryLower = task.toLowerCase();
+
+  const scored = sources.map((source) => {
+    let score = 0;
+    const overlap = source.topics.filter((topic) => {
+      if (labels.includes(topic)) return true;
+      if (topic.length < 3) return false;
+      try {
+        return new RegExp(`\\b${topic.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(
+          queryLower,
+        );
+      } catch {
+        return queryLower.includes(topic);
+      }
+    }).length;
+
+    if (queryLower.includes(source.name.toLowerCase())) {
+      score += 6;
+    }
+    score += overlap * 3;
+
+    const trustScore: Record<SourceConfig['trust'], number> = {
+      high: 4,
+      medium_high: 3,
+      medium: 2,
+      low_medium: 1,
+    };
+    score += trustScore[source.trust];
+
+    if (source.speed === 'fast') score += 2;
+    if (source.speed === 'medium') score += 1;
+    if (source.cost === 'low') score += 1;
+    score += source.priority * 0.5;
+
+    return { source, score };
+  });
+
+  scored.sort((left, right) => right.score - left.score);
+  return scored.map((entry) => entry.source);
+}
+
 export async function fetchLiveData(task: string): Promise<string> {
-  const sourceTask = stripExecutionContext(task);
+  const sourceTask = normalizeLiveDataSearchTask(task);
   const normalizedTask = sourceTask.trim().toLowerCase();
   const bypassCurrentEventCache = shouldBypassCurrentEventCaches(sourceTask);
   const cached = bypassCurrentEventCache ? null : getCacheValue(liveDataCache.get(normalizedTask));
@@ -2342,24 +3732,42 @@ export async function fetchLiveData(task: string): Promise<string> {
 
   const snapshotAt = new Date().toISOString();
   const researchDomain = detectResearchDomain(sourceTask);
+  const shouldFetchCurrentEvents = shouldGatherCurrentEvents(sourceTask);
+  const shouldAlsoFetchFirecrawl =
+    shouldFetchCurrentEvents && isCreatorAudienceMetricTask(sourceTask);
+  const firecrawlQueryVariants = buildPrimaryFirecrawlQueryVariants(task);
   const payload: Record<string, unknown> = {
     snapshot_at: snapshotAt,
     research_domain: researchDomain,
   };
 
   if (researchDomain === 'crypto') {
-    const [coingecko, defillama, duckduckgo, wikipedia, currentEvents, thn, dynamic] =
+    const [firecrawlEvidence, coingecko, bitcoinOnchain, defillama, wikipedia, currentEvents] =
       await Promise.allSettled([
+        shouldFetchCurrentEvents
+          ? Promise.resolve([] as FirecrawlArticleSnapshot[])
+          : fetchFirecrawlSearchSnapshots(firecrawlQueryVariants, sourceTask, {
+              bypassCache: bypassCurrentEventCache,
+            }),
         fetchCoinGeckoData(sourceTask),
+        fetchBitcoinOnchainData(sourceTask),
         fetchDefiLlamaData(sourceTask),
-        fetchDuckDuckGoData(sourceTask),
         fetchWikipediaData(sourceTask, researchDomain),
-        shouldGatherCurrentEvents(sourceTask)
-          ? fetchCurrentEventsData(sourceTask, { bypassCache: bypassCurrentEventCache })
+        shouldFetchCurrentEvents
+          ? fetchCurrentEventsData(task, { bypassCache: bypassCurrentEventCache })
           : Promise.resolve(null),
-        fetchHackerNewsRSS(sourceTask, { bypassCache: bypassCurrentEventCache }),
-        fetchDynamicSources(sourceTask),
       ]);
+
+    if (firecrawlEvidence.status === 'fulfilled' && firecrawlEvidence.value.length > 0) {
+      const taskFilteredEvidence = filterLowValueEvidenceForTask(task, firecrawlEvidence.value);
+      const finalFirecrawlEvidence = filterPredictionMarketResearchEvidence(task, taskFilteredEvidence);
+      if (finalFirecrawlEvidence.length > 0) {
+      payload.dynamic_sources = {
+        source: 'Firecrawl search (primary evidence)',
+        articles: finalFirecrawlEvidence,
+      };
+      }
+    }
 
     if (coingecko.status === 'fulfilled' && coingecko.value.length > 0) {
       payload.coingecko = {
@@ -2368,17 +3776,14 @@ export async function fetchLiveData(task: string): Promise<string> {
       };
     }
 
+    if (bitcoinOnchain.status === 'fulfilled' && bitcoinOnchain.value) {
+      payload.bitcoin_onchain = bitcoinOnchain.value;
+    }
+
     if (defillama.status === 'fulfilled' && defillama.value.length > 0) {
       payload.defillama = {
         source: 'DefiLlama chains API + stablecoins API',
         chains: defillama.value,
-      };
-    }
-
-    if (duckduckgo.status === 'fulfilled' && duckduckgo.value) {
-      payload.duckduckgo = {
-        source: 'DuckDuckGo instant answer API',
-        ...duckduckgo.value,
       };
     }
 
@@ -2390,28 +3795,16 @@ export async function fetchLiveData(task: string): Promise<string> {
     }
 
     if (currentEvents.status === 'fulfilled' && currentEvents.value) {
-      payload.current_events = currentEvents.value;
-    }
-
-    if (thn.status === 'fulfilled' && thn.value.length > 0) {
-      payload.the_hacker_news = {
-        source: 'The Hacker News RSS',
-        articles: thn.value,
-      };
-    }
-
-    if (dynamic.status === 'fulfilled' && dynamic.value.length > 0) {
-      payload.dynamic_sources = {
-        source: 'Dynamic RSS (source registry)',
-        articles: dynamic.value,
-      };
+      payload.current_events = sanitizePredictionMarketCurrentEvents(
+        task,
+        currentEvents.value,
+      );
     }
   } else if (researchDomain === 'geopolitics') {
-    const [currentEvents, duckduckgo, wikipedia, thn] = await Promise.allSettled([
+    const [currentEvents, wikipedia] = await Promise.allSettled([
       fetchCurrentEventsData(sourceTask, { bypassCache: bypassCurrentEventCache }),
-      fetchDuckDuckGoData(sourceTask),
+      
       fetchWikipediaData(sourceTask, researchDomain),
-      fetchHackerNewsRSS(sourceTask, { bypassCache: bypassCurrentEventCache }),
     ]);
 
     if (currentEvents.status === 'fulfilled' && currentEvents.value) {
@@ -2449,46 +3842,52 @@ export async function fetchLiveData(task: string): Promise<string> {
       };
     }
 
-    if (duckduckgo.status === 'fulfilled' && duckduckgo.value) {
-      payload.duckduckgo = {
-        source: 'DuckDuckGo instant answer API',
-        ...duckduckgo.value,
-      };
-    }
-
     if (wikipedia.status === 'fulfilled' && wikipedia.value.length > 0) {
       payload.wikipedia = {
         source: 'Wikipedia OpenSearch + REST summary API',
         pages: wikipedia.value,
       };
     }
-
-    if (thn.status === 'fulfilled' && thn.value.length > 0) {
-      payload.the_hacker_news = {
-        source: 'The Hacker News RSS',
-        articles: thn.value,
-      };
-    }
   } else {
-    const [duckduckgo, wikipedia, currentEvents, thn, dynamic] = await Promise.all([
-      fetchDuckDuckGoData(sourceTask).catch(() => null),
-      fetchWikipediaData(sourceTask, researchDomain).catch(() => [] as WikipediaPageSnapshot[]),
+    const identityLookup = isSimpleIdentityLookup(sourceTask);
+    const lookupTask = identityLookup ? normalizeIdentityLookupQuery(sourceTask) : sourceTask;
+    const [firecrawlEvidence, wikipedia, currentEvents] = await Promise.all([
       (
-        shouldGatherCurrentEvents(sourceTask)
-          ? fetchCurrentEventsData(sourceTask, { bypassCache: bypassCurrentEventCache })
+        shouldFetchCurrentEvents && !shouldAlsoFetchFirecrawl
+          ? Promise.resolve([] as FirecrawlArticleSnapshot[])
+          : fetchFirecrawlSearchSnapshots(firecrawlQueryVariants, sourceTask, {
+              bypassCache: bypassCurrentEventCache,
+            })
+      ).catch(() => [] as FirecrawlArticleSnapshot[]),
+      fetchWikipediaData(lookupTask, researchDomain).catch(() => [] as WikipediaPageSnapshot[]),
+      (
+        !identityLookup && shouldFetchCurrentEvents
+          ? fetchCurrentEventsData(task, { bypassCache: bypassCurrentEventCache })
           : Promise.resolve(null)
       ).catch(() => null),
-      fetchHackerNewsRSS(sourceTask, { bypassCache: bypassCurrentEventCache }).catch(
-        () => [] as GdeltArticleSnapshot[],
-      ),
-      fetchDynamicSources(sourceTask).catch(() => [] as GdeltArticleSnapshot[]),
     ]);
 
-    if (duckduckgo) {
-      payload.duckduckgo = {
-        source: 'DuckDuckGo instant answer API',
-        ...duckduckgo,
+    const creatorAudienceTask = isCreatorAudienceMetricTask(sourceTask);
+    const taskFilteredEvidence = filterLowValueEvidenceForTask(task, firecrawlEvidence);
+    const creatorAugmentedEvidence = creatorAudienceTask
+      ? augmentCreatorAudienceEvidence(taskFilteredEvidence)
+      : taskFilteredEvidence;
+    const finalFirecrawlEvidence = creatorAudienceTask
+      ? filterCreatorAudienceEvidence(creatorAugmentedEvidence)
+      : filterPredictionMarketResearchEvidence(task, creatorAugmentedEvidence);
+    const creatorAudienceMetrics = creatorAudienceTask
+      ? await fetchCreatorAudienceMetricSnapshot(finalFirecrawlEvidence)
+      : null;
+
+    if (finalFirecrawlEvidence.length > 0) {
+      payload.dynamic_sources = {
+        source: 'Firecrawl search (primary evidence)',
+        articles: finalFirecrawlEvidence,
       };
+    }
+
+    if (creatorAudienceMetrics) {
+      payload.creator_audience_metrics = creatorAudienceMetrics;
     }
 
     if (wikipedia.length > 0) {
@@ -2499,27 +3898,14 @@ export async function fetchLiveData(task: string): Promise<string> {
     }
 
     if (currentEvents) {
-      payload.current_events = currentEvents;
-    }
-
-    if (thn.length > 0) {
-      payload.the_hacker_news = {
-        source: 'The Hacker News RSS',
-        articles: thn,
-      };
-    }
-
-    if (dynamic.length > 0) {
-      payload.dynamic_sources = {
-        source: 'Dynamic RSS (source registry)',
-        articles: dynamic,
-      };
+      payload.current_events = sanitizePredictionMarketCurrentEvents(task, currentEvents);
     }
 
   }
 
   const hasSourceData = Boolean(
-    payload.coingecko ||
+      payload.coingecko ||
+      payload.bitcoin_onchain ||
       payload.defillama ||
       payload.duckduckgo ||
       payload.wikipedia ||
@@ -2530,7 +3916,7 @@ export async function fetchLiveData(task: string): Promise<string> {
   );
   const result = hasSourceData ? JSON.stringify(payload, null, 2) : '';
 
-  if (normalizedTask && !bypassCurrentEventCache) {
+  if (normalizedTask && !bypassCurrentEventCache && hasSourceData) {
     liveDataCache.set(normalizedTask, {
       value: result,
       expiresAt: Date.now() + LIVE_DATA_CACHE_TTL_MS,

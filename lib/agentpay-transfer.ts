@@ -1,6 +1,11 @@
-import { getAddress, parseUnits } from 'viem';
+import { getAddress } from 'viem';
 import { adminDb } from '../db/client';
-import { executeTransaction, getOrCreateUserAgentWallet, waitForTransaction } from './dcw';
+import {
+  getCircleClient,
+  getOrCreateUserAgentWallet,
+  waitForTransaction,
+} from './dcw';
+import { acquireExecutionGuard } from './execution-guard';
 
 const ARC_USDC = '0x3600000000000000000000000000000000000000' as const;
 
@@ -18,15 +23,46 @@ export function extractTxId(tx: unknown): string | null {
   return obj?.data?.transaction?.id ?? obj?.data?.id ?? null;
 }
 
+async function createUsdcTransferTransaction(params: {
+  walletId: string;
+  destinationAddress: string;
+  amountUsdc: number;
+}): Promise<unknown> {
+  const dcw = getCircleClient();
+  return dcw.createTransaction({
+    walletId: params.walletId,
+    tokenAddress: ARC_USDC,
+    blockchain: 'ARC-TESTNET',
+    amount: [params.amountUsdc.toFixed(6)],
+    destinationAddress: params.destinationAddress,
+    fee: {
+      type: 'level',
+      config: {
+        feeLevel: 'HIGH',
+      },
+    },
+  });
+}
+
 export async function executeUsdcTransfer(params: {
   payerEoa: string;
   toAddress: string;
   amountUsdc: number;
   remark: string | null;
   actionType: string;
+  idempotencyKey?: string;
 }): Promise<{ txHash: `0x${string}` }> {
   const payer = getAddress(params.payerEoa);
   const payee = getAddress(params.toAddress);
+  const guard = await acquireExecutionGuard({
+    walletAddress: payer,
+    amount: params.amountUsdc,
+    recipients: [payee],
+    idempotencyKey: params.idempotencyKey,
+    route: `agentpay:${params.actionType}`,
+    requireConfirmation: true,
+  });
+  try {
   if (payer === payee) {
     throw new Error('Cannot send to the same wallet');
   }
@@ -36,15 +72,10 @@ export async function executeUsdcTransfer(params: {
       'Agent wallet not ready. Complete AgentFlow wallet setup (user agent wallet) before sending.',
     );
   }
-  const amountRaw = parseUnits(params.amountUsdc.toFixed(6), 6);
-
-  const tx = await executeTransaction({
+  const tx = await createUsdcTransferTransaction({
     walletId: userAgent.wallet_id,
-    contractAddress: ARC_USDC,
-    abiFunctionSignature: 'transfer(address,uint256)',
-    abiParameters: [payee, amountRaw.toString()],
-    feeLevel: 'HIGH',
-    usdcAmount: params.amountUsdc,
+    destinationAddress: payee,
+    amountUsdc: params.amountUsdc,
   });
 
   const txId = extractTxId(tx);
@@ -77,7 +108,10 @@ export async function executeUsdcTransfer(params: {
     throw new Error(`[agentpay] Ledger insert failed: ${error.message}`);
   }
 
-  return { txHash: hash };
+    return { txHash: hash };
+  } finally {
+    await guard.release();
+  }
 }
 
 export async function executeOwnerWalletUsdcTransfer(params: {
@@ -99,14 +133,10 @@ export async function executeOwnerWalletUsdcTransfer(params: {
     throw new Error('Transfer amount must be greater than zero');
   }
 
-  const amountRaw = parseUnits(params.amountUsdc.toFixed(6), 6);
-  const tx = await executeTransaction({
+  const tx = await createUsdcTransferTransaction({
     walletId: params.fromWalletId,
-    contractAddress: ARC_USDC,
-    abiFunctionSignature: 'transfer(address,uint256)',
-    abiParameters: [payee, amountRaw.toString()],
-    feeLevel: 'HIGH',
-    usdcAmount: params.amountUsdc,
+    destinationAddress: payee,
+    amountUsdc: params.amountUsdc,
   });
 
   const txId = extractTxId(tx);

@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { pathToFileURL } from 'url';
 import { adminDb } from '../db/client';
 import { readVaultApyPercent, resolveVaultAddress } from '../lib/vault-apy';
 import { sendTelegramText } from '../lib/telegram-notify';
@@ -80,7 +81,7 @@ async function main(): Promise<void> {
   await runYieldMonitor();
 }
 
-if (require.main === module) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
     console.error('[yield-monitor] failed:', err);
     process.exit(1);

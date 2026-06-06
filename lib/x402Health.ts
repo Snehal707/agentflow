@@ -16,14 +16,20 @@ export function deriveHealthUrlFromRunUrl(runUrl: string): string {
   try {
     const url = new URL(trimmed);
     const pathname = url.pathname.replace(/\/+$/, '');
-    url.pathname = pathname.endsWith('/run')
+    const confirmIndex = pathname.indexOf('/confirm/');
+    url.pathname = confirmIndex >= 0
+      ? `${pathname.slice(0, confirmIndex) || ''}/health`
+      : pathname.endsWith('/run')
       ? `${pathname.slice(0, -4) || ''}/health`
       : `${pathname || ''}/health`;
     url.search = '';
     return url.toString();
   } catch {
     const normalized = normalizeBaseUrl(trimmed);
-    return normalized.endsWith('/run')
+    const confirmIndex = normalized.indexOf('/confirm/');
+    return confirmIndex >= 0
+      ? `${normalized.slice(0, confirmIndex) || ''}/health`
+      : normalized.endsWith('/run')
       ? `${normalized.slice(0, -4) || ''}/health`
       : `${normalized}/health`;
   }

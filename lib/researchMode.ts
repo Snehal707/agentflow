@@ -1,38 +1,30 @@
 export type ResearchReasoningMode = 'fast' | 'deep';
 
-const DEEP_RESEARCH_PATTERNS: RegExp[] = [
-  /\bdeep research\b/i,
-  /\bdeep[-\s]?dive\b/i,
-  /\bcomprehensive research\b/i,
-  /\bexhaustive research\b/i,
-  /\bdetailed research report\b/i,
-  /\bfull research report\b/i,
-  /\binstitutional[-\s]?grade research\b/i,
-  /\bhigh reasoning\b/i,
-];
-
 export function inferResearchReasoningMode(input: {
   task?: string | null;
   explicitMode?: unknown;
   deepResearch?: unknown;
   defaultMode?: ResearchReasoningMode;
 }): ResearchReasoningMode {
-  if (typeof input.explicitMode === 'string') {
-    const normalized = input.explicitMode.trim().toLowerCase();
-    if (normalized === 'fast' || normalized === 'deep') {
-      return normalized;
-    }
-  }
+  const explicitMode =
+    typeof input.explicitMode === 'string' ? input.explicitMode.trim().toLowerCase() : '';
+  if (explicitMode === 'deep') return 'deep';
+  if (explicitMode === 'fast') return 'fast';
 
-  if (input.deepResearch === true || input.deepResearch === 'true') {
+  if (input.deepResearch === true) return 'deep';
+  if (typeof input.deepResearch === 'string' && /^(1|true|yes|deep)$/i.test(input.deepResearch.trim())) {
     return 'deep';
   }
 
-  const task = input.task?.trim() || '';
-  if (task && DEEP_RESEARCH_PATTERNS.some((pattern) => pattern.test(task))) {
+  const task = typeof input.task === 'string' ? input.task.toLowerCase() : '';
+  if (
+    /\bdeep\s+(?:research\s+)?report\b/.test(task) ||
+    /\bdeep\s+research\b/.test(task) ||
+    /\bdeep\s+dive\b/.test(task) ||
+    /\b(?:full|detailed|comprehensive|in-depth|indepth)\s+(?:research\s+)?report\b/.test(task)
+  ) {
     return 'deep';
   }
 
   return input.defaultMode ?? 'fast';
 }
-

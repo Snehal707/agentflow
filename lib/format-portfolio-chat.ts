@@ -28,6 +28,10 @@ function truncateText(value: string, max: number): string {
   return `${value.slice(0, max - 1)}…`;
 }
 
+function trimPredictionAmount(value: string): string {
+  return value.replace(/\b(\d+\.\d{1,6})\d+\b/g, '$1');
+}
+
 export function formatPortfolioSnapshotRecordsForChat(
   data: PortfolioChatSnapshotInput,
   options: FormatPortfolioChatOptions = {},
@@ -56,6 +60,18 @@ export function formatPortfolioSnapshotRecordsForChat(
     const kind = String(position.kind || '').trim();
     if (kind === 'gateway_position') {
       return amount || (usdValue > 0 ? fmtUsd(usdValue) : 'Gateway reserve');
+    }
+    if (kind === 'prediction_market') {
+      const status = Array.isArray(position.notes)
+        ? (position.notes as unknown[]).map((note) => String(note)).find((note) =>
+            /^(?:Redeemable now|Refundable now|Stage:)/i.test(note),
+          )
+        : '';
+      const address = String(position.marketAddress || '').trim();
+      const addressLabel = /^0x[a-fA-F0-9]{40}$/.test(address)
+        ? ` (${address.slice(0, 8)}...${address.slice(-4)})`
+        : '';
+      return `${name}${addressLabel}: ${trimPredictionAmount(amount || 'position detected')}${status ? ` - ${status}` : ''}`;
     }
     if (amount) {
       return `${name}: ${amount}${usdValue > 0 ? ` (${fmtUsd(usdValue)})` : ''}`;
@@ -91,6 +107,10 @@ export function formatPortfolioSnapshotRecordsForChat(
     .filter((position) => String(position.kind || '') === 'swap_liquidity')
     .filter((position) => Number(position.usdValue || 0) > 0 || String(position.amountFormatted || '').trim())
     .map(positionLine);
+  const predictionMarketPositions = positions
+    .filter((position) => String(position.kind || '') === 'prediction_market')
+    .filter((position) => String(position.amountFormatted || '').trim())
+    .map(positionLine);
   const gatewayPositionRows = positions.filter(
     (position) => String(position.kind || '') === 'gateway_position',
   );
@@ -105,7 +125,7 @@ export function formatPortfolioSnapshotRecordsForChat(
   const otherPositions = positions
     .filter((position) => {
       const kind = String(position.kind || '');
-      return kind !== 'swap_liquidity' && kind !== 'gateway_position';
+      return kind !== 'swap_liquidity' && kind !== 'gateway_position' && kind !== 'prediction_market';
     })
     .filter((position) => Number(position.usdValue || 0) > 0 || String(position.amountFormatted || '').trim())
     .map(positionLine);
@@ -146,6 +166,12 @@ export function formatPortfolioSnapshotRecordsForChat(
       gatewayPositions.length > 0
         ? `**Gateway reserve:** ${gatewayPositions.join('; ')}`
         : null,
+      predictionMarketPositions.length > 0
+        ? [
+            '**Prediction market positions:**',
+            ...predictionMarketPositions.map((line) => `- ${line}`),
+          ].join('\n')
+        : null,
       otherPositions.length > 0
         ? `**Other positions:** ${otherPositions.join('; ')}`
         : null,
@@ -167,10 +193,23 @@ export function formatPortfolioSnapshotRecordsForChat(
   return result;
 }
 
-/** Body for chat after a successful paid Portfolio agent run (snapshot + analysis + footer). */
+function formatPortfolioAnalysis(report: string): string {
+  const trimmed = report.trim();
+  const substantiveText = trimmed
+    .replace(/^#{1,6}\s+.*$/gm, '')
+    .replace(/[-*_`\s]/g, '');
+  if (!substantiveText) {
+    return '';
+  }
+  return /^#{1,6}\s+\S/m.test(trimmed)
+    ? trimmed
+    : `## Analysis\n\n${trimmed}`;
+}
+
+/** Body for chat after a successful paid Portfolio agent run (snapshot + analysis). */
 export function formatPaidPortfolioAgentChatBody(
   data: Record<string, unknown>,
-  priceLabel: string,
+  _priceLabel: string,
 ): string {
   const holdings = Array.isArray(data.holdings) ? data.holdings : [];
   const positions = Array.isArray(data.positions) ? data.positions : [];
@@ -189,9 +228,9 @@ export function formatPaidPortfolioAgentChatBody(
   });
   const report = typeof data.report === 'string' ? data.report.trim() : '';
   const parts: string[] = [snapshot];
-  if (report) {
-    parts.push(`## Analysis\n\n${report}`);
+  const analysis = formatPortfolioAnalysis(report);
+  if (analysis) {
+    parts.push(analysis);
   }
-  parts.push(`_Paid Portfolio Agent (${priceLabel} via x402)._`);
   return parts.join('\n\n');
 }

@@ -1,60 +1,68 @@
 "use client";
 
-import type { PortfolioHolding } from "@/lib/liveAgentClient";
+import {
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import type { PortfolioHolding, PortfolioPosition } from "@/lib/liveAgentClient";
 
-const TOKEN_BAR_COLORS: Record<string, string> = {
-  USDC: "#3B82F6",
-  EURC: "#10B981",
-  AFVUSDC: "#A855F7",
-  APVUSDC: "#A855F7",
-};
+export type AllocationViewMode = "live" | "holdings" | "pnl";
 
-const TOKEN_LABELS: Record<string, { title: string; subtitle?: string }> = {
-  USDC: { title: "USDC" },
-  EURC: { title: "EURC" },
-  AFVUSDC: { title: "Vault USDC", subtitle: "afvUSDC" },
-  APVUSDC: { title: "Vault USDC", subtitle: "apvUSDC" },
-};
-
-type Props = {
-  holdings: PortfolioHolding[];
-  maxUsd: number;
-  shareDenom: number;
-  totalTokenCount?: number;
-  emptySlots?: number;
-};
-
-function accentForIndex(index: number): string {
-  const palette = [188, 206, 222, 254, 162, 138];
-  const hue = palette[index % palette.length] ?? 188;
-  return `hsla(${hue}, 78%, 62%, 0.92)`;
+function hashSeed(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }
 
-function accentForHolding(symbol: string | undefined, index: number): string {
-  if (!symbol) return accentForIndex(index);
-  return TOKEN_BAR_COLORS[symbol.toUpperCase()] ?? accentForIndex(index);
+const TOKEN_LINE_COLORS: Record<string, string> = {
+  USDC: "#f2ca50", // Gold
+  EURC: "#ffffff", // White
+  AFVUSDC: "#d8ad27", // Golden variant
+};
+
+/** Deterministic series for sparkline; same wobble math as previous SVG path. */
+function sparkSeries(
+  id: string,
+  steps: number,
+  h: number,
+  amp01: number,
+): { i: number; y: number }[] {
+  const seed = hashSeed(id);
+  const maxAmp = (h / 2 - 1) * Math.max(0.12, Math.min(1, amp01));
+  const out: { i: number; y: number }[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const s1 = Math.sin(t * Math.PI * 4 + seed * 1e-6);
+    const s2 = Math.sin(t * Math.PI * 11 + seed * 3e-6);
+    const s3 = Math.sin(t * Math.PI * 19 + seed * 7e-6) * 0.35;
+    const wobble = s1 * 0.5 + s2 * 0.35 + s3;
+    const y = h / 2 + maxAmp * wobble;
+    out.push({ i, y });
+  }
+  return out;
 }
 
-function holdingDisplayMeta(holding: PortfolioHolding | null | undefined): {
-  title: string;
-  subtitle: string;
-} {
-  if (!holding) {
-    return { title: "--", subtitle: "Waiting for holdings" };
+function strokeForIndex(index: number): string {
+  const isAlt = index % 2 === 0;
+  if (isAlt) {
+    const hue = 42 + (index % 4) * 4;
+    return `hsla(${hue}, 82%, 62%, 0.8)`;
+  } else {
+    return `rgba(255, 255, 255, 0.75)`;
   }
+}
 
-  const symbol = holding.symbol?.toUpperCase() ?? "";
-  const configured = TOKEN_LABELS[symbol];
-  if (configured) {
-    return {
-      title: configured.title,
-      subtitle: configured.subtitle ?? holding.symbol ?? configured.title,
-    };
-  }
-
-  const rawTitle = holding.symbol?.trim() || holding.name?.trim() || "Asset";
-  const rawSubtitle = holding.name?.trim() || holding.symbol?.trim() || rawTitle;
-  return { title: rawTitle, subtitle: rawSubtitle };
+function strokeForHolding(symbol: string | undefined, index: number): string {
+  if (!symbol) return strokeForIndex(index);
+  const key = symbol.toUpperCase();
+  return TOKEN_LINE_COLORS[key] ?? strokeForIndex(index);
 }
 
 function formatUsdExact(value: number): string {
@@ -66,73 +74,45 @@ function formatUsdExact(value: number): string {
 }
 
 function formatSignedUsd(value: number | null | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "--";
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
   const abs = Math.abs(value);
-  const sign = value >= 0 ? "+" : "-";
+  const sign = value >= 0 ? "+" : "−";
   return `${sign}${formatUsdExact(abs)}`;
 }
 
-function formatSharePercent(usdValue: number | null | undefined, shareDenom: number): string {
-  if (typeof usdValue !== "number" || !Number.isFinite(usdValue) || usdValue <= 0 || shareDenom <= 0) {
-    return "0%";
-  }
-  return `${((usdValue / shareDenom) * 100).toFixed(1)}%`;
+function AllocationLineTooltip({
+  active,
+  holding,
+  usdValue,
+}: {
+  active?: boolean;
+  holding: PortfolioHolding;
+  usdValue: number;
+}) {
+  if (!active) return null;
+  const title = holding.name?.trim() || holding.symbol;
+  return (
+    <div className="rounded-md border border-[#46484d]/40 bg-[#1d2025]/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur-sm">
+      <p className="text-[11px] font-semibold leading-tight text-[#f6f6fc]">{title}</p>
+      <p className="mt-0.5 font-mono text-[10px] tabular-nums text-[#aaabb0]">{formatUsdExact(usdValue)}</p>
+    </div>
+  );
 }
 
-function normalizedShareLabels(holdings: PortfolioHolding[], shareDenom: number): Map<string, string> {
-  const labels = new Map<string, string>();
-  if (holdings.length === 0 || shareDenom <= 0) {
-    return labels;
-  }
+type Props = {
+  holdings: PortfolioHolding[];
+  maxUsd: number;
+  shareDenom: number;
+  /** Total tokens in wallet (may exceed visible rows). */
+  totalTokenCount?: number;
+  emptySlots?: number;
+  allocationView?: AllocationViewMode;
+  /** Agent positions with unrealized PnL (PNL tab). */
+  positions?: PortfolioPosition[];
+};
 
-  const scale = 10;
-  const rawShares = holdings.map((holding) => {
-    const usd = holding.usdValue ?? 0;
-    const scaled = usd > 0 ? (usd / shareDenom) * 100 * scale : 0;
-    const base = Math.floor(scaled);
-    return {
-      id: holding.id,
-      usd,
-      base,
-      remainder: scaled - base,
-    };
-  });
-
-  let assigned = rawShares.reduce((sum, item) => sum + item.base, 0);
-  const target = 100 * scale;
-  const ranked = [...rawShares].sort((a, b) => {
-    if (b.remainder !== a.remainder) return b.remainder - a.remainder;
-    return b.usd - a.usd;
-  });
-
-  let cursor = 0;
-  while (assigned < target && ranked.length > 0) {
-    ranked[cursor % ranked.length]!.base += 1;
-    assigned += 1;
-    cursor += 1;
-  }
-
-  const byId = new Map(ranked.map((item) => [item.id, item.base]));
-  for (const item of rawShares) {
-    const normalized = (byId.get(item.id) ?? 0) / scale;
-    labels.set(item.id, `${normalized.toFixed(1)}%`);
-  }
-
-  return labels;
-}
-
-function barWidthPercent(
-  usdValue: number | null | undefined,
-  maxUsd: number,
-  emphasized: boolean,
-): number {
-  if (typeof usdValue !== "number" || !Number.isFinite(usdValue) || usdValue <= 0 || maxUsd <= 0) {
-    return 0;
-  }
-  const scaled = Math.round((usdValue / maxUsd) * 100);
-  const minimum = emphasized ? 18 : 12;
-  return Math.min(100, Math.max(minimum, scaled));
-}
+const CHART_H = 28;
+const STEPS = 28;
 
 export function AllocationSparklines({
   holdings,
@@ -140,15 +120,59 @@ export function AllocationSparklines({
   shareDenom,
   totalTokenCount,
   emptySlots = 0,
+  allocationView = "live",
+  positions = [],
 }: Props) {
+  if (allocationView === "pnl") {
+    if (positions.length === 0) {
+      return (
+        <p className="px-1 py-2 text-[10px] leading-relaxed text-[#6a6c72]">
+          No active agent positions with PnL. Deploy or fund strategies from the{" "}
+          <span className="text-[#aaabb0]">Active Agent Positions</span> section below.
+        </p>
+      );
+    }
+    const rows = positions.slice(0, 12);
+    return (
+      <div className="flex flex-col gap-1.5">
+        {rows.map((position) => {
+          const pnl = position.pnlUsd;
+          const pnlPositive = typeof pnl === "number" && pnl >= 0;
+          return (
+            <div
+              key={position.id}
+              className="flex items-center justify-between gap-2 rounded-lg border border-[#46484d]/10 bg-[#0c0e12]/80 px-2 py-1.5 sm:gap-3"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-[10px] font-semibold text-[#f6f6fc]">{position.name}</p>
+                <p className="truncate text-[8px] uppercase tracking-wide text-[#6a6c72]">{position.protocol}</p>
+              </div>
+              <div className="shrink-0 text-right">
+                <p
+                  className={`font-mono text-[10px] tabular-nums ${
+                    pnlPositive ? "text-[#10d5ff]" : "text-[#ff716c]"
+                  }`}
+                >
+                  {formatSignedUsd(pnl)}
+                </p>
+                <p className="text-[8px] text-[#6a6c72]">unrealized</p>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   const max = maxUsd > 0 ? maxUsd : 1;
-  const shareLabels = normalizedShareLabels(holdings, shareDenom);
   const rows =
     holdings.length > 0
       ? holdings
-      : Array.from({ length: Math.min(5, emptySlots || 3) }, () => null as PortfolioHolding | null);
+      : Array.from({ length: Math.min(5, emptySlots || 3) }, (_, i) => null as PortfolioHolding | null);
+
   const hidden = (totalTokenCount ?? 0) > holdings.length ? totalTokenCount! - holdings.length : 0;
-  const holdingsEmphasis = true;
+  const holdingsEmphasis = allocationView === "holdings";
+  const chartMuted = holdingsEmphasis ? "opacity-75" : "";
 
   return (
     <div className="flex flex-col gap-2">
@@ -157,74 +181,76 @@ export function AllocationSparklines({
           {rows.map((holding, index) => {
             const id = holding?.id ?? `empty-${index}`;
             const usd = holding?.usdValue ?? 0;
-            const accent = holding ? accentForHolding(holding.symbol, index) : "rgba(70, 72, 77, 0.35)";
-            const width = holding ? barWidthPercent(usd, max, holdingsEmphasis) : 0;
-            const displayMeta = holdingDisplayMeta(holding);
-            const shareLabel = holding
-              ? shareLabels.get(holding.id) ?? formatSharePercent(holding.usdValue, shareDenom)
-              : "--";
+            const amp = holding ? usd / max : 0;
+            const pct =
+              holding && shareDenom > 0
+                ? Math.max(1, Math.round(((holding.usdValue ?? 0) / shareDenom) * 100))
+                : 0;
+            const stroke = holding ? strokeForHolding(holding.symbol, index) : "rgba(70, 72, 77, 0.35)";
+            const series = sparkSeries(holding ? holding.id : `empty-${index}`, STEPS, CHART_H, holding ? amp : 0.08);
 
             return (
               <div
                 key={id}
-                className="flex items-center gap-2 rounded-lg border border-[#46484d]/10 bg-[#0c0e12]/80 px-2 py-1.5 sm:gap-3"
+                className="flex items-center gap-2 rounded-lg border border-[#46484d]/10 bg-[#0c0e12]/80 px-2 py-1 sm:gap-3"
               >
                 <div className="w-16 shrink-0 sm:w-[4.5rem]">
-                  <p className="text-[10px] font-semibold leading-tight tracking-tight text-[#f6f6fc]">
-                    {displayMeta.title}
+                  <p className="text-[10px] font-semibold uppercase leading-tight tracking-tight text-[#aaabb0]">
+                    {holding?.symbol ?? "—"}
                   </p>
                 </div>
-
-                <div className="min-w-0 flex-1">
-                  <div
-                    className={`relative overflow-hidden rounded-full border border-white/5 bg-[#11151b] ${
-                      holdingsEmphasis ? "h-4" : "h-3.5"
-                    }`}
-                  >
-                    <div
-                      aria-hidden="true"
-                      className="absolute inset-0 opacity-20"
-                      style={{
-                        backgroundImage:
-                          "linear-gradient(90deg, rgba(255,255,255,0.06) 0 1px, transparent 1px 14px)",
-                      }}
-                    />
-                    {holding ? (
-                      <div
-                        className="relative h-full rounded-full transition-[width] duration-500"
-                        style={{
-                          width: `${width}%`,
-                          backgroundColor: accent,
-                          boxShadow: `0 0 24px ${accent}`,
-                        }}
+                <div className={`relative min-h-[28px] min-w-0 flex-1 ${chartMuted}`}>
+                  <ResponsiveContainer width="100%" height={CHART_H}>
+                    <LineChart data={series} margin={{ top: 1, right: 2, left: 2, bottom: 1 }}>
+                      <XAxis dataKey="i" type="number" domain={[0, STEPS]} hide allowDataOverflow />
+                      <YAxis domain={[0, CHART_H]} hide allowDataOverflow />
+                      {holding ? (
+                        <Tooltip
+                          content={(tip) => (
+                            <AllocationLineTooltip active={tip.active} holding={holding} usdValue={usd} />
+                          )}
+                          cursor={{ stroke: "rgba(148, 163, 184, 0.35)", strokeWidth: 1 }}
+                        />
+                      ) : null}
+                      <Line
+                        type="linear"
+                        dataKey="y"
+                        stroke={stroke}
+                        strokeWidth={holding ? 1.25 : 0.75}
+                        dot={false}
+                        isAnimationActive={false}
+                        activeDot={
+                          holding
+                            ? {
+                                r: 4,
+                                fill: stroke,
+                                stroke: "#0c0e12",
+                                strokeWidth: 1,
+                              }
+                            : false
+                        }
                       />
-                    ) : null}
-                  </div>
-
-                  <div className="mt-1 flex items-center justify-between gap-2">
-                    <p
-                      className="truncate text-[8px] uppercase tracking-[0.14em] text-[#aaabb0]"
-                    >
-                      {displayMeta.subtitle}
-                    </p>
-                    <p
-                      className="shrink-0 text-[8px] uppercase tracking-[0.14em] text-[#aaabb0]"
-                    >
-                      {shareLabel}
-                    </p>
-                  </div>
+                    </LineChart>
+                  </ResponsiveContainer>
                 </div>
-
                 <div className="w-24 shrink-0 text-right">
                   {holding ? (
                     <>
-                      <p className="text-[10px] font-mono text-[#f6f6fc]">{formatUsdExact(usd)}</p>
-                      <p className="text-[9px] font-semibold text-[#aaabb0]">
-                        value
+                      <p className="text-[10px] font-mono text-[#f6f6fc]">
+                        {usd.toLocaleString("en-US", {
+                          style: "currency",
+                          currency: "USD",
+                          maximumFractionDigits: 2,
+                        })}
+                      </p>
+                      <p
+                        className={`text-[9px] text-[#6a6c72] ${holdingsEmphasis ? "font-semibold text-[#aaabb0]" : ""}`}
+                      >
+                        {pct}% of wallet
                       </p>
                     </>
                   ) : (
-                    <p className="text-[10px] text-[#46484d]">--</p>
+                    <p className="text-[10px] text-[#46484d]">—</p>
                   )}
                 </div>
               </div>
@@ -232,10 +258,9 @@ export function AllocationSparklines({
           })}
         </div>
       </div>
-
       {hidden > 0 ? (
         <p className="text-[10px] text-[#6a6c72]">
-          Showing top {holdings.length} by USD - +{hidden} more token{hidden === 1 ? "" : "s"} on this wallet
+          Showing top {holdings.length} by USD · +{hidden} more token{hidden === 1 ? "" : "s"} on this wallet
         </p>
       ) : null}
     </div>

@@ -2,7 +2,6 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import dotenv from 'dotenv';
 import { isAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
 import { checkRateLimit } from '../../lib/ratelimit';
@@ -11,7 +10,6 @@ import { transcribeAudioForChat, validateAudioPayloadForTranscription } from '..
 import { getOrCreateAgentWallets } from '../../lib/dcw';
 import { recordReputationSafe } from '../../lib/reputation';
 import { incrementDailyUsageCap, readDailyUsageCap } from '../../lib/usageCaps';
-import { getFacilitatorBaseUrl } from '../../lib/facilitator-url';
 
 dotenv.config();
 
@@ -19,16 +17,9 @@ const app = express();
 app.use(express.json({ limit: process.env.AGENT_JSON_LIMIT?.trim() || '20mb' }));
 
 const port = Number(process.env.TRANSCRIBE_AGENT_PORT || 3017);
-const facilitatorUrl = getFacilitatorBaseUrl();
-const price = process.env.TRANSCRIBE_AGENT_PRICE
-  ? `$${process.env.TRANSCRIBE_AGENT_PRICE}`
-  : '$0.002';
 const dailyLimit = Number(process.env.TRANSCRIBE_DAILY_LIMIT || 5);
 
-const account = privateKeyToAccount(resolveAgentPrivateKey());
-const sellerAddress =
-  (process.env.SELLER_ADDRESS?.trim() as `0x${string}`) || account.address;
-const gateway = createGatewayMiddleware({ sellerAddress, facilitatorUrl });
+privateKeyToAccount(resolveAgentPrivateKey());
 
 function classifyTranscribeScore(text: string): number {
   const normalized = text.trim();
@@ -150,8 +141,8 @@ const preflightMiddleware = async (req: Request, res: Response, next: NextFuncti
 
 const guardPreflightMiddleware = async (req: Request, res: Response, next: NextFunction) => {
   if ((req as any)._internalAuth) {
-    const benchmarkText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
-    if (benchmarkText) {
+    const providedText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    if (providedText) {
       next();
       return;
     }
@@ -165,42 +156,25 @@ const guardPreflightMiddleware = async (req: Request, res: Response, next: NextF
   await preflightMiddleware(req, res, next);
 };
 
-const guardGatewayMiddleware = (req: Request, res: Response, next: NextFunction) => {
-  if ((req as any)._internalAuth) {
-    next();
-    return;
-  }
-  return gateway.require(price)(req, res, next);
-};
-
 app.post(
   '/run',
   internalKeyMiddleware,
   guardAuthMiddleware,
   guardRateLimitMiddleware,
   guardPreflightMiddleware,
-  guardGatewayMiddleware,
   async (req: Request, res: Response) => {
     const auth = (req as any).auth as JWTPayload;
     try {
-      if (req.body?.benchmark === true) {
-        console.log('[benchmark] transcribe short-circuit');
-        return res.json({
-          ok: true,
-          benchmark: true,
-          agent: 'transcribe',
-          result: 'Benchmark mode - payment logged',
-        });
-      }
-      const benchmarkText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
-      const result = benchmarkText && (req as any)._internalAuth
-        ? {
-            text: benchmarkText,
-            model: 'benchmark-text',
-          }
-        : await transcribeAudioForChat({
-            audio: req.body.audio,
-          });
+      const providedText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+      const result =
+        providedText && (req as any)._internalAuth
+          ? {
+              text: providedText,
+              model: 'inline-text',
+            }
+          : await transcribeAudioForChat({
+              audio: req.body.audio,
+            });
 
       const cap = await incrementDailyUsageCap({
         scope: 'transcribe',

@@ -21,7 +21,6 @@ export function shouldTriggerResearch(content: string): boolean {
 export function portfolioBuyerSlugFromTool(tool: string): 'swap' | 'vault' | 'bridge' | 'batch' | 'split' | null {
   if (tool === 'swap_tokens') return 'swap';
   if (tool === 'vault_action') return 'vault';
-  if (tool === 'bridge_usdc') return 'bridge';
   if (tool === 'batch' || tool === 'batch_pay') return 'batch';
   if (tool === 'split' || tool === 'split_pay') return 'split';
   return null;

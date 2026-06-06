@@ -16,7 +16,7 @@ export default function SettingsPage() {
   const { isCollapsed, toggleSidebar } = useSidebarPreference();
   const { address } = useAccount();
   const { openConnectModal } = useConnectModal();
-  const { isAuthenticated, signIn, loading: signInLoading } = useAgentJwt();
+  const { isAuthenticated, signIn, loading: signInLoading, error: signInError } = useAgentJwt();
   const [autoSettlement, setAutoSettlement] = useState(true);
   const [biometricMfa, setBiometricMfa] = useState(false);
   const [dispatchBriefing, setDispatchBriefing] = useState(true);
@@ -34,6 +34,7 @@ export default function SettingsPage() {
               address={address}
               isAuthenticated={isAuthenticated}
               isLoading={signInLoading}
+              error={signInError}
               onAction={() => {
                 if (!address) { openConnectModal?.(); return; }
                 if (!isAuthenticated) { void signIn().catch(() => {}); }

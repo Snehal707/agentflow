@@ -8,7 +8,8 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
 
 /// @notice Two-asset Curve StableSwap-style pool (USDC / EURC), 6-decimal tokens.
 /// @dev Amplification `A = 100`, fee 3 bps. Math follows Curve StableSwap `get_D` / `get_y` (N_COINS=2).
-/// @dev Keep in sync with `foundry/src/AgentFlowSwap.sol` (OpenZeppelin v4 `Ownable()` here for Hardhat; Foundry uses v5 `Ownable(msg.sender)`).
+/// @deprecated AgentFlow swap execution is moving to 0x API integration.
+/// This contract is kept only for historical testnet deployments and should not be used by backend code.
 contract AgentFlowSwap is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 

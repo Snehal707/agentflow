@@ -1,7 +1,0 @@
-﻿# agentflow-agents — facilitator + V2 + V3 agents (one container)
-[build]
-builder = "nixpacks"
-
-[deploy]
-startCommand = "npm run dev:agents"
-restartPolicyType = "ON_FAILURE"

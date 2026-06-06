@@ -1,3 +1,5 @@
+import { APP_URLS } from './app-urls';
+
 export function isLikelyGatewayOrBalanceError(message: string): boolean {
   const m = message.toLowerCase();
   return (
@@ -18,7 +20,7 @@ export function buildGatewayLowMessage(currentBalance: number, required: number)
     `Current: ${currentBalance.toFixed(4)} USDC`,
     '',
     'Fund your Gateway at:',
-    'https://agentflow.one/funds → Gateway tab',
+    `${APP_URLS.funds} → Gateway tab`,
     '',
     'Execution will continue via your Agent Wallet instead.',
   ].join('\n');

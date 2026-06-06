@@ -1,3 +1,13 @@
+import { hasMojibakeMarkers, repairMojibake } from './text-normalization';
+import {
+  isCircularResearchSourceUrl,
+  isLowValueSourceForTask,
+  isLowValueSocialSourceUrl,
+  isOfficialCreatorPlatformUrl,
+  sourceHostname,
+  sourcePriority,
+} from './source-policy';
+
 type Obj = Record<string, unknown>;
 
 export type NormalizedReportSource = {
@@ -6,6 +16,8 @@ export type NormalizedReportSource = {
   url: string;
   usedFor?: string;
   canonical: boolean;
+  publishedAt?: string;
+  accessedAt?: string;
 };
 
 export type NormalizedClaim = {
@@ -60,6 +72,20 @@ type FramingSignals = {
   }>;
 };
 
+type GroundedSourceHint = {
+  name: string;
+  url: string;
+  publishedAt?: string;
+  accessedAt?: string;
+};
+
+type LiveDataSourceGrounding = {
+  byUrl: Map<string, GroundedSourceHint>;
+  byName: Map<string, GroundedSourceHint[]>;
+  hasEvidenceInventory: boolean;
+  snapshotAt?: string;
+};
+
 type FinalizeParams = {
   task: string;
   writerMarkdown: string;
@@ -112,6 +138,13 @@ function asDate(value?: string | null): string | undefined {
     : value;
 }
 
+function todayDateString(now = new Date()): string {
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 function isFutureDateValue(value: string, now = new Date()): boolean {
   const trimmed = value.trim();
   if (!trimmed) return false;
@@ -146,6 +179,86 @@ function sentence(value: string): string {
   return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
+function stripHtmlTags(value: string): string {
+  return value.replace(/<[^>]+>/g, ' ');
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function cleanInlineEvidenceText(value: string): string {
+  return stripHtmlTags(value)
+    .replace(/\bhttps?:\/\/\S+/gi, ' ')
+    .replace(/\b(?:title|url|symbol|id):\s*/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function shortenText(value: string, maxLength = 220): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length > maxLength
+    ? `${normalized.slice(0, maxLength - 3).trimEnd()}...`
+    : normalized;
+}
+
+function inferPrimaryTopicLabel(task: string, research: Obj | null): string | null {
+  const scope = asObject(research?.scope);
+  const entities = asArray(scope?.entities)
+    .map((entry) => asString(entry))
+    .filter((value): value is string => Boolean(value));
+
+  const taskLower = task.toLowerCase();
+  const exactEntity = entities.find((entity) =>
+    new RegExp(`\\b${escapeRegExp(entity)}\\b`, 'i').test(task),
+  );
+  if (exactEntity) return exactEntity;
+
+  const capitalized = task.match(/\b[A-Z][a-zA-Z0-9.-]{2,}\b/);
+  if (capitalized?.[0]) return capitalized[0];
+
+  const token = taskLower.match(/\b(bitcoin|ethereum|solana|xrp|dogecoin|litecoin|cardano|avalanche|chainlink|openai|anthropic|ipcc)\b/i);
+  return token?.[0] ?? null;
+}
+
+function isOffTopicVariantForPrimary(primaryTopicLabel: string | null, text: string): boolean {
+  if (!primaryTopicLabel) return false;
+  const primary = primaryTopicLabel.trim();
+  if (!primary) return false;
+  return new RegExp(
+    `\\b${escapeRegExp(primary)}\\s+(cash|sv|gold|classic|wrapped|inu)\\b`,
+    'i',
+  ).test(text);
+}
+
+function isRelevantToPrimaryTopic(primaryTopicLabel: string | null, text: string): boolean {
+  if (!primaryTopicLabel) return true;
+  return !isOffTopicVariantForPrimary(primaryTopicLabel, text);
+}
+
+function shouldBypassPrimaryTopicSourceFilter(
+  task: string,
+  primaryTopicLabel: string | null,
+): boolean {
+  if (!primaryTopicLabel) return true;
+  if (/\bprediction market\b/i.test(task)) return true;
+  if (/^[A-Z0-9]{2,5}$/.test(primaryTopicLabel.trim())) return true;
+  return false;
+}
+
+function articleMatchesPrimaryTopic(
+  task: string,
+  primaryTopicLabel: string | null,
+  articleText: string,
+): boolean {
+  if (shouldBypassPrimaryTopicSourceFilter(task, primaryTopicLabel)) {
+    return true;
+  }
+  if (!primaryTopicLabel) return true;
+  return new RegExp(`\\b${escapeRegExp(primaryTopicLabel)}\\b`, 'i').test(articleText);
+}
+
 function normalizeUrl(value: string | null): string | null {
   if (!value) return null;
   try {
@@ -160,10 +273,6 @@ function isGoogleNewsRssUrl(url: string): boolean {
   return /^https?:\/\/news\.google\.com\/rss\/articles\//i.test(url);
 }
 
-function sourcePriority(url: string): number {
-  return isGoogleNewsRssUrl(url) ? 1 : 2;
-}
-
 function normalizeSourceName(name: string | null, url: string): string {
   const haystack = `${name || ''} ${url}`;
   if (/\bassociated press\b|\bap news\b|apnews\.com/i.test(haystack)) return 'AP News';
@@ -176,19 +285,249 @@ function normalizeSourceName(name: string | null, url: string): string {
   if (/\bcnbc\b|cnbc\.com/i.test(haystack)) return 'CNBC';
   if (/\bfinancial times\b|ft\.com/i.test(haystack)) return 'Financial Times';
   if (/\batlantic council\b|atlanticcouncil\.org/i.test(haystack)) return 'Atlantic Council';
+  if (/\bcoingecko\b|coingecko\.com/i.test(haystack)) return 'CoinGecko';
+  if (/\bcoinmarketcap\b|coinmarketcap\.com/i.test(haystack)) return 'CoinMarketCap';
+  if (/\bdefillama\b|defillama\.com/i.test(haystack)) return 'DefiLlama';
+  if (/\bmempool\.space\b|\bmempool space\b/i.test(haystack)) return 'Mempool.space';
+  if (/\bcoindesk\b|coindesk\.com/i.test(haystack)) return 'CoinDesk';
+  if (/\bforbes\b|forbes\.com/i.test(haystack)) return 'Forbes';
   return name || new URL(url).hostname.replace(/^www\./, '');
 }
 
-function createSourceRegistry() {
+function sourceNameKey(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function sourceUrlKey(url: string): string {
+  return url.trim().toLowerCase();
+}
+
+function pushGroundedSource(
+  grounding: LiveDataSourceGrounding,
+  task: string,
+  hint: GroundedSourceHint,
+): void {
+  const url = normalizeUrl(hint.url);
+  const name = hint.name.trim();
+  if (!url || !name) return;
+  if (isLowValueSocialSourceUrl(url)) return;
+  if (isCircularResearchSourceUrl(task, url)) return;
+  if (isLowValueSourceForTask(task, { url, title: hint.name, publisher: hint.name })) return;
+
+  const normalizedName = normalizeSourceName(name, url);
+  const entry: GroundedSourceHint = {
+    name: normalizedName,
+    url,
+    ...(hint.publishedAt ? { publishedAt: asDate(hint.publishedAt) } : {}),
+    ...(hint.accessedAt ? { accessedAt: asDate(hint.accessedAt) } : {}),
+  };
+
+  grounding.byUrl.set(sourceUrlKey(url), entry);
+  const key = sourceNameKey(normalizedName);
+  const existing = grounding.byName.get(key) ?? [];
+  existing.push(entry);
+  grounding.byName.set(key, existing);
+  grounding.hasEvidenceInventory = true;
+}
+
+function buildLiveDataSourceGrounding(
+  liveData: Obj | null,
+  task: string,
+  primaryTopicLabel?: string | null,
+): LiveDataSourceGrounding {
+  const grounding: LiveDataSourceGrounding = {
+    byUrl: new Map(),
+    byName: new Map(),
+    hasEvidenceInventory: false,
+    snapshotAt: asDate(asString(liveData?.snapshot_at)),
+  };
+
+  const snapshotAt = grounding.snapshotAt;
+  const coingecko = asObject(liveData?.coingecko);
+  for (const entry of asArray(coingecko?.assets)) {
+    const asset = asObject(entry);
+    const coinId = asString(asset?.coinId);
+    if (!coinId) continue;
+    pushGroundedSource(grounding, task, {
+      name: 'CoinGecko',
+      url: `https://www.coingecko.com/en/coins/${encodeURIComponent(coinId)}`,
+      ...(asString(asset?.last_updated_at) ? { publishedAt: asString(asset?.last_updated_at)! } : {}),
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+
+  const defillama = asObject(liveData?.defillama);
+  for (const entry of asArray(defillama?.chains)) {
+    const chain = asString(asObject(entry)?.chain);
+    if (!chain) continue;
+    pushGroundedSource(grounding, task, {
+      name: 'DefiLlama',
+      url: `https://defillama.com/chain/${encodeURIComponent(chain)}`,
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+
+  const bitcoinOnchain = asObject(liveData?.bitcoin_onchain);
+  if (bitcoinOnchain) {
+    pushGroundedSource(grounding, task, {
+      name: 'Mempool.space',
+      url: 'https://mempool.space/blocks',
+      ...(asString(bitcoinOnchain?.latest_block_time)
+        ? { publishedAt: asString(bitcoinOnchain.latest_block_time)! }
+        : {}),
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+
+  const wikipedia = asObject(liveData?.wikipedia);
+  for (const entry of asArray(wikipedia?.pages)) {
+    const page = asObject(entry);
+    const url = normalizeUrl(asString(page?.url));
+    if (!url) continue;
+    pushGroundedSource(grounding, task, {
+      name: 'Wikipedia',
+      url,
+      ...(asString(page?.last_updated_at) ? { publishedAt: asString(page?.last_updated_at)! } : {}),
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+
+  const liveCurrentEvents = currentEvents(liveData);
+  const liveFramingSignals = asObject(liveCurrentEvents?.framing_signals);
+  for (const entry of asArray(liveFramingSignals?.support)) {
+    const support = asObject(entry);
+    const url = normalizeUrl(asString(support?.source_url));
+    if (!url) continue;
+    pushGroundedSource(grounding, task, {
+      name: asString(support?.source_name) ?? asString(support?.title) ?? 'Current event source',
+      url,
+      ...(asString(support?.date_or_period) ? { publishedAt: asString(support?.date_or_period)! } : {}),
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+  for (const entry of asArray(liveCurrentEvents?.article_snapshots)) {
+    const article = asObject(entry);
+    const url = normalizeUrl(asString(article?.url));
+    if (!url) continue;
+    pushGroundedSource(grounding, task, {
+      name: asString(article?.publisher) ?? asString(article?.title) ?? 'Current event source',
+      url,
+      ...(asString(article?.seen_at) ? { publishedAt: asString(article?.seen_at)! } : {}),
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+  for (const entry of asArray(liveCurrentEvents?.articles)) {
+    const article = asObject(entry);
+    const url = normalizeUrl(asString(article?.url));
+    if (!url) continue;
+    pushGroundedSource(grounding, task, {
+      name: asString(article?.publisher) ?? asString(article?.domain) ?? asString(article?.title) ?? 'Current event source',
+      url,
+      ...(asString(article?.seen_at) ? { publishedAt: asString(article?.seen_at)! } : {}),
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+
+  const dynamicSources = asObject(liveData?.dynamic_sources);
+  for (const entry of asArray(dynamicSources?.articles)) {
+    const article = asObject(entry);
+    const articleText = [
+      asString(article?.title),
+      asString(article?.summary),
+      asString(article?.publisher),
+      asString(article?.url),
+    ]
+      .filter(Boolean)
+      .join(' ');
+    if (!articleMatchesPrimaryTopic(task, primaryTopicLabel ?? null, articleText)) {
+      continue;
+    }
+    const url = normalizeUrl(asString(article?.url));
+    if (!url) continue;
+    pushGroundedSource(grounding, task, {
+      name: asString(article?.publisher) ?? asString(article?.title) ?? 'Dynamic source',
+      url,
+      ...(asString(article?.seen_at) ? { publishedAt: asString(article?.seen_at)! } : {}),
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+
+  for (const entry of asArray(liveData?.sources)) {
+    const source = asObject(entry);
+    const url = normalizeUrl(asString(source?.url));
+    if (!url) continue;
+    pushGroundedSource(grounding, task, {
+      name: asString(source?.title) ?? asString(source?.domain) ?? 'Retrieved source',
+      url,
+      ...(asString(source?.date) ? { publishedAt: asString(source?.date)! } : {}),
+      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+    });
+  }
+
+  return grounding;
+}
+
+function resolveGroundedSourceHint(
+  grounding: LiveDataSourceGrounding,
+  nameValue: unknown,
+  urlValue: unknown,
+): GroundedSourceHint | null {
+  const rawUrl = normalizeUrl(asString(urlValue));
+  if (rawUrl) {
+    const byUrl = grounding.byUrl.get(sourceUrlKey(rawUrl));
+    if (byUrl) return byUrl;
+  }
+
+  const rawName = asString(nameValue);
+  if (rawName) {
+    const normalizedName = normalizeSourceName(rawName, rawUrl ?? 'https://example.com');
+    const matches = grounding.byName.get(sourceNameKey(normalizedName)) ?? [];
+    if (matches.length === 1) return matches[0];
+    if (rawUrl) {
+      const rawHost = (() => {
+        try {
+          return new URL(rawUrl).hostname.replace(/^www\./, '').toLowerCase();
+        } catch {
+          return '';
+        }
+      })();
+      const hostMatch = matches.find((entry) => {
+        try {
+          return new URL(entry.url).hostname.replace(/^www\./, '').toLowerCase() === rawHost;
+        } catch {
+          return false;
+        }
+      });
+      if (hostMatch) return hostMatch;
+    }
+    if (matches[0]) return matches[0];
+  }
+
+  return null;
+}
+
+function createSourceRegistry(task: string) {
   const byId = new Map<string, NormalizedReportSource>();
   const byKey = new Map<string, string>();
 
   return {
-    add(nameValue: unknown, urlValue: unknown, usedForValue?: unknown): string[] {
+    add(
+      nameValue: unknown,
+      urlValue: unknown,
+      usedForValue?: unknown,
+      dateMeta?: { publishedAt?: unknown; accessedAt?: unknown },
+    ): string[] {
       const rawUrl = normalizeUrl(asString(urlValue));
       const rawName = asString(nameValue);
       const usedFor = asString(usedForValue) ?? undefined;
+      const publishedAt = asDate(asString(dateMeta?.publishedAt));
+      const accessedAt = asDate(asString(dateMeta?.accessedAt));
       if (!rawUrl) return [];
+      if (isLowValueSocialSourceUrl(rawUrl)) return [];
+      if (isCircularResearchSourceUrl(task, rawUrl)) return [];
+      if (isLowValueSourceForTask(task, { url: rawUrl, title: rawName ?? undefined, publisher: rawName ?? undefined })) {
+        return [];
+      }
 
       const name = normalizeSourceName(rawName, rawUrl);
       if (
@@ -203,11 +542,20 @@ function createSourceRegistry() {
       const existingId = byKey.get(key);
       if (existingId) {
         const previous = byId.get(existingId)!;
-        if (sourcePriority(rawUrl) > sourcePriority(previous.url)) {
+        if (sourcePriority(rawUrl, name) > sourcePriority(previous.url, previous.name)) {
           byId.set(existingId, {
             ...previous,
             url: rawUrl,
             canonical: !isGoogleNewsRssUrl(rawUrl),
+            usedFor: previous.usedFor ?? usedFor,
+            publishedAt: previous.publishedAt ?? publishedAt,
+            accessedAt: previous.accessedAt ?? accessedAt,
+          });
+        } else if (!previous.publishedAt || !previous.accessedAt) {
+          byId.set(existingId, {
+            ...previous,
+            publishedAt: previous.publishedAt ?? publishedAt,
+            accessedAt: previous.accessedAt ?? accessedAt,
             usedFor: previous.usedFor ?? usedFor,
           });
         }
@@ -223,6 +571,8 @@ function createSourceRegistry() {
         url: rawUrl,
         usedFor,
         canonical: !isGoogleNewsRssUrl(rawUrl),
+        publishedAt,
+        accessedAt,
       });
       byKey.set(key, id);
       return [id];
@@ -231,11 +581,104 @@ function createSourceRegistry() {
       return byId.get(id);
     },
     list() {
-      return [...byId.values()]
-        .sort((left, right) => sourcePriority(right.url) - sourcePriority(left.url))
-        .slice(0, 8);
+      const sorted = [...byId.values()].sort(
+        (left, right) =>
+          sourcePriority(right.url, right.name) - sourcePriority(left.url, left.name),
+      );
+      const nonWikipedia = sorted.filter((source) => !/\bwikipedia\.org\b/i.test(source.url));
+      return (nonWikipedia.length >= 2 ? nonWikipedia : sorted).slice(0, 8);
     },
   };
+}
+
+function addSupplementalLiveEvidenceSources(
+  liveData: Obj | null,
+  task: string,
+  sources: ReturnType<typeof createSourceRegistry>,
+  primaryTopicLabel?: string | null,
+): void {
+  const snapshotAt = asDate(asString(liveData?.snapshot_at)) ?? todayDateString();
+  const add = (
+    name: unknown,
+    url: unknown,
+    usedFor: unknown,
+    publishedAt?: unknown,
+  ) => {
+    const rawUrl = normalizeUrl(asString(url));
+    if (!rawUrl) return;
+    const priority = sourcePriority(rawUrl, asString(name) ?? undefined);
+    if (priority < 20) return;
+    sources.add(name, rawUrl, usedFor, {
+      publishedAt,
+      accessedAt: snapshotAt,
+    });
+  };
+
+  const coingecko = asObject(liveData?.coingecko);
+  for (const entry of asArray(coingecko?.assets)) {
+    const asset = asObject(entry);
+    const coinId = asString(asset?.coinId);
+    if (!coinId) continue;
+    add(
+      'CoinGecko',
+      `https://www.coingecko.com/en/coins/${encodeURIComponent(coinId)}`,
+      'live market data',
+      asset?.last_updated_at,
+    );
+  }
+
+  const defillama = asObject(liveData?.defillama);
+  for (const entry of asArray(defillama?.chains)) {
+    const chain = asString(asObject(entry)?.chain);
+    if (!chain) continue;
+    add('DefiLlama', `https://defillama.com/chain/${encodeURIComponent(chain)}`, 'TVL data');
+  }
+
+  const bitcoinOnchain = asObject(liveData?.bitcoin_onchain);
+  if (bitcoinOnchain) {
+    add(
+      'Mempool.space',
+      'https://mempool.space/blocks',
+      'Bitcoin block and transaction metrics',
+      bitcoinOnchain.latest_block_time,
+    );
+  }
+
+  const dynamicSources = asObject(liveData?.dynamic_sources);
+  for (const entry of asArray(dynamicSources?.articles).slice(0, 6)) {
+    const article = asObject(entry);
+    const articleText = [
+      asString(article?.title),
+      asString(article?.summary),
+      asString(article?.publisher),
+      asString(article?.url),
+    ]
+      .filter(Boolean)
+      .join(' ');
+    if (!articleMatchesPrimaryTopic(task, primaryTopicLabel ?? null, articleText)) {
+      continue;
+    }
+    add(
+      asString(article?.publisher) ?? asString(article?.title) ?? 'Retrieved source',
+      article?.url,
+      asString(article?.summary) ?? 'retrieved article evidence',
+      article?.seen_at,
+    );
+  }
+
+  const events = currentEvents(liveData);
+  for (const entry of [
+    ...asArray(events?.article_snapshots),
+    ...asArray(events?.articles),
+  ].slice(0, 6)) {
+    const article = asObject(entry);
+    add(
+      asString(article?.publisher) ?? asString(article?.domain) ?? asString(article?.title) ?? 'Current event source',
+      article?.url,
+      asString(article?.summary) ?? asString(article?.title) ?? 'current event evidence',
+      article?.seen_at,
+    );
+  }
 }
 
 function currentEvents(liveData: Obj | null): Obj | null {
@@ -385,7 +828,71 @@ function normalizeDevelopmentSummary(text: string): string {
   if (diplomatic === 'reported_diplomatic_development') {
     return 'Recent reporting described a diplomatic development relevant to the conflict.';
   }
-  return 'Recent reporting described a topic-relevant development.';
+  const cleaned = cleanInlineEvidenceText(text);
+  if (!cleaned) {
+    return 'Recent reporting described a topic-relevant development.';
+  }
+  return shortenText(cleaned, 180);
+}
+
+function addLiveArticleClaims(
+  params: FinalizeParams,
+  sources: ReturnType<typeof createSourceRegistry>,
+  addStructuredClaim: (claim: NormalizedClaim) => void,
+  addEvidenceSource: (nameValue: unknown, urlValue: unknown, usedForValue?: unknown) => string[],
+  topic: string,
+  primaryTopicLabel: string | null,
+): void {
+  const pushArticleClaim = (article: Obj, section: NormalizedClaim['section']) => {
+    const title = asString(article?.title);
+    const summary = asString(article?.summary);
+    const publisher = asString(article?.publisher) ?? asString(article?.domain) ?? 'Retrieved source';
+    const url = article?.url;
+    const text = [title, summary].filter(Boolean).join(' — ');
+    if (!text) return;
+    if (!articleMatchesPrimaryTopic(params.task, primaryTopicLabel, `${publisher} ${text} ${asString(url) ?? ''}`)) {
+      return;
+    }
+
+    const ids = addEvidenceSource(publisher, url, summary ?? title ?? 'retrieved article evidence');
+    if (!ids.length) return;
+
+    addStructuredClaim({
+      topic,
+      claim_id: claimId(
+        topic,
+        'live-article',
+        section,
+        asDate(asString(article?.seen_at)),
+        title ?? summary ?? undefined,
+      ),
+      section,
+      entity: primaryTopicLabel ?? 'Topic',
+      status: 'reported',
+      status_type: 'development',
+      confidence: 'medium',
+      time_ref: asDate(asString(article?.seen_at)),
+      summary: sentence(shortenText(cleanInlineEvidenceText(text), 220)),
+      evidence_source_ids: ids,
+      canonical_url: ids[0] ? sources.get(ids[0])?.url : undefined,
+      disputed: false,
+      notes: [text],
+    });
+  };
+
+  const dynamicSources = asObject(params.liveData?.dynamic_sources);
+  for (const entry of asArray(dynamicSources?.articles).slice(0, 4)) {
+    const article = asObject(entry);
+    if (!article) continue;
+    pushArticleClaim(article, 'reported_developments');
+  }
+
+  const events = currentEvents(params.liveData);
+  for (const entry of [...asArray(events?.article_snapshots), ...asArray(events?.articles)].slice(0, 4)) {
+    const article = asObject(entry);
+    if (!article) continue;
+    pushArticleClaim(article, 'reported_developments');
+  }
 }
 
 function addClaim(map: Map<string, NormalizedClaim>, claim: NormalizedClaim): void {
@@ -417,9 +924,15 @@ function addClaim(map: Map<string, NormalizedClaim>, claim: NormalizedClaim): vo
 
 function buildRawClaims(params: FinalizeParams): RawClaimState {
   const topic = asString(params.research?.topic) || params.task || 'AgentFlow';
-  const sources = createSourceRegistry();
+  const primaryTopicLabel = inferPrimaryTopicLabel(params.task, params.research);
+  const sources = createSourceRegistry(params.task);
   const rawClaims = new Map<string, NormalizedClaim>();
   const issues: string[] = [];
+  const sourceGrounding = buildLiveDataSourceGrounding(
+    params.liveData,
+    params.task,
+    primaryTopicLabel,
+  );
   const framing = framingSignals(params.liveData);
   const support = asArray<{
     title?: string;
@@ -429,9 +942,36 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
   }>(framing?.support);
 
   const addStructuredClaim = (claim: NormalizedClaim) => addClaim(rawClaims, claim);
+  const addEvidenceSource = (
+    nameValue: unknown,
+    urlValue: unknown,
+    usedForValue?: unknown,
+  ): string[] => {
+    const grounded = resolveGroundedSourceHint(sourceGrounding, nameValue, urlValue);
+    const rawUrl = normalizeUrl(asString(urlValue));
+    const rawName = asString(nameValue);
+
+    if (sourceGrounding.hasEvidenceInventory && !grounded) {
+      const descriptor = rawName || rawUrl || 'unknown source';
+      issues.push(`Unsupported source omitted from final source list: ${descriptor}`);
+      return [];
+    }
+
+    return sources.add(
+      grounded?.name ?? rawName,
+      grounded?.url ?? rawUrl,
+      usedForValue,
+      {
+        publishedAt: grounded?.publishedAt,
+        accessedAt:
+          grounded?.accessedAt ??
+          (sourceGrounding.hasEvidenceInventory ? sourceGrounding.snapshotAt : todayDateString()),
+      },
+    );
+  };
 
   if (framing?.broader_conflict_status === 'reported_active_war') {
-    const ids = sources.add(
+    const ids = addEvidenceSource(
       support[0]?.source_name,
       support[0]?.source_url,
       support[0]?.title ?? 'Active conflict reporting',
@@ -459,7 +999,7 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
   }
 
   if (framing?.hormuz_route_status) {
-    const ids = sources.add(
+    const ids = addEvidenceSource(
       support[1]?.source_name ?? support[0]?.source_name,
       support[1]?.source_url ?? support[0]?.source_url,
       support[1]?.title ?? 'Hormuz route status',
@@ -493,7 +1033,7 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
   if (framing?.red_sea_route_status) {
     const redSeaSupport =
       support.find((item) => /\bred sea\b|shipping/i.test(`${item.title || ''}`)) || support[0];
-    const ids = sources.add(
+    const ids = addEvidenceSource(
       redSeaSupport?.source_name,
       redSeaSupport?.source_url,
       redSeaSupport?.title ?? 'Red Sea route status',
@@ -530,7 +1070,7 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
     const text = asString(item?.claim);
     if (!item || !text) continue;
 
-    const ids = sources.add(
+    const ids = addEvidenceSource(
       item.source_name ?? item.name,
       item.source_url ?? item.url,
       item.support ?? item.used_for,
@@ -651,7 +1191,7 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
     const text = asString(item?.event);
     if (!item || !text) continue;
 
-    const ids = sources.add(
+    const ids = addEvidenceSource(
       item.source_name ?? item.name,
       item.source_url ?? item.url,
       item.support ?? item.importance,
@@ -699,7 +1239,7 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
     const value = asString(item?.value);
     if (!item || !name || !value) continue;
 
-    const ids = sources.add(
+    const ids = addEvidenceSource(
       item.source_name ?? item.name,
       item.source_url ?? item.url,
       item.support,
@@ -724,6 +1264,22 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
       notes: [],
     });
   }
+
+  addLiveArticleClaims(
+    params,
+    sources,
+    addStructuredClaim,
+    addEvidenceSource,
+    topic,
+    primaryTopicLabel,
+  );
+
+  addSupplementalLiveEvidenceSources(
+    params.liveData,
+    params.task,
+    sources,
+    primaryTopicLabel,
+  );
 
   for (const claim of rawClaims.values()) {
     if (!hasSourceEvidence(claim)) {
@@ -1108,8 +1664,15 @@ function buildReportedDevelopmentsSection(
 function buildMetricsSection(
   claims: NormalizedClaim[],
   sourceMap: Map<string, NormalizedReportSource>,
+  primaryTopicLabel?: string | null,
 ): string {
-  const metrics = claims.filter((claim) => claim.status_type === 'metric').slice(0, 5);
+  const metrics = claims
+    .filter(
+      (claim) =>
+        claim.status_type === 'metric' &&
+        isRelevantToPrimaryTopic(primaryTopicLabel ?? null, claim.entity),
+    )
+    .slice(0, 5);
   if (!metrics.length) {
     return '- Exact quantitative metrics are limited in the current retrieved source set.';
   }
@@ -1130,6 +1693,7 @@ function buildAnalysisSection(claims: NormalizedClaim[]): string {
   const insuranceMetric = claims.some(
     (claim) => claim.status_type === 'metric' && /insurance/i.test(claim.entity),
   );
+  const hasRouteRiskContext = Boolean(conflict || hormuz || redSea);
 
   if (conflict && hormuz) {
     sentences.push(
@@ -1145,10 +1709,14 @@ function buildAnalysisSection(claims: NormalizedClaim[]): string {
     );
   }
 
-  if (!insuranceMetric) {
+  if (hasRouteRiskContext && !insuranceMetric) {
     sentences.push(
       'The current retrieved source set does not quantify insurance spikes or broad freight dislocation, so those effects should be treated as plausible but unquantified rather than confirmed.',
     );
+  }
+
+  if (!sentences.length) {
+    return 'Available evidence for this query is limited. The retrieved source set returned mostly background information and point-in-time metrics rather than current driver analysis. This report reflects what was retrievable, and a more confident causal explanation requires additional current sources.';
   }
 
   return sentences.map(sentence).join(' ');
@@ -1213,24 +1781,209 @@ function buildConclusionSection(claims: NormalizedClaim[]): string {
     );
   }
 
+  if (!sentences.length) {
+    return 'The strongest honest takeaway is that the current retrieved evidence is directionally useful but still too thin for a confident, complete conclusion.';
+  }
+
   return sentences.map(sentence).join(' ');
 }
 
-function buildSourcesSection(sources: NormalizedReportSource[]): string {
+function extractStructuredSummary(research: Obj | null): string | null {
+  const summary = asString(research?.executive_summary);
+  return summary ? sentence(shortenText(summary, 320)) : null;
+}
+
+function extractStructuredKeyEvidence(analysis: Obj | null): string[] {
+  const insights = asArray(analysis?.key_insights)
+    .map((entry) => asObject(entry))
+    .filter((entry): entry is Obj => Boolean(entry))
+    .map((entry) => asString(entry.insight))
+    .filter((value): value is string => Boolean(value))
+    .map((value) => `- ${sentence(shortenText(value, 220))}`)
+    .slice(0, 4);
+
+  return insights;
+}
+
+function extractStructuredDevelopments(research: Obj | null, primaryTopicLabel: string | null): string | null {
+  const developments = asArray(research?.recent_developments)
+    .map((entry) => asObject(entry))
+    .filter((entry): entry is Obj => Boolean(entry))
+    .map((entry) => {
+      const event = asString(entry.event);
+      const date = asString(entry.date_or_period);
+      if (!event) return null;
+      if (!isRelevantToPrimaryTopic(primaryTopicLabel, event)) return null;
+      return `- ${shortenText(event, 200)}${date ? ` (${date})` : ''}`;
+    })
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 3);
+
+  return developments.length ? developments.join('\n') : null;
+}
+
+function extractStructuredRisks(research: Obj | null): string | null {
+  const risks = asArray(research?.risks_or_caveats)
+    .map((entry) => asString(entry))
+    .filter((value): value is string => Boolean(value))
+    .map((value) => `- ${sentence(shortenText(value, 220))}`)
+    .slice(0, 3);
+
+  return risks.length ? risks.join('\n') : null;
+}
+
+function extractStructuredConclusion(analysis: Obj | null): string | null {
+  const conclusion = asString(analysis?.decision_relevant_conclusion);
+  return conclusion ? sentence(shortenText(conclusion, 320)) : null;
+}
+
+function formatSourceUsageForDisplay(
+  usedFor?: string,
+  primaryTopicLabel?: string | null,
+): string | null {
+  if (!usedFor) return null;
+
+  const cleanedSegments = usedFor
+    .split(/\s*;\s*/)
+    .map((segment) =>
+      stripHtmlTags(segment)
+        .replace(/\bhttps?:\/\/\S+/gi, ' ')
+        .replace(/\b(?:url|title|symbol|id):\s*/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim(),
+    )
+    .filter(Boolean)
+    .filter((segment) => isRelevantToPrimaryTopic(primaryTopicLabel ?? null, segment));
+
+  const cleaned = cleanedSegments.join('; ').trim();
+
+  if (!cleaned) return null;
+  if (/\bstatus active\b|\b24h volume\b|\boracle\b/i.test(cleaned)) {
+    return null;
+  }
+
+  const normalized = cleaned.replace(/^(fact|metric|development):\s*/i, '').trim();
+  if (!normalized) return null;
+  if (normalized.length > 80 || normalized.split(/\s+/).length > 12) return null;
+
+  return normalized;
+}
+
+function formatSourceNameForDisplay(name: string): string {
+  const cleaned = stripHtmlTags(name).replace(/\s+/g, ' ').trim();
+  const shortened = cleaned.length > 72 ? `${cleaned.slice(0, 69).trimEnd()}...` : cleaned;
+  return shortened.replace(/([\\[\]])/g, '\\$1');
+}
+
+function buildSourcesSection(
+  sources: NormalizedReportSource[],
+  primaryTopicLabel?: string | null,
+  fallbackAccessDate?: string,
+): string {
   return sources.length
     ? sources
-        .map((source) => `- ${source.name}: ${source.url}${source.usedFor ? ` - ${source.usedFor}` : ''}`)
+        .slice(0, 6)
+        .map((source) => {
+          const usage = formatSourceUsageForDisplay(source.usedFor, primaryTopicLabel);
+          const publishedAt = asDate(source.publishedAt);
+          const accessedAt = asDate(source.accessedAt) ?? fallbackAccessDate;
+          const dateLabel = publishedAt
+            ? `published ${publishedAt}`
+            : accessedAt
+              ? `accessed ${accessedAt}`
+              : null;
+          return `- [${formatSourceNameForDisplay(source.name)}](${source.url})${usage ? ` - ${usage}` : ''}${dateLabel ? ` (${dateLabel})` : ''}`;
+        })
         .join('\n')
-    : '- Source URLs unavailable in the current retrieved set.';
+    : '- Source URLs were not available in the current retrieved set. This indicates a retrieval gap that should be reported.';
+}
+
+function buildFallbackSourcesFromLiveData(
+  liveData: Obj | null,
+  task: string,
+  primaryTopicLabel?: string | null,
+): NormalizedReportSource[] {
+  const grounding = buildLiveDataSourceGrounding(liveData, task, primaryTopicLabel);
+  const deduped = [...grounding.byUrl.values()]
+    .sort((left, right) => sourcePriority(right.url, right.name) - sourcePriority(left.url, left.name))
+    .slice(0, 6);
+
+  return deduped.map((entry, index) => ({
+    id: `fallback_source_${index + 1}`,
+    name: normalizeSourceName(entry.name, entry.url),
+    url: entry.url,
+    usedFor: undefined,
+    canonical: !isGoogleNewsRssUrl(entry.url),
+    publishedAt: entry.publishedAt,
+    accessedAt: entry.accessedAt,
+  }));
+}
+
+function isSourcesHeadingLine(line: string): boolean {
+  if (/^(?:[-*\u2022]\s+)?(?:#{1,6}\s+)?\*\*Sources:?\*\*:?\s*$/i.test(line.trim())) {
+    return true;
+  }
+  return /^(?:[-*•]\s+)?(?:#{1,6}\s+)?(?:\*\*)?Sources(?:\*\*)?\s*:?\s*$/i.test(line.trim());
+}
+
+function isReportSectionHeadingLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (isSourcesHeadingLine(trimmed)) return true;
+  if (/^#{1,6}\s+\S/.test(trimmed)) return true;
+  if (/^(?:[-*\u2022]\s+)?\*\*[^*]+\*\*:?\s*$/.test(trimmed)) return true;
+  if (/^\*\*[^*]+\*\*:?\s*$/.test(trimmed)) return true;
+  return /^(?:[-*•]\s+)?(?:Summary|Overview|Executive Summary|Current Situation|Current State|Market Context|Ecosystem Overview|Key Evidence|What Changed|Evidence and Data|Data and Statistics|Why It Matters|Implications(?: for You)?|Catalysts and Constraints|Constraints|Risks(?: and (?:Tradeoffs|Unknowns|Watchpoints))?|Coverage Limits|What We Still Do Not Know|Portfolio Context|Action Options|Sources|Takeaway)\s*:?\s*$/i.test(
+    trimmed,
+  );
+}
+
+function replaceSourcesSection(markdown: string, renderedSources: string): string {
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const hasSourcesHeading = lines.some((line) => isSourcesHeadingLine(line));
+
+  if (!hasSourcesHeading) {
+    return `${markdown.trim()}\n\n## Sources\n\n${renderedSources}`.trim();
+  }
+
+  const rebuilt: string[] = [];
+  let insertedSources = false;
+
+  for (let index = 0; index < lines.length;) {
+    if (!isSourcesHeadingLine(lines[index])) {
+      rebuilt.push(lines[index]);
+      index += 1;
+      continue;
+    }
+
+    if (!insertedSources) {
+      rebuilt.push('## Sources', '', ...renderedSources.split('\n'));
+      insertedSources = true;
+    }
+
+    index += 1;
+    while (index < lines.length && !isReportSectionHeadingLine(lines[index])) {
+      index += 1;
+    }
+  }
+
+  return rebuilt.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function sanitizeWriterMarkdown(markdown: string): string {
-  const normalized = markdown.replace(/\r\n/g, '\n').trim();
+  const normalized = repairMojibake(markdown).replace(/\r\n/g, '\n').trim();
   if (!normalized || /writer agent returned no markdown output/i.test(normalized)) {
     return '';
   }
 
   const withoutBlockedQuotes = normalized
+    .replace(/<a\s+[^>]*href="([^"]+)"[^>]*>/gi, '$1')
+    .replace(/<\/a>/gi, '')
+    .replace(/<((?:https?:\/\/)[^>\s]+)>/gi, '$1')
+    .replace(/\[source URL:\s*<?((?:https?:\/\/)[^\]\s>]+)>?\]/gi, 'source URL: $1')
+    .replace(/\(\s*article available at:\s*<?((?:https?:\/\/)[^)>\s]+)>?\s*\)/gi, '(article available at: $1)')
+    .replace(/\(\s*announcement available at:\s*<?((?:https?:\/\/)[^)>\s]+)>?\s*\)/gi, '(announcement available at: $1)')
+    .replace(/\(\s*source URL:\s*<?((?:https?:\/\/)[^)>\s]+)>?\s*\)/gi, '(source URL: $1)')
     .split('\n')
     .filter((line) => !line.trim().startsWith('>'))
     .join('\n')
@@ -1242,6 +1995,59 @@ function sanitizeWriterMarkdown(markdown: string): string {
   }
 
   return withoutBlockedQuotes.trim();
+}
+
+function isLinkOnlySourceBullet(line: string): boolean {
+  const trimmed = line.trim();
+  if (!/^(?:[-*•]|\d+\.)\s+/.test(trimmed)) return false;
+  const body = trimmed.replace(/^(?:[-*•]|\d+\.)\s+/, '').trim();
+  return (
+    /^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/.test(body) ||
+    /^(?:https?:\/\/\S+)$/.test(body) ||
+    /^(?:[A-Za-z][A-Za-z0-9 .&:+-]{1,80}):\s*(?:https?:\/\/\S+)$/.test(body)
+  );
+}
+
+function isLooseSourceLinkBullet(line: string): boolean {
+  if (isLinkOnlySourceBullet(line)) return true;
+  const trimmed = line.trim();
+  if (!/^(?:[-*\u2022]|\d+\.)\s+/.test(trimmed)) return false;
+  const body = trimmed.replace(/^(?:[-*\u2022]|\d+\.)\s+/, '').trim();
+  return (
+    /^\[(https?:\/\/[^\]]+)\]$/.test(body) ||
+    /^(?:[A-Za-z][A-Za-z0-9 .&:+-]{1,80}):\s*\[(?:https?:\/\/[^\]]+)\]$/.test(body) ||
+    /^(?:[A-Za-z][A-Za-z0-9 .&:+-]{1,80}):\s*\[[^\]]+\]\((https?:\/\/[^)]+)\)$/.test(body)
+  );
+}
+
+function removeRedundantPreSourcesLinkList(markdown: string): string {
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const sourceHeadingIndex = lines.findIndex((line) => isSourcesHeadingLine(line));
+  if (sourceHeadingIndex <= 0) {
+    return markdown.trim();
+  }
+
+  let blockEnd = sourceHeadingIndex - 1;
+  while (blockEnd >= 0 && !lines[blockEnd].trim()) {
+    blockEnd -= 1;
+  }
+  if (blockEnd < 0) {
+    return markdown.trim();
+  }
+
+  let blockStart = blockEnd;
+  while (blockStart >= 0 && isLooseSourceLinkBullet(lines[blockStart])) {
+    blockStart -= 1;
+  }
+  blockStart += 1;
+
+  const blockLines = lines.slice(blockStart, blockEnd + 1).filter((line) => line.trim());
+  if (blockLines.length < 2 || blockLines.some((line) => !isLooseSourceLinkBullet(line))) {
+    return markdown.trim();
+  }
+
+  const rebuilt = [...lines.slice(0, blockStart), ...lines.slice(blockEnd + 1)];
+  return rebuilt.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 export function buildCurrentEventReportMarkdown(state: FinalClaimState): string {
@@ -1276,7 +2082,7 @@ export function buildCurrentEventReportMarkdown(state: FinalClaimState): string 
     '',
     '## Sources',
     '',
-    buildSourcesSection(state.sources),
+    buildSourcesSection(state.sources, undefined, todayDateString()),
     '',
     '## Takeaway',
     '',
@@ -1284,35 +2090,48 @@ export function buildCurrentEventReportMarkdown(state: FinalClaimState): string 
   ].join('\n').trim();
 }
 
-export function buildGeneralReportMarkdown(state: FinalClaimState): string {
+export function buildGeneralReportMarkdown(
+  state: FinalClaimState,
+  research: Obj | null,
+  analysis: Obj | null,
+): string {
   const sourceMap = new Map(state.sources.map((source) => [source.id, source]));
+  const primaryTopicLabel = inferPrimaryTopicLabel(state.topic, research);
   const keyFacts = state.claims
     .filter(
       (claim) =>
-        claim.section === 'reported_developments' || claim.section === 'data_and_statistics',
+        isRelevantToPrimaryTopic(primaryTopicLabel, claim.summary) &&
+        (claim.section === 'reported_developments' || claim.section === 'data_and_statistics'),
     )
     .slice(0, 5);
+  const structuredSummary = extractStructuredSummary(research);
+  const structuredKeyEvidence = extractStructuredKeyEvidence(analysis);
+  const structuredDevelopments = extractStructuredDevelopments(research, primaryTopicLabel);
+  const structuredRisks = extractStructuredRisks(research);
+  const structuredConclusion = extractStructuredConclusion(analysis);
 
   return [
     `# ${state.topic}`,
     '',
     '## Overview',
     '',
-    buildExecutiveSummary(state.claims, sourceMap),
+    structuredSummary || buildExecutiveSummary(state.claims, sourceMap),
     '',
     '## Key Evidence',
     '',
-    keyFacts.length
+    structuredKeyEvidence.length
+      ? structuredKeyEvidence.join('\n')
+      : keyFacts.length
       ? keyFacts.map((claim) => `- ${claim.summary}`).join('\n')
-      : '- The current retrieved source set is limited.',
+      : '- Available evidence for this query is limited. The retrieved source set returned mostly background information and point-in-time metrics rather than current driver analysis.',
     '',
     '## What Changed',
     '',
-    buildReportedDevelopmentsSection(state.claims, sourceMap),
+    structuredDevelopments || buildReportedDevelopmentsSection(state.claims, sourceMap),
     '',
     '## Evidence and Data',
     '',
-    buildMetricsSection(state.claims, sourceMap),
+    buildMetricsSection(state.claims, sourceMap, primaryTopicLabel),
     '',
     '## Why It Matters',
     '',
@@ -1320,15 +2139,15 @@ export function buildGeneralReportMarkdown(state: FinalClaimState): string {
     '',
     '## Risks and Tradeoffs',
     '',
-    buildRisksSection(state.claims),
+    structuredRisks || buildRisksSection(state.claims),
     '',
     '## Sources',
     '',
-    buildSourcesSection(state.sources),
+    buildSourcesSection(state.sources, primaryTopicLabel, todayDateString()),
     '',
     '## Takeaway',
     '',
-    buildConclusionSection(state.claims),
+    structuredConclusion || buildConclusionSection(state.claims),
   ].join('\n').trim();
 }
 
@@ -1460,7 +2279,7 @@ export function finalizeReportMarkdown(params: FinalizeParams): {
   const state = buildFinalState(params);
   const fallbackMarkdown = currentEvents(params.liveData)
     ? buildCurrentEventReportMarkdown(state)
-    : buildGeneralReportMarkdown(state);
+    : buildGeneralReportMarkdown(state, params.research, params.analysis);
   const writerMarkdown = sanitizeWriterMarkdown(params.writerMarkdown);
   const writerValidationIssues = writerMarkdown
     ? validateReportMarkdown(writerMarkdown, params.liveData)
@@ -1468,19 +2287,40 @@ export function finalizeReportMarkdown(params: FinalizeParams): {
   const shouldUseFallback =
     !writerMarkdown || writerValidationIssues.some(isBlockingValidationIssue);
   const markdown = shouldUseFallback ? fallbackMarkdown : writerMarkdown;
+  const repairedMarkdown = hasMojibakeMarkers(markdown) ? repairMojibake(markdown) : markdown;
+  const primaryTopicLabel = inferPrimaryTopicLabel(state.topic, params.research);
+  const effectiveSources =
+    state.sources.length > 0
+      ? state.sources
+      : buildFallbackSourcesFromLiveData(params.liveData, params.task, primaryTopicLabel);
+  const renderedSources = buildSourcesSection(
+    effectiveSources,
+    primaryTopicLabel,
+    todayDateString(),
+  );
+  const markdownWithDeterministicSources = replaceSourcesSection(repairedMarkdown, renderedSources);
+  const cleanedMarkdown = removeRedundantPreSourcesLinkList(markdownWithDeterministicSources);
+  if (repairedMarkdown !== markdown) {
+    console.warn('[reportPipeline] repaired mojibake in final markdown');
+  }
   const validationIssues = shouldUseFallback
-    ? [...new Set([...state.issues, ...validateReportMarkdown(markdown, params.liveData)])]
+    ? [
+        ...new Set([
+          ...state.issues,
+          ...validateReportMarkdown(cleanedMarkdown, params.liveData),
+        ]),
+      ]
     : [
         ...new Set([
           ...state.issues,
           ...writerValidationIssues,
-          ...validateReportMarkdown(markdown, params.liveData),
+          ...validateReportMarkdown(cleanedMarkdown, params.liveData),
         ]),
       ];
 
   return {
-    markdown,
-    sources: state.sources,
+    markdown: cleanedMarkdown,
+    sources: effectiveSources,
     validationIssues,
     claims: state.claims,
   };

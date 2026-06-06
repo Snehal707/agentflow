@@ -2,6 +2,7 @@ import { createPublicClient, defineChain, getAddress, http, parseUnits } from 'v
 import { adminDb } from '../../../db/client';
 import { ARC } from '../../../lib/arc-config';
 import { executeTransaction, getOrCreateUserAgentWallet, waitForTransaction } from '../../../lib/dcw';
+import { executeGuardCheck } from '../../../lib/execution-guard';
 
 const ARC_USDC = '0x3600000000000000000000000000000000000000' as const;
 
@@ -33,15 +34,33 @@ export async function executeInvoicePayment(input: ExecutePaymentInput): Promise
   const amountRaw = parseUnits(input.amountUsdc.toFixed(6), 6);
 
   const userAgent = await getOrCreateUserAgentWallet(payer);
-
-  const tx = await executeTransaction({
-    walletId: userAgent.wallet_id,
-    contractAddress: ARC_USDC,
-    abiFunctionSignature: 'transfer(address,uint256)',
-    abiParameters: [payee, amountRaw.toString()],
-    feeLevel: 'HIGH',
-    usdcAmount: input.amountUsdc,
+  const guard = await executeGuardCheck({
+    walletAddress: payer,
+    amount: input.amountUsdc,
+    recipients: [payee],
+    idempotencyKey: `invoice:${input.invoiceId}`,
+    route: 'agent:invoice:execute',
+    requireConfirmation: true,
+    logReason: 'invoice_blocked',
+    logContext: { invoiceId: input.invoiceId },
   });
+  if (!guard.allowed) {
+    throw new Error(guard.message);
+  }
+
+  let tx: unknown;
+  try {
+    tx = await executeTransaction({
+      walletId: userAgent.wallet_id,
+      contractAddress: ARC_USDC,
+      abiFunctionSignature: 'transfer(address,uint256)',
+      abiParameters: [payee, amountRaw.toString()],
+      feeLevel: 'HIGH',
+      usdcAmount: input.amountUsdc,
+    });
+  } finally {
+    await guard.release();
+  }
 
   const txId = extractTxId(tx);
   if (!txId) {

@@ -27,14 +27,12 @@ export type HandleProfile = {
 };
 
 export const navItems: NavItem[] = [
-  { href: "/chat", label: "Chat", icon: "space_dashboard" },
+  { href: "/chat", label: "Chat", icon: "forum" },
   { href: "/pay", label: "AgentPay", icon: "payments" },
   { href: "/funds", label: "Funding", icon: "account_balance" },
   { href: "/portfolio", label: "Portfolio", icon: "bar_chart" },
-  { href: "/vault", label: "Vault", icon: "savings" },
   { href: "/agents", label: "Agents", icon: "smart_toy" },
-  { href: "/economy", label: "Benchmark", icon: "monitoring" },
-  { href: "/settings", label: "Telegram", icon: "send" },
+  { href: "/telegram", label: "Telegram", icon: "send" },
 ];
 
 export const suggestedPrompts: Record<ChatCategory, string[]> = {
@@ -44,7 +42,6 @@ export const suggestedPrompts: Record<ChatCategory, string[]> = {
     "Analyze this image and turn it into a short research brief.",
     "Transcribe this voice note and return only the transcript text.",
     "Write a concise analyst-style report from current Arc market context.",
-    "Render 'AgentFlow' as ASCII art.",
   ],
   Swap: [
     "Quote swapping 25 USDC to EURC before execution.",
@@ -61,8 +58,11 @@ export const suggestedPrompts: Record<ChatCategory, string[]> = {
   Bridge: [
     "Bridge 1 USDC from Ethereum Sepolia to Arc.",
     "Bridge 1 USDC from Base Sepolia to Arc.",
+    "Bridge 1 USDC from Arbitrum Sepolia to Arc.",
+    "Bridge 1 USDC from Avalanche Fuji to Arc.",
+    "Bridge 1 USDC from Polygon Amoy to Arc.",
     "Show the supported bridge source chains for Arc.",
-    "Check how much sponsored bridge allowance I have left today.",
+    "Explain how the web bridge flow works from my EOA into my AgentFlow wallet.",
   ],
   Portfolio: [
     "Show my Agent wallet holdings, vault shares, and Gateway reserve.",
@@ -72,7 +72,7 @@ export const suggestedPrompts: Record<ChatCategory, string[]> = {
   ],
   AgentPay: [
     "Send 25 USDC to one recipient and show me the preview.",
-    "Create a 50 USDC invoice for Benchmark Vendor.",
+    "Create a 50 USDC invoice for Acme Automation.",
     "Split 50 USDC between three wallets and wait for confirmation.",
     "Create a weekly schedule to pay a vendor 10 USDC on Arc.",
     "Prepare a batch payout for three recipients before execution.",

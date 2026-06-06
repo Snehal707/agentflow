@@ -1,7 +1,0 @@
-﻿# agentflow-api — public API (uses Railway $PORT)
-[build]
-builder = "nixpacks"
-
-[deploy]
-startCommand = "npm run start:api"
-restartPolicyType = "ON_FAILURE"

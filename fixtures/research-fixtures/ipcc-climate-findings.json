@@ -1,0 +1,141 @@
+{
+  "name": "ipcc-climate-findings",
+  "captured_at": "2026-05-23T17:11:53.260Z",
+  "task": "IPCC climate report findings",
+  "brief": {
+    "query": "IPCC climate report findings",
+    "intent": "comprehend",
+    "scope": "broad",
+    "time_sensitivity": "recent",
+    "required_freshness_days": 180,
+    "geography": [],
+    "domains_priority": [
+      "climate_science",
+      "regulatory_agencies",
+      "reputable_news",
+      "academic_research"
+    ],
+    "domains_avoid": [
+      "rss",
+      "news.google.com",
+      "conspiracy_theories",
+      "pseudoscience",
+      "political_opinion_pieces"
+    ],
+    "preferred_source_types": [
+      "official_reports",
+      "primary_research",
+      "reputable_news",
+      "academic_articles"
+    ],
+    "must_answer": [
+      "What are the key findings and projections from the latest IPCC reports?",
+      "How do these findings compare to previous reports and what new data informs these conclusions?",
+      "What are the major conclusions regarding climate change impacts, causes, and mitigation strategies?",
+      "What do the reports emphasize regarding vulnerable regions, ecosystems, and socioeconomic systems?",
+      "What do these findings imply for global climate policy moving forward?"
+    ],
+    "avoid_drift": [
+      "speculation",
+      "unrelated political issues",
+      "industry lobbying statements"
+    ],
+    "minimum_source_diversity": 3,
+    "sub_questions": [
+      "How do the current reports summarize the warming of the atmosphere, ocean, and land over the past decades?",
+      "What evidence supports the human influence on the climate system?",
+      "How does climate change affect weather extremes, sea level rise, and ocean acidification?",
+      "What are the projected climate impacts under different emission scenarios?",
+      "How do the reports assess the progress and challenges in climate mitigation and adaptation efforts globally?"
+    ],
+    "evaluation_rubric": "High-quality sources include recent IPCC reports and peer-reviewed articles on climate change, focusing on scientific consensus and recommendations. Avoid sources promoting climate denial or downplaying scientific consensus."
+  },
+  "queries": [
+    "IPCC climate findings",
+    "IPCC climate findings overview 2026",
+    "IPCC climate findings latest developments 2026",
+    "IPCC climate findings statistics data report",
+    "IPCC climate findings risks challenges analysis",
+    "IPCC climate findings official data report",
+    "IPCC climate findings Reuters 2026",
+    "IPCC climate findings BBC 2026",
+    "IPCC climate findings Wikipedia background",
+    "IPCC climate findings academic research overview",
+    "IPCC climate findings What are the key findings and projections from the latest IPCC reports",
+    "What are the key findings and projections from the latest IPCC reports 2026",
+    "IPCC climate findings How do these findings compare to previous reports and what new data informs these conclusions",
+    "How do these findings compare to previous reports and what new data informs these conclusions 2026",
+    "IPCC climate findings What are the major conclusions regarding climate change impacts causes and mitigation strategies",
+    "What are the major conclusions regarding climate change impacts causes and mitigation strategies 2026",
+    "IPCC climate findings What do the reports emphasize regarding vulnerable regions ecosystems and socioeconomic systems",
+    "What do the reports emphasize regarding vulnerable regions ecosystems and socioeconomic systems 2026",
+    "IPCC climate findings What do these findings imply for global climate policy moving forward",
+    "What do these findings imply for global climate policy moving forward 2026",
+    "How do the current reports the warming of the atmosphere ocean and land over the past decades",
+    "latest How do the current reports the warming of the atmosphere ocean and land over the past decades 2026",
+    "official How do the current reports the warming of the atmosphere ocean and land over the past decades report site:.gov OR site:.org",
+    "How do the current reports the warming of the atmosphere ocean and land over the past decades statistics data numbers",
+    "criticism concerns How do the current reports the warming of the atmosphere ocean and land over the past decades",
+    "What evidence supports the human influence on the climate system",
+    "latest What evidence supports the human influence on the climate system 2026",
+    "official What evidence supports the human influence on the climate system report site:.gov OR site:.org",
+    "What evidence supports the human influence on the climate system statistics data numbers",
+    "criticism concerns What evidence supports the human influence on the climate system",
+    "How does climate change affect weather extremes sea level rise and ocean acidification",
+    "latest How does climate change affect weather extremes sea level rise and ocean acidification 2026",
+    "official How does climate change affect weather extremes sea level rise and ocean acidification report site:.gov OR site:.org",
+    "How does climate change affect weather extremes sea level rise and ocean acidification statistics data numbers",
+    "criticism concerns How does climate change affect weather extremes sea level rise and ocean acidification",
+    "What are the projected climate impacts under different emission scenarios",
+    "latest What are the projected climate impacts under different emission scenarios 2026",
+    "official What are the projected climate impacts under different emission scenarios report site:.gov OR site:.org",
+    "What are the projected climate impacts under different emission scenarios statistics data numbers",
+    "criticism concerns What are the projected climate impacts under different emission scenarios",
+    "How do the reports assess the progress and challenges in climate mitigation and adaptation efforts globally",
+    "latest How do the reports assess the progress and challenges in climate mitigation and adaptation efforts globally 2026",
+    "official How do the reports assess the progress and challenges in climate mitigation and adaptation efforts globally report site:.gov OR site:.org",
+    "How do the reports assess the progress and challenges in climate mitigation and adaptation efforts globally statistics data numbers",
+    "criticism concerns How do the reports assess the progress and challenges in climate mitigation and adaptation efforts globally",
+    "How do the current reports summarize the warming of the atmosphere, ocean, and land over the past decades? site:www.ipcc.ch",
+    "What evidence supports the human influence on the climate system? site:www.ipcc.ch",
+    "How do the current reports summarize the warming of the atmosphere, ocean, and land over the past decades? site:www.noaa.gov",
+    "What evidence supports the human influence on the climate system? site:www.noaa.gov",
+    "How do the current reports summarize the warming of the atmosphere, ocean, and land over the past decades? site:earthdata.nasa.gov",
+    "What evidence supports the human influence on the climate system? site:earthdata.nasa.gov"
+  ],
+  "sources": [
+    {
+      "url": "https://www.ipcc.ch/2026/05/18/pr-wgii-ar7-lamii-nassau/",
+      "title": "IPCC",
+      "date": "2026-05-18T13:40:12.000Z",
+      "snippet": "Title: Drafting of the next IPCC assessment of climate impacts, adaptation and vulnerabilities gets underway as authors gather in Nassau\nURL: https://www.ipcc.ch/2026/05/18/pr-wgii-ar7-lamii-nassau/\nDate: 2026-05-18T13:40:12.000Z\nOver 200 authors from the IPCC’s Working Group II gather in the Bahamas to work on the draft of the next scientific report assessing climate impacts, adaptation and vulnerabilities. NASSAU, May 18 —The authors of the Intergovernmental Panel on Climate Change (IPCC) working on the next Working Group II report which assesses the latest science related to climate impacts, adaptation pathways and vulnerabilities are meeting in Nassau, Bahamas this week to develop the report’s first draft. This is the second time authors are meeting to advance work on the report, also known as the Second Lead Author Meeting. Taking place from 18 to 22 May 2026, this meeting brings together more than 200 authors o\n\n---\n\nTitle: IPCC invites government representatives and experts to review the second draft of the Special Report on Climate Change and Cities\nURL: https://www.ipcc.ch/2026/05/08/ipcc-srcities-second-order-draft-review/\nDate: 2026-05-08T13:05:41.000Z\nGENEVA, May 8 – The Intergovernmental Panel on Climate Change (IPCC) has opened registration for governments and experts to serve as Expert Reviewers on the Second-Order Draft (SOD) of the Special Report on Climate Change and Cities. Following the Third Lead Author Meeting this January, authors of this Special Report have processed comments from expert reviewers of the First-Order Draft and prepared a second draft, which will open this week for governments and experts worldwide to review and provide comments. “Our authors have worked hard to process the tens of thousands of comments received in our First-Order Draft to present a Second-Order Draft that accounts for the suggestions, perspecti\n\n---\n\nTitle: Science Officer in the IPCC Working Group II Technical Support Unit (College of the Integrative Studies,",
+      "domain": "www.ipcc.ch",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.noaa.gov",
+      "title": "NOAA",
+      "date": "",
+      "snippet": "URL: https://www.noaa.gov\n{\"description\":{\"title\":\"Global Land and Ocean Average Temperature Departures\",\"units\":\"Degrees Celsius\",\"base period\":\"1901-2000\"},\"data\":{\"1880\":{\"departure\":-0.18},\"1881\":{\"departure\":-0.09},\"1882\":{\"departure\":-0.17},\"1883\":{\"departure\":-0.17},\"1884\":{\"departure\":-0.27},\"1885\":{\"departure\":-0.23},\"1886\":{\"departure\":-0.27},\"1887\":{\"departure\":-0.35},\"1888\":{\"departure\":-0.12},\"1889\":{\"departure\":-0.06},\"1890\":{\"departure\":-0.31},\"1891\":{\"departure\":-0.23},\"1892\":{\"departure\":-0.32},\"1893\":{\"departure\":-0.33},\"1894\":{\"departure\":-0.34},\"1895\":{\"departure\":-0.23},\"1896\":{\"departure\":-0.13},\"1897\":{\"departure\":-0.12},\"1898\":{\"departure\":-0.26},\"1899\":{\"departure\":-0.17},\"1900\":{\"departure\":",
+      "domain": "www.noaa.gov",
+      "reliability": "high"
+    },
+    {
+      "url": "https://earthdata.nasa.gov",
+      "title": "NASA Earthdata",
+      "date": "",
+      "snippet": "Title: COAPEC (Coupled Ocean-Atmosphere Processes and European Climate) data from the Hadley Centre, Met Office\nURL: https://earthdata.nasa.gov\nCOAPEC is a NERC thematic programme designed to examine the variability of the Earth's climate. The goal of COAPEC is to determine the impact on climate, especially European climate, of the coupling between the Atlantic Ocean and the atmosphere. This is currently a 100 year dataset derived from the HadCM3 model, and the years covered by the dataset are 2079 - 2178. [Summary Extracted from the BADC Home Page]\n\n---\n\nTitle: Climate Model Products from Germany's Deutches Klimarechenzentrum\nURL: https://earthdata.nasa.gov\nThis dataset contains climate model output from Deutches Klimarechenzentrum (DKRZ) in Germany. The model output consists of monthly mean grids for several variables from three runs of the ECHAM4 model. The three runs are a control (constant atmospheric forcing) run, a greenhouse gas run which assumes a compounded 1%/year increase in CO2, and an aerosol run which combines CO2 and sulphate aerosol concentrations. The model is run at T42 resolution, resulting in a 128x64 latitude/longitude gaussian output grid (approximately 2.8-degree by 2.8-degree resolution). The grids are in GRIB format (Edition 1). DSS has computed decadal means for each decade-month from the monthly mean grids. The decade\n\n---\n\nTitle: Climate Model Products from the First-generation Global Coupled Model at the Canadian Centre for Climate Modelling and Analysis\nURL: https://earthdata.nasa.gov\nThe Canadian Centre for Climate Modelling and Analysis (CCCMA) has developed several climate simulation models for use in projecting natural climate change and assessing the impact of human activities on climate change. CCCMA's first-generation global coupled model (CGCM1) was run with three scenarios: one with constant atmospheric forcing (control run), one with carbon dioxide (CO2) increasing at a compounded one percent per year rate, and one with a com",
+      "domain": "earthdata.nasa.gov",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.climatewatchdata.org",
+      "title": "Climate Watch",
+      "date": "",
+      "snippet": "URL: https://www.climatewatchdata.org\n{\"id\":1295817,\"iso code3\":\"USA\",\"country\":\"United States\",\"data source\":\"Climate Watch\",\"sector\":\"Agriculture\",\"gas\":\"All GHG\",\"unit\":\"MtCO₂e\",\"emissions\":[{\"year\":1990,\"value\":362.3},{\"year\":1991,\"value\":359.15},{\"year\":1992,\"value\":366.39},{\"year\":1993,\"value\":367.48},{\"year\":1994,\"value\":377.38},{\"year\":1995,\"value\":375.95},{\"year\":1996,\"value\":379.73},{\"year\":1997,\"value\":378.3},{\"year\":1998,\"value\":376.57},{\"year\":1999,\"value\":374.17},{\"year\":2000,\"value\":368.32},{\"year\":2001,\"value\":366.24},{\"year\":2002,\"value\":365.67},{\"year\":2003,\"value\":371.34},{\"year\":2004,\"value\":370.92},{\"year\":2005,\"value\":370.18},{\"year\":2006,\"value\":375.63},{\"year\":2007,\"value\":375.96},{\"year\":2008,\"value\":372\n\n---\n\nURL: https://www.climatewatchdata.org\n{\"id\":1295818,\"iso code3\":\"USA\",\"country\":\"United States\",\"data source\":\"Climate Watch\",\"sector\":\"Agriculture\",\"gas\":\"CH4\",\"unit\":\"MtCO₂e\",\"emissions\":[{\"year\":1990,\"value\":220.59},{\"year\":1991,\"value\":221.32},{\"year\":1992,\"value\":224.35},{\"year\":1993,\"value\":224.78},{\"year\":1994,\"value\":229.99},{\"year\":1995,\"value\":230.82},{\"year\":1996,\"value\":230.14},{\"year\":1997,\"value\":229.21},{\"year\":1998,\"value\":227.14},{\"year\":1999,\"value\":226.11},{\"year\":2000,\"value\":223.06},{\"year\":2001,\"value\":222.2},{\"year\":2002,\"value\":221.6},{\"year\":2003,\"value\":220.55},{\"year\":2004,\"value\":221.14},{\"year\":2005,\"value\":222.4},{\"year\":2006,\"value\":222.73},{\"year\":2007,\"value\":223.49},{\"year\":2008,\"value\":225.24},\n\n---\n\nURL: https://www.climatewatchdata.org\n{\"id\":1295819,\"iso code3\":\"USA\",\"country\":\"United States\",\"data source\":\"Climate Watch\",\"sector\":\"Agriculture\",\"gas\":\"N2O\",\"unit\":\"MtCO₂e\",\"emissions\":[{\"year\":1990,\"value\":141.7},{\"year\":1991,\"value\":137.82},{\"year\":1992,\"value\":142.04},{\"year\":1993,\"value\":142.7},{\"year\":1994,\"value\":147.39},{\"year\":1995,\"value\":145.13},{\"year\":1996,\"value\":149.59},{\"year\":1997,\"value\":149.09},{\"year\":1998,\"value\":149.43},{\"year\":1999,\"value\":148.06},{\"year\":2000,\"value\":145.26},{\"y",
+      "domain": "www.climatewatchdata.org",
+      "reliability": "high"
+    }
+  ],
+  "captured_runtime_version": "0.1.0"
+}

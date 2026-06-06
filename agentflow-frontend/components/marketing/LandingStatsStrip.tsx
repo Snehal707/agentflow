@@ -34,12 +34,12 @@ export function LandingStatsStrip() {
     <div className="grid gap-4 border-y border-[#4d4635]/20 py-6 sm:grid-cols-3 sm:gap-8">
       <div>
         <div className="font-label text-[10px] uppercase tracking-[0.2em] text-[#d0c5af]/48">
-          Onchain proof
+          Onchain transactions
         </div>
         <div className="mt-2 font-headline text-3xl font-bold text-[#f2ca50] md:text-4xl">
           {stats.onchain.toLocaleString("en-US")}+
         </div>
-        <div className="mt-1 text-xs text-[#d0c5af]/60">Completed Arc records</div>
+        <div className="mt-1 text-xs text-[#d0c5af]/60">Recorded on Arc</div>
       </div>
       <div>
         <div className="font-label text-[10px] uppercase tracking-[0.2em] text-[#d0c5af]/48">
@@ -48,7 +48,7 @@ export function LandingStatsStrip() {
         <div className="mt-2 font-headline text-3xl font-bold text-[#f2ca50] md:text-4xl">
           Arc + USDC
         </div>
-        <div className="mt-1 text-xs text-[#d0c5af]/60">USDC-native agent work</div>
+        <div className="mt-1 text-xs text-[#d0c5af]/60">Stable-fee execution</div>
       </div>
       <div>
         <div className="font-label text-[10px] uppercase tracking-[0.2em] text-[#d0c5af]/48">
@@ -57,7 +57,7 @@ export function LandingStatsStrip() {
         <div className="mt-2 font-headline text-3xl font-bold text-[#f2ca50] md:text-4xl">
           {stats.total > 0 ? stats.total.toLocaleString("en-US") : "Live"}
         </div>
-        <div className="mt-1 text-xs text-[#d0c5af]/60">Per-task buyer and seller traces</div>
+        <div className="mt-1 text-xs text-[#d0c5af]/60">Buyer and seller traces</div>
       </div>
     </div>
   );

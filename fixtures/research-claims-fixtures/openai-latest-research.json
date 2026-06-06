@@ -1,0 +1,279 @@
+{
+  "name": "openai-latest-research",
+  "source_fixture": "openai-latest-research",
+  "captured_at": "2026-05-23T19:42:38.460Z",
+  "captured_runtime_version": "0.1.0",
+  "capture_notes": "initial_capture",
+  "capture_config": {
+    "claim_batch_concurrency": 1,
+    "claim_batch_timeout_ms": 45000
+  },
+  "claims_count": 16,
+  "extraction_latency_ms": 33589,
+  "claims": [
+    {
+      "claim": "An OpenAI model has disproved a central conjecture in discrete geometry.",
+      "date": "2026-05-20",
+      "source_url": "https://openai.com/index/model-disproves-discrete-geometry-conjecture",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "An OpenAI model solved the 80-year-old unit distance problem, disproving a major conjecture in discrete geometry and marking a milestone in AI-driven mathematics.",
+      "entities": [
+        "OpenAI",
+        "unit distance problem",
+        "discrete geometry"
+      ],
+      "numbers": [
+        "80-year-old",
+        "1"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "OpenAI aims to build the best-equipped nonprofit the world has ever seen.",
+      "date": "2025-04-02",
+      "source_url": "https://openai.com/index/nonprofit-commission-guidance",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "Already a nonprofit, and already using AI to help people solve hard problems, OpenAI aims to build the best-equipped nonprofit the world has ever seen—combining potentially historic financial resources with something even more powerful: technology that can scale human ingenuity itself.",
+      "entities": [
+        "OpenAI",
+        "nonprofit"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "OpenAI has released new realtime voice models in the API that can reason, translate, and transcribe speech.",
+      "date": "2026-05-07",
+      "source_url": "https://openai.com/index/advancing-voice-intelligence-with-new-models-in-the-api",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "Explore new realtime voice models in the OpenAI API that can reason, translate, and transcribe speech, enabling more natural and intelligent voice experiences.",
+      "entities": [
+        "OpenAI",
+        "API",
+        "voice models"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Elon Musk's xAI has gone all in on natural gas, while SpaceX is obsessed with orbital data centers.",
+      "date": "2026-05-23",
+      "source_url": "https://techcrunch.com/2026/05/23/elon-musk-has-given-up-on-solar-power-on-earth/",
+      "source_type": "news",
+      "confidence": 0.7,
+      "supporting_snippet": "Elon Muks's xAI has gone all in on natural gas, while SpaceX is obsessed with orbital data centers. What happened to the \"solar-electric economy\" he promised?",
+      "entities": [
+        "Elon Musk",
+        "xEI",
+        "SpaceX",
+        "natural gas",
+        "orbital data centers",
+        "solar-electric economy"
+      ],
+      "numbers": [],
+      "stance": "disputes"
+    },
+    {
+      "claim": "Blue Origin's New Glenn mega-rocket was cleared to fly after an April mishap.",
+      "date": "2026-05-22",
+      "source_url": "https://techcrunch.com/2026/05/22/blue-origin-cleared-to-fly-new-glenn-mega-rocket-after-april-mishap/",
+      "source_type": "news",
+      "confidence": 0.8,
+      "supporting_snippet": "Blue Origin confirmed an engine failure led to the loss of an AST SpaceMobile satellite last month, but offered little detail.",
+      "entities": [
+        "Blue Origin",
+        "New Glenn",
+        "mega-rocket",
+        "engine failure",
+        "AST SpaceMobile satellite"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Microsoft has introduced GridSFM, a small foundation model that can predict AC optimal power flow in milliseconds.",
+      "date": "2026-05-13",
+      "source_url": "https://www.microsoft.com/en-us/research/blog/gridsfm-a-new-small-foundation-model-for-the-electric-grid/",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "Introducing GridSFM, a small foundation model that can predict AC optimal power flow in milliseconds, boosting efficiency and unlocking cost savings.",
+      "entities": [
+        "Microsoft",
+        "GridSFM",
+        "foundation model",
+        "AC optimal power flow"
+      ],
+      "numbers": [
+        "1"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Microsoft's MatterSim is expanding AI capabilities for materials science, including faster large-scale simulations and a new multi-task model.",
+      "date": "2026-05-12",
+      "source_url": "https://www.microsoft.com/en-us/research/blog/advancing-ai-for-materials-with-mattersim-experimental-synthesis-faster-simulation-and-multi-task-models/",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "MatterSim is expanding what AI can do for materials science—from faster large-scale simulations to MatterSim-MT, a new multi-task model for simulating properties beyond potential energy surfaces alone.",
+      "entities": [
+        "Microsoft",
+        "MatterSim",
+        "AI",
+        "materials science",
+        "large-scale simulations",
+        "MatterSim-MT",
+        "multi-task model"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Microsoft introduced MagenticLite, an agentic system for small models that works across the browser and local file system.",
+      "date": "2026-05-21",
+      "source_url": "https://www.microsoft.com/en-us/research/blog/magenticlite-magenticbrain-fara1-5-an-agentic-experience-optimized-for-small-models/",
+      "source_type": "official",
+      "confidence": 1,
+      "supporting_snippet": "MagenticLite is an agentic system for small models that works across the browser and local file system in a single workflow.",
+      "entities": [
+        "Microsoft",
+        "MagenticLite",
+        "agentic system",
+        "small models",
+        "browser",
+        "local file system"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Hugging Face hosts a model called Lance with 686 likes and 1227 downloads.",
+      "date": "",
+      "source_url": "https://huggingface.co",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "\"id\":\"bytedance-research/Lance\",\"likes\":686,\"trendingScore\":655,\"private\":false,\"downloads\":1227",
+      "entities": [
+        "Hugging Face",
+        "Lance"
+      ],
+      "numbers": [
+        "686",
+        "1227"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Hugging Face hosts a model called Tencent/Hy-MT2-1.8B with 364 likes and 2564 downloads.",
+      "date": "",
+      "source_url": "https://huggingface.co",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "\"id\":\"tencent/Hy-MT2-1.8B\",\"likes\":364,\"trendingScore\":346,\"private\":false,\"downloads\":2564",
+      "entities": [
+        "Hugging Face",
+        "Tencent/Hy-MT2-1.8B"
+      ],
+      "numbers": [
+        "364",
+        "2564"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Hugging Face hosts a model called Supertone/supertonic-3 with 604 likes and 40368 downloads.",
+      "date": "",
+      "source_url": "https://huggingface.co",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "\"id\":\"Supertone/supertonic-3\",\"likes\":604,\"trendingScore\":304,\"private\":false,\"downloads\":40368",
+      "entities": [
+        "Hugging Face",
+        "Supertone/supertonic-3"
+      ],
+      "numbers": [
+        "604",
+        "40368"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Google DeepMind launched a new 27 billion parameter foundation model for single-cell analysis named Gemma.",
+      "date": "2025-10-23",
+      "source_url": "https://deepmind.google/blog/how-a-gemma-model-helped-discover-a-new-potential-cancer-therapy-pathway/",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "We’re launching a new 27 billion parameter foundation model for single-cell analysis built on the Gemma family of open models.",
+      "entities": [
+        "Google DeepMind",
+        "Gemma"
+      ],
+      "numbers": [
+        "27 billion"
+      ],
+      "stance": "confirms"
+    },
+    {
+      "claim": "DeepMind launched T5Gemma, a new collection of encoder-decoder LLMs.",
+      "date": "2025-10-25",
+      "source_url": "https://deepmind.google/blog/t5gemma-a-new-collection-of-encoder-decoder-gemma-models/",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "Introducing T5Gemma, a new collection of encoder-decoder LLMs.",
+      "entities": [
+        "DeepMind",
+        "T5Gemma"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "OpenReview hosts comments on repositories including CoLoR, Cognitive-Behaviors, RADA, Self-Instruct, and G-EVAL.",
+      "date": "",
+      "source_url": "https://openreview.net",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "RepoName: CoLoR \\n\\n RepoName: Cognitive-Behaviors \\n\\n RepoName: RADA \\n\\n RepoName: Self-Instruct \\n\\n RepoName: G-EVAL",
+      "entities": [
+        "OpenReview",
+        "CoLoR",
+        "Cognitive-Behaviors",
+        "RADA",
+        "Self-Instruct",
+        "G-EVAL"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Anthropic is a public benefit corporation focused on AI research and products with safety at the frontier.",
+      "date": "",
+      "source_url": "https://www.anthropic.com",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "Anthropic is a public benefit corporation dedicated to securing its benefits and mitigating its risks.",
+      "entities": [
+        "Anthropic"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    },
+    {
+      "claim": "Google Research introduced Groundsource, which turns news reports into data using Gemini.",
+      "date": "2026-03-12",
+      "source_url": "https://research.google/blog/introducing-groundsource-turning-news-reports-into-data-with-gemini/",
+      "source_type": "official",
+      "confidence": 0.9,
+      "supporting_snippet": "Introducing Groundsource: Turning news reports into data with Gemini.",
+      "entities": [
+        "Google Research",
+        "Groundsource",
+        "Gemini"
+      ],
+      "numbers": [],
+      "stance": "confirms"
+    }
+  ]
+}

@@ -24,7 +24,6 @@ const STATS_SLUGS = [
   'schedule',
   'split',
   'batch',
-  'ascii',
   'agentpay',
 ] as const;
 

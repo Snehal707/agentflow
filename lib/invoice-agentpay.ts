@@ -80,7 +80,7 @@ export async function createPaymentRequestFromInvoice(
   }
 
   let payerWallet: string | null = null;
-  const vendorHandle = String(invoice.vendor_handle ?? '').trim();
+  const vendorHandle = String(invoice.vendor_handle ?? invoice.vendor_name ?? '').trim();
   const issuer = String(invoice.business_wallet ?? '').trim();
 
   if (vendorHandle && issuer) {

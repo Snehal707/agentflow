@@ -10,20 +10,32 @@ export type VaultHoldingCard = {
   walletAddress: string;
   balanceFormatted: string;
   symbol: string;
+  displaySymbol: string;
   usdValue: number | null;
   readLabel: string;
 };
 
-export function findVaultHolding(holdings: PortfolioHolding[]): PortfolioHolding | null {
-  return (
-    holdings.find((holding) => {
-      if (holding.kind !== "vault_share") {
-        return false;
-      }
-      const amount = Number(holding.balanceFormatted ?? "0");
-      return Number.isFinite(amount) && amount > 0;
-    }) ?? null
-  );
+function inferUnderlyingSymbol(holding: PortfolioHolding): string {
+  const upperSymbol = holding.symbol.trim().toUpperCase();
+  const notes = holding.notes.join(" ").toUpperCase();
+
+  if (notes.includes("UNDERLYING USDC") || upperSymbol.includes("USDC")) {
+    return "USDC";
+  }
+  if (notes.includes("UNDERLYING EURC") || upperSymbol.includes("EURC")) {
+    return "EURC";
+  }
+  return holding.symbol || "VAULT";
+}
+
+export function findVaultHoldings(holdings: PortfolioHolding[]): PortfolioHolding[] {
+  return holdings.filter((holding) => {
+    if (holding.kind !== "vault_share") {
+      return false;
+    }
+    const amount = Number(holding.balanceFormatted ?? "0");
+    return Number.isFinite(amount) && amount > 0;
+  });
 }
 
 export type LoadVaultHoldingCardsResult = {
@@ -50,14 +62,15 @@ export async function loadVaultHoldingCards(
   try {
     const walletSnapshot = await fetchPortfolioSnapshot(address);
     didReadAnything = true;
-    const walletVault = findVaultHolding(walletSnapshot.holdings);
-    if (walletVault) {
+    const walletVaults = findVaultHoldings(walletSnapshot.holdings);
+    for (const walletVault of walletVaults) {
       nextHoldings.push({
-        key: `wallet-${address}`,
+        key: `wallet-${address}-${walletVault.id}`,
         label: "Connected wallet",
         walletAddress: address,
         balanceFormatted: walletVault.balanceFormatted,
         symbol: walletVault.symbol || "afvUSDC",
+        displaySymbol: inferUnderlyingSymbol(walletVault),
         usdValue: walletVault.usdValue,
         readLabel: "Live onchain read",
       });
@@ -75,18 +88,21 @@ export async function loadVaultHoldingCards(
       if (executionAddress && executionAddress.toLowerCase() !== address.toLowerCase()) {
         const executionSnapshot = await fetchPortfolioSnapshot(executionAddress);
         didReadAnything = true;
-        const executionVault = findVaultHolding(executionSnapshot.holdings);
+        const executionVaults = findVaultHoldings(executionSnapshot.holdings);
 
-        if (executionVault) {
-          nextHoldings.push({
-            key: `execution-${executionAddress}`,
-            label: "Agent wallet",
-            walletAddress: executionAddress,
-            balanceFormatted: executionVault.balanceFormatted,
-            symbol: executionVault.symbol || "afvUSDC",
-            usdValue: executionVault.usdValue,
-            readLabel: "Live onchain read",
-          });
+        if (executionVaults.length > 0) {
+          for (const executionVault of executionVaults) {
+            nextHoldings.push({
+              key: `execution-${executionAddress}-${executionVault.id}`,
+              label: "Agent wallet",
+              walletAddress: executionAddress,
+              balanceFormatted: executionVault.balanceFormatted,
+              symbol: executionVault.symbol || "afvUSDC",
+              displaySymbol: inferUnderlyingSymbol(executionVault),
+              usdValue: executionVault.usdValue,
+              readLabel: "Live onchain read",
+            });
+          }
         } else {
           const balance = Number(executionSummary.balances.vaultShares?.formatted ?? "0");
           if (Number.isFinite(balance) && balance > 0) {
@@ -96,6 +112,7 @@ export async function loadVaultHoldingCards(
               walletAddress: executionAddress,
               balanceFormatted: executionSummary.balances.vaultShares.formatted,
               symbol: "afvUSDC",
+              displaySymbol: "USDC",
               usdValue: null,
               readLabel: "Live wallet summary",
             });

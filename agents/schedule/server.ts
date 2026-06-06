@@ -110,16 +110,6 @@ app.post(
       return res.status(400).json({ action: 'error', message: 'walletAddress must match authenticated wallet' });
     }
 
-    if (req.body?.benchmark === true) {
-      console.log('[benchmark] schedule short-circuit');
-      return res.json({
-        ok: true,
-        benchmark: true,
-        agent: 'schedule',
-        result: 'Benchmark mode - payment logged',
-      });
-    }
-
     try {
       const result = await handleScheduleTask(task, walletAddress);
       return res.json(result);

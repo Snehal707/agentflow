@@ -9,11 +9,22 @@ import {
   useRef,
   useState,
 } from "react";
+import { flushSync } from "react-dom";
 import dynamic from "next/dynamic";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { ConnectButton, useConnectModal } from "@rainbow-me/rainbowkit";
-import { useAccount, useChainId, useWalletClient } from "wagmi";
-import { formatUnits, getAddress } from "viem";
+import { useAccount, useChainId, useSwitchChain, useWalletClient } from "wagmi";
+import { getWalletClient } from "@wagmi/core";
+import { createViemAdapterFromProvider } from "@circle-fin/adapter-viem-v2";
+import { BridgeChain, BridgeKit } from "@circle-fin/bridge-kit";
+import {
+  createPublicClient,
+  type EIP1193Provider,
+  formatUnits,
+  getAddress,
+  http,
+  parseAbi,
+} from "viem";
 import Link from "next/link";
 import { ChatSidebar } from "@/components/chat/ChatSidebar";
 import { ChatTopNavbar } from "@/components/chat/ChatTopNavbar";
@@ -31,11 +42,11 @@ import { normalizeChatHistoryFromStorage } from "@/lib/chatHistory";
 import { type ChatCategory, type ChatHistoryItem } from "@/lib/appData";
 import {
   fetchExecutionWalletSummary,
+  finalizeBridgeRun,
   runPaidAgent,
   runPortfolioAgent,
   streamConversationReply,
   streamAgentFlow,
-  streamBridgeAgent,
   type PipelineEvent,
   type PortfolioAgentResponse,
   type ResearchPayload,
@@ -43,19 +54,22 @@ import {
 } from "@/lib/liveAgentClient";
 import { useAgentJwt } from "@/lib/hooks/useAgentJwt";
 import { sidebarWidthClass, useSidebarPreference } from "@/lib/useSidebarPreference";
+import { config as wagmiConfig } from "@/lib/wagmi";
+import { createBrowserX402RequestId } from "@/lib/x402BrowserClient";
 import {
-  bridgeTraceFromStreamEvent,
-  traceEntriesFromBridgeResult,
-} from "@/lib/bridgeTrace";
-import {
-  executeEoaUsycPlan,
-  preflightEoaUsycAction,
-  type EoaUsycExecutionPlan,
-} from "@/lib/usycEoa";
+  BRIDGE_SOURCE_CONFIG,
+  detectBridgeSource,
+  type BridgeSource,
+} from "@/lib/bridgeSources";
 
 const HISTORY_STORAGE_KEY = "agentflow.chat.history";
+const EXECUTION_WALLET_CACHE_PREFIX = "agentflow.execution-wallet";
 const ARC_EURC_ADDRESS = "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a" as const;
-
+const ERC20_ALLOWANCE_ABI = parseAbi([
+  "function allowance(address owner,address spender) view returns (uint256)",
+  "function approve(address spender,uint256 amount) returns (bool)",
+  "function balanceOf(address owner) view returns (uint256)",
+]);
 const ChatPaymentPanel = dynamic(
   () => import("@/components/chat/ChatPaymentPanel").then((mod) => mod.ChatPaymentPanel),
   { ssr: false },
@@ -75,6 +89,126 @@ function createChatSessionId(): string {
   return `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+type X402AttemptSnapshot = {
+  requestId: string;
+  stage?: string;
+  error?: string;
+  transaction?: string;
+  updatedAt?: string;
+};
+
+const BRIDGE_SWITCH_TIMEOUT_MS = 15_000;
+const BRIDGE_WALLET_CLIENT_TIMEOUT_MS = 15_000;
+const BRIDGE_FINALIZE_TIMEOUT_MS = 35_000;
+const BRIDGE_FINALIZE_POLL_TIMEOUT_MS = 30_000;
+const BRIDGE_FINALIZE_POLL_INTERVAL_MS = 1_500;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isTerminalX402AttemptStage(stage?: string | null): boolean {
+  return stage === "succeeded" || stage === "failed" || stage === "preflight_failed";
+}
+
+function isBridgeFinalizePendingStage(stage?: string | null): boolean {
+  return stage === "started" ||
+    stage === "preflight_ok" ||
+    stage === "payment_required" ||
+    stage === "payload_created" ||
+    stage === "paid_request_sent";
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: number | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer != null) {
+      window.clearTimeout(timer);
+    }
+  }
+}
+
+async function readX402AttemptSnapshot(
+  requestId: string,
+): Promise<X402AttemptSnapshot | null> {
+  try {
+    const response = await fetch(`/api/x402/attempts/${encodeURIComponent(requestId)}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = (await response.json()) as
+      | X402AttemptSnapshot
+      | { ok?: boolean; record?: X402AttemptSnapshot | null };
+    if (payload && typeof payload === "object" && "record" in payload) {
+      return payload.record ?? null;
+    }
+    return payload as X402AttemptSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForX402AttemptTerminalState(
+  requestId: string,
+  timeoutMs: number = BRIDGE_FINALIZE_POLL_TIMEOUT_MS,
+): Promise<X402AttemptSnapshot | null> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const attempt = await readX402AttemptSnapshot(requestId);
+    if (attempt && isTerminalX402AttemptStage(attempt.stage)) {
+      return attempt;
+    }
+    await sleep(BRIDGE_FINALIZE_POLL_INTERVAL_MS);
+  }
+  return await readX402AttemptSnapshot(requestId);
+}
+
+function executionWalletCacheKey(address: string): string {
+  return `${EXECUTION_WALLET_CACHE_PREFIX}:${address.toLowerCase()}`;
+}
+
+function loadCachedExecutionWalletAddress(address: string): `0x${string}` | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const raw = sessionStorage.getItem(executionWalletCacheKey(address));
+    if (!raw) {
+      return null;
+    }
+    return getAddress(raw) as `0x${string}`;
+  } catch {
+    return null;
+  }
+}
+
+function persistExecutionWalletAddress(
+  address: string,
+  executionWalletAddress: `0x${string}`,
+): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    sessionStorage.setItem(executionWalletCacheKey(address), executionWalletAddress);
+  } catch {
+    /* Ignore storage failures. */
+  }
+}
+
 function QuickAgentPromptStrip({
   disabled,
   onSelect,
@@ -84,7 +218,7 @@ function QuickAgentPromptStrip({
 }) {
   return (
     <div
-      className="mx-auto mt-5 flex max-w-5xl flex-wrap justify-center gap-2.5"
+      className="mx-auto mt-[22px] flex max-w-[1064px] flex-wrap justify-center gap-3"
       aria-label="AgentFlow prompt starters"
     >
       {quickAgentPrompts.map((item) => (
@@ -94,7 +228,7 @@ function QuickAgentPromptStrip({
           disabled={disabled}
           onClick={() => onSelect(item)}
           title={item.prompt}
-          className="min-h-11 rounded-full border border-white/10 bg-[#202020]/85 px-5 text-[11px] font-black uppercase tracking-[0.18em] text-white/45 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition hover:border-[#f2ca50]/45 hover:bg-[#211f16] hover:text-[#f2ca50] disabled:cursor-not-allowed disabled:opacity-50"
+          className="min-h-[50px] rounded-full border border-white/10 bg-[#202020]/90 px-6 text-[11px] font-black uppercase tracking-[0.2em] text-white/45 shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_12px_30px_rgba(0,0,0,0.28)] transition hover:border-[#f2ca50]/45 hover:bg-[#211f16] hover:text-[#f2ca50] disabled:cursor-not-allowed disabled:opacity-50"
         >
           {item.label}
         </button>
@@ -154,16 +288,86 @@ const quickAgentPrompts: QuickAgentPrompt[] = [
     prompt: "Show my portfolio.",
   },
 ];
+
 type ExecutionTarget = "EOA" | "DCW";
 type VaultAction =
   | "deposit"
   | "withdraw"
   | "check_apy"
-  | "compound"
-  | "usyc_deposit"
-  | "usyc_withdraw";
-type BridgeSource = "ethereum-sepolia" | "base-sepolia";
+  | "compound";
+type VaultSemanticAction = VaultAction | "list" | "position";
 type ChatIntent = PromptTab | "Conversation" | "Vision";
+
+type PendingBridgeDraft = {
+  assistantId: string;
+  sourceChain: BridgeSource;
+  amount: number;
+  payerAddress: `0x${string}`;
+  userDcwAddress: `0x${string}`;
+  authHeaders: Record<string, string>;
+};
+
+type PendingBridgeSelection = {
+  assistantId: string;
+  sourceChain: BridgeSource;
+  payerAddress: `0x${string}`;
+  authHeaders: Record<string, string>;
+};
+
+type PendingSwapSelection = {
+  assistantId: string;
+  tokenInSymbol: "USDC" | "EURC";
+  tokenOutSymbol: "USDC" | "EURC";
+  payerAddress: `0x${string}`;
+  authHeaders: Record<string, string>;
+};
+
+type PendingSwapDraft = {
+  assistantId: string;
+  payerAddress: `0x${string}`;
+  authHeaders: Record<string, string>;
+  amount: number;
+  tokenPair: { tokenIn: `0x${string}`; tokenOut: `0x${string}` };
+  tokenInSymbol: "USDC" | "EURC";
+  tokenOutSymbol: "USDC" | "EURC";
+  requestedSlippage: number;
+  provider: string;
+  routeData: unknown;
+  expectedOutRaw: string;
+  quoteOutRaw: string;
+  optimalSlippage?: number;
+};
+
+type PendingVaultSelection = {
+  assistantId: string;
+  action: "deposit" | "withdraw";
+  vaultSymbol: "luneUSDC" | "luneEURC";
+  amount?: number | null;
+  payerAddress: `0x${string}`;
+  authHeaders: Record<string, string>;
+};
+
+type PendingVaultDraft = {
+  assistantId: string;
+  action: "deposit" | "withdraw";
+  vaultSymbol: "luneUSDC" | "luneEURC";
+  vaultAddress: `0x${string}`;
+  amount: number;
+  payerAddress: `0x${string}`;
+  authHeaders: Record<string, string>;
+};
+
+type BridgeSourceHolding = {
+  sourceChain: BridgeSource;
+  label: string;
+  usdcBalanceRaw: bigint;
+  nativeBalanceRaw: bigint;
+};
+
+const VAULT_ADDRESS_BY_SYMBOL: Record<"luneUSDC" | "luneEURC", `0x${string}`> = {
+  luneUSDC: "0x66CF9CA9D75FD62438C6E254bA35E61775EF9496",
+  luneEURC: "0xcF2C839B12ECf6D9eEcd4607521B73fcFb7E8713",
+};
 
 type PendingChatAttachment = ChatAttachment & {
   dataUrl: string;
@@ -213,7 +417,7 @@ type AgentRunPaymentResult = {
 };
 
 type VisionAgentResponseWithPayment = VisionAgentResponse & AgentRunPaymentResult;
-type TranscribeAgentResponseWithPayment = TranscribeAgentResponse & AgentRunPaymentResult;
+type TranscribeAgentResponseWithPayment = TranscribeAgentResponse & Partial<AgentRunPaymentResult>;
 
 const contextLabels = ["x402", "Arc"] as const;
 
@@ -267,20 +471,46 @@ function normalizePromptForIntent(prompt: string): string {
     .replace(/\bpositons?\b/g, "positions")
     .replace(/\bliqudity\b/g, "liquidity")
     .replace(/\bholdngs?\b/g, "holdings")
-    .replace(/\bbalence(s)?\b/g, "balance$1");
+    .replace(/\bbalence(s)?\b/g, "balance$1")
+    .replace(/\bbri+dge+\b/g, "bridge")
+    .replace(/\bbridg\b/g, "bridge")
+    .replace(/\bbroidge\b/g, "bridge")
+    .replace(/\bbrdige\b/g, "bridge");
 }
 
 type SwapAgentResponse = {
   success: boolean;
+  action?: "preview";
+  provider?: string;
+  expectedOutRaw?: string;
+  expectedOutFormatted?: string;
+  route?: Array<{
+    isV3: boolean;
+    path: `0x${string}`[];
+    fees: number[];
+    bps: number;
+  }>;
+  payload?: {
+    provider: string;
+    tokenIn: `0x${string}`;
+    tokenOut: `0x${string}`;
+    amount: number;
+    requestedSlippage: number;
+    optimalSlippage?: number;
+    quoteAmountOutRaw: string;
+    routeData: unknown;
+  };
   executionMode?: "DCW";
   txHash?: string;
+  approvalTxHash?: string | null;
   error?: string;
   receipt?: {
     explorerLink?: string;
+    approvalExplorerLink?: string | null;
     amountIn?: number;
     executionTarget?: "DCW";
     optimalSlippage?: number;
-    tokenPair?: { tokenIn: string; tokenOut: string };
+    tokenPair?: { tokenIn: `0x${string}`; tokenOut: `0x${string}` };
     quoteOutRaw?: string;
   };
 };
@@ -303,7 +533,7 @@ function arcTokenLabel(address: string): string {
 /** Human-readable swap size for chat receipt (matches swap agent `receipt`). */
 function formatSwapAmountLine(input: {
   amountIn: number;
-  quoteOutRaw?: string;
+  quoteOutRaw?: string | null;
   tokenIn: string;
   tokenOut: string;
 }): string {
@@ -323,6 +553,162 @@ function formatSwapAmountLine(input: {
   }
   const arrow = outHuman || outLabel;
   return `**Swap:** ${input.amountIn} ${inLabel} -> ${arrow}`;
+}
+
+function isSoftPendingAcknowledgement(message: string): boolean {
+  return /^(?:ok|okay|sure|got it|understood|alright|fine|cool|yep|yeah|yes please|go ahead|do it|continue)$/i.test(
+    message.trim(),
+  );
+}
+
+function buildSwapPreviewContent(input: {
+  amount: number;
+  tokenInSymbol: "USDC" | "EURC";
+  tokenOutSymbol: "USDC" | "EURC";
+  expectedOutFormatted?: string;
+  optimalSlippage?: number;
+  provider?: string;
+}): string {
+  const amountLine = `**Swap:** ${input.amount} ${input.tokenInSymbol} -> ${
+    input.expectedOutFormatted ? `~${input.expectedOutFormatted} ${input.tokenOutSymbol}` : input.tokenOutSymbol
+  }`;
+  const providerLine = input.provider ? `Provider: ${input.provider}` : null;
+  const slippageLine =
+    typeof input.optimalSlippage === "number"
+      ? `Slippage guard: ${input.optimalSlippage}%`
+      : null;
+
+  return [
+    amountLine,
+    providerLine,
+    slippageLine,
+    "",
+    "Reply YES to execute or NO to cancel.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function normalizeQuickActionText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[`"'.,!?():[\]{}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function decodeQuickActionMessage(value: string): {
+  displayText: string;
+  prompt: string | null;
+  actionId: string | null;
+} {
+  const match = value.match(/^\[\[AF_ACTION:([^\]]+)]]([\s\S]*)$/);
+  if (!match) {
+    return { displayText: value, prompt: null, actionId: null };
+  }
+
+  let prompt: string | null = null;
+  let actionId: string | null = null;
+  try {
+    const decoded = decodeURIComponent(match[1]);
+    try {
+      const payload = JSON.parse(decoded) as { prompt?: unknown; actionId?: unknown };
+      prompt = typeof payload.prompt === "string" ? payload.prompt : null;
+      actionId = typeof payload.actionId === "string" ? payload.actionId : null;
+    } catch {
+      // Keep older quick-action envelopes working during rolling frontend updates.
+      prompt = decoded;
+    }
+  } catch {
+    prompt = null;
+  }
+
+  return {
+    displayText: match[2] || "",
+    prompt,
+    actionId,
+  };
+}
+
+function flattenQuickActions(
+  groups: LiveChatMessage["quickActionGroups"] | undefined,
+): Array<{ label: string; prompt: string }> {
+  if (!groups?.length) {
+    return [];
+  }
+  return groups.flatMap((group) =>
+    group.actions.map((action) => ({
+      label: action.label,
+      prompt: action.prompt,
+    })),
+  );
+}
+
+function findLatestAssistantQuickActions(
+  messages: LiveChatMessage[],
+): Array<{ label: string; prompt: string }> {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant") {
+      continue;
+    }
+    const actions = flattenQuickActions(message.quickActionGroups);
+    if (actions.length) {
+      return actions;
+    }
+  }
+  return [];
+}
+
+function resolveQuickActionPromptFromReply(
+  reply: string,
+  messages: LiveChatMessage[],
+): string | null {
+  const normalizedReply = normalizeQuickActionText(reply);
+  if (!normalizedReply) {
+    return null;
+  }
+
+  const actions = findLatestAssistantQuickActions(messages);
+  if (!actions.length) {
+    return null;
+  }
+
+  const exact = actions.find(
+    (action) =>
+      normalizeQuickActionText(action.label) === normalizedReply ||
+      normalizeQuickActionText(action.prompt) === normalizedReply,
+  );
+  if (exact) {
+    return exact.prompt;
+  }
+
+  const ordinalMatchers: Array<{ matcher: RegExp; index: number }> = [
+    { matcher: /^(?:the\s+)?(?:first|1st|one)\s+one$|^(?:first|1st)$/i, index: 0 },
+    { matcher: /^(?:the\s+)?(?:second|2nd|two)\s+one$|^(?:second|2nd)$/i, index: 1 },
+    { matcher: /^(?:the\s+)?(?:third|3rd|three)\s+one$|^(?:third|3rd)$/i, index: 2 },
+    { matcher: /^(?:the\s+)?(?:fourth|4th|four)\s+one$|^(?:fourth|4th)$/i, index: 3 },
+  ];
+
+  for (const { matcher, index } of ordinalMatchers) {
+    if (matcher.test(reply.trim()) && actions[index]) {
+      return actions[index].prompt;
+    }
+  }
+
+  if (/^(?:that|this)\s+one$/i.test(reply.trim()) && actions.length === 1) {
+    return actions[0].prompt;
+  }
+
+  if (/^(?:the\s+)?other\s+one$/i.test(reply.trim()) && actions.length === 2) {
+    return actions[1].prompt;
+  }
+
+  if (/^(?:the\s+)?last\s+one$|^last$/i.test(reply.trim())) {
+    return actions[actions.length - 1]?.prompt ?? null;
+  }
+
+  return null;
 }
 
 function paymentPriceLabel(agent: string): string {
@@ -419,12 +805,21 @@ type VaultAgentResponse = {
   success: boolean;
   action?: string;
   apy?: number;
+  vaults?: Array<Record<string, unknown>>;
   txHash?: string;
   explorerLink?: string | null;
-  usycReceived?: string;
+  approvalTxHash?: string | null;
+  receipt?: {
+    approvalExplorerLink?: string | null;
+    explorerLink?: string | null;
+  };
+  provider?: string;
+  vaultSymbol?: string;
+  sharesReceivedFormatted?: string;
+  sharesBurnedFormatted?: string;
+  assetsReceivedFormatted?: string;
   usdcReceived?: string;
   executionMode?: "EOA" | "DCW";
-  eoaPlan?: EoaUsycExecutionPlan;
   error?: string;
 };
 
@@ -481,6 +876,18 @@ function inferPromptIntent(prompt: string, fallbackTab: PromptTab): ChatIntent {
     return "Portfolio";
   }
 
+  const vaultIntent = normalizeVaultIntent(prompt);
+  if (
+    vaultIntent.isVaultDomain &&
+    !(
+      portfolioAnalysisVerbPattern.test(normalized) &&
+      portfolioAnalysisSubjectPattern.test(normalized) &&
+      !/\bvault\b/.test(normalized)
+    )
+  ) {
+    return "Vault";
+  }
+
   if (/\b(portfolio|holdings|allocation|pnl|position|positions)\b/.test(normalized)) {
     return "Portfolio";
   }
@@ -497,20 +904,11 @@ function inferPromptIntent(prompt: string, fallbackTab: PromptTab): ChatIntent {
 
   if (
     explicitBridgeActionPattern.test(normalized) ||
+    (hasBridgeIntentFraming(prompt) && Boolean(detectBridgeSource(prompt))) ||
+    isBareBridgeSourceReply(prompt) ||
     /\b(sepolia|base sepolia|ethereum sepolia)\b/.test(normalized)
   ) {
     return "Bridge";
-  }
-
-  if (/\busyc\b/.test(normalized)) {
-    return "Vault";
-  }
-
-  if (
-    explicitVaultActionPattern.test(normalized) ||
-    (/\bvault\b/.test(normalized) && !portfolioAnalysisSubjectPattern.test(normalized))
-  ) {
-    return "Vault";
   }
 
   if (
@@ -575,7 +973,7 @@ function buildLocalPromptGuard(
     ) &&
     !/\bgateway\s+strateg/i.test(normalized)
   ) {
-    return "AgentFlow does not manage liquidity pools, strategy positions, or marketplace strategies. The live portfolio view is your Agent wallet, Gateway reserve, vault shares, and recent activity.";
+    return "AgentFlow does not manage liquidity pools, strategy positions, or third-party strategy agents. The live portfolio view is your Agent wallet, Gateway reserve, vault shares, and recent activity.";
   }
 
   return null;
@@ -644,6 +1042,15 @@ function parseAmount(prompt: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseOptionalAmount(prompt: string): number | null {
+  const match = prompt.match(/(?:[$]\s*)?(\d+(?:\.\d+)?)(?:\s*[$])?/);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function parseSlippage(prompt: string, fallback: number): number {
   const match = prompt.match(/(\d+(?:\.\d+)?)\s*%/);
   const parsed = match ? Number(match[1]) : fallback;
@@ -651,32 +1058,421 @@ function parseSlippage(prompt: string, fallback: number): number {
 }
 
 function detectVaultAction(prompt: string): VaultAction {
-  if (/\busyc\b/i.test(prompt)) {
-    if (/\b(redeem|withdraw|sell)\b/i.test(prompt)) return "usyc_withdraw";
-    return "usyc_deposit";
-  }
   if (/compound/i.test(prompt)) return "compound";
-  if (/withdraw/i.test(prompt)) return "withdraw";
-  if (/\b(deposit|earn|supply|add)\b/i.test(prompt)) return "deposit";
+  if (/\b(withdraw|redeem|unstake|take\s+out|pull\s+out|remove)\b/i.test(prompt)) return "withdraw";
+  if (/\b(deposit|earn|supply|add|stake|park|allocate|fund)\b/i.test(prompt)) return "deposit";
+  if (
+    /\b(put|move|stash|place)\b/i.test(prompt) &&
+    /\b(vault|yield|earn|passive income|idle funds?)\b/i.test(prompt)
+  ) {
+    return "deposit";
+  }
   if (/apy|yield/i.test(prompt) && !/deposit|withdraw|compound/i.test(prompt)) {
     return "check_apy";
   }
   return "check_apy";
 }
 
-function detectBridgeSource(prompt: string): BridgeSource {
-  if (/base\s*sepolia/i.test(prompt)) {
-    return "base-sepolia";
+function isBareBridgeSourceReply(prompt: string): boolean {
+  return /^(?:eth(?:ereum)?(?:[\s-]+sep(?:olia)?)|base(?:[\s-]+sep(?:olia)?)|arb(?:itrum)?(?:[\s-]+sep(?:olia)?)|op(?:timism)?(?:[\s-]+sep(?:olia)?)|avalanche(?:[\s-]+fuji)?|fuji|polygon(?:[\s-]+amoy)?|amoy|linea(?:[\s-]+sep(?:olia)?)|unichain(?:[\s-]+sep(?:olia)?)|codex(?:[\s-]+testnet)?|sonic(?:[\s-]+testnet)?|monad(?:[\s-]+testnet)?|ink(?:[\s-]+testnet|[\s-]+sep(?:olia)?)|sei(?:[\s-]+testnet)?|morph(?:[\s-]+testnet)?|pharos(?:[\s-]+atlantic|[\s-]+testnet)?|plume(?:[\s-]+testnet)?|injective(?:[\s-]+testnet)?|world(?:[\s-]+chain)?(?:[\s-]+sep(?:olia)?)|xdc(?:[\s-]+apothem)?|hyperevm(?:[\s-]+testnet)?)$/i.test(
+    prompt.trim(),
+  );
+}
+
+function hasBridgeIntentFraming(prompt: string): boolean {
+  return /\b(bridge|bridging|source chain|from there to arc|to arc|move.*to arc|send.*to arc)\b/i.test(
+    prompt,
+  );
+}
+
+function detectVaultSymbol(prompt: string): "luneUSDC" | "luneEURC" | null {
+  if (/\blune\s*eurc\b|\bluneeurc\b|\beurc vault\b/i.test(prompt)) {
+    return "luneEURC";
   }
-  return "ethereum-sepolia";
+  if (/\blune\s*usdc\b|\bluneusdc\b|\busdc vault\b/i.test(prompt)) {
+    return "luneUSDC";
+  }
+  return null;
+}
+
+function inferVaultSymbolFromAssetHint(prompt: string): "luneUSDC" | "luneEURC" | null {
+  if (/\beurc\b/i.test(prompt)) {
+    return "luneEURC";
+  }
+  if (/\busdc\b/i.test(prompt)) {
+    return "luneUSDC";
+  }
+  return null;
+}
+
+function vaultAssetSymbol(vaultSymbol: "luneUSDC" | "luneEURC"): "USDC" | "EURC" {
+  return vaultSymbol === "luneEURC" ? "EURC" : "USDC";
+}
+
+function vaultLabel(vaultSymbol: "luneUSDC" | "luneEURC"): string {
+  return vaultSymbol === "luneEURC" ? "Lunex EURC Vault" : "Lunex USDC Vault";
+}
+
+function inferPendingVaultSelectionFromAssistantReply(input: {
+  assistantId: string;
+  content: string;
+  payerAddress: `0x${string}` | null | undefined;
+  authHeaders: Record<string, string> | null | undefined;
+}): PendingVaultSelection | null {
+  const { assistantId, content, payerAddress, authHeaders } = input;
+  if (!payerAddress || !authHeaders) {
+    return null;
+  }
+
+  const vaultSymbol = detectVaultSymbol(content);
+  if (!vaultSymbol) {
+    return null;
+  }
+
+  let action: "deposit" | "withdraw" | null = null;
+  if (/\bhow much\b[\s\S]*\bdeposit\b/i.test(content)) {
+    action = "deposit";
+  } else if (/\bhow much\b[\s\S]*\bwithdraw\b/i.test(content)) {
+    action = "withdraw";
+  }
+
+  if (!action) {
+    return null;
+  }
+
+  return {
+    assistantId,
+    action,
+    vaultSymbol,
+    amount: null,
+    payerAddress,
+    authHeaders,
+  };
+}
+
+function inferPendingSwapSelectionFromAssistantReply(input: {
+  assistantId: string;
+  content: string;
+  payerAddress: `0x${string}` | null | undefined;
+  authHeaders: Record<string, string> | null | undefined;
+}): PendingSwapSelection | null {
+  const { assistantId, content, payerAddress, authHeaders } = input;
+  if (!payerAddress || !authHeaders) {
+    return null;
+  }
+
+  const match = content.match(/\bhow much\s+(USDC|EURC)\s+do you want to swap into\s+(USDC|EURC)\b/i);
+  if (!match) {
+    return null;
+  }
+
+  const tokenInSymbol = match[1].toUpperCase() as "USDC" | "EURC";
+  const tokenOutSymbol = match[2].toUpperCase() as "USDC" | "EURC";
+  if (tokenInSymbol === tokenOutSymbol) {
+    return null;
+  }
+
+  return {
+    assistantId,
+    tokenInSymbol,
+    tokenOutSymbol,
+    payerAddress,
+    authHeaders,
+  };
+}
+
+function normalizeVaultIntent(prompt: string): {
+  isVaultDomain: boolean;
+  action: VaultSemanticAction;
+  vaultSymbol: "luneUSDC" | "luneEURC" | null;
+  amount: number | null;
+} {
+  const normalized = normalizePromptForIntent(prompt);
+  const explicitVaultSymbol = detectVaultSymbol(prompt);
+  const amount = parseOptionalAmount(prompt);
+  const asksPositions =
+    /\b(my vault positions?|my positions?|show positions?|what(?:'s| is) in my vault|vault holdings?)\b/i.test(
+      normalized,
+    );
+
+  if (asksPositions) {
+    return { isVaultDomain: true, action: "position", vaultSymbol: explicitVaultSymbol, amount };
+  }
+
+  const asksApy =
+    /\b(apy|apr|rate|return|yield)\b/i.test(normalized) &&
+    !/\b(deposit|withdraw|stake|unstake|move|put|park)\b/i.test(normalized);
+  const signalsVaultMeaning =
+    explicitVaultSymbol != null ||
+    explicitVaultActionPattern.test(normalized) ||
+    /\bvault\b/i.test(normalized) ||
+    /\b(passive income|idle funds?|earn options?|yield options?|safer yield|yield opportunity|yield opportunities)\b/i.test(
+      normalized,
+    ) ||
+    (/\b(park|grow|earn|yield|put|move|stash|allocate)\b/i.test(normalized) &&
+      /\b(usdc|eurc|funds?|cash|stablecoins?|money)\b/i.test(normalized)) ||
+    /\b(where|how|what|which)\b[\s\S]*\b(earn|yield|passive income)\b/i.test(normalized);
+
+  if (!signalsVaultMeaning) {
+    return { isVaultDomain: false, action: "check_apy", vaultSymbol: explicitVaultSymbol, amount };
+  }
+
+  if (
+    /\b(show|list|browse|compare|explore|which|what)\b/i.test(normalized) &&
+    /\b(vaults?|yield|earn|passive income)\b/i.test(normalized) &&
+    !/\b(deposit|withdraw|stake|unstake|redeem)\b/i.test(normalized)
+  ) {
+    return { isVaultDomain: true, action: "list", vaultSymbol: explicitVaultSymbol, amount };
+  }
+
+  if (
+    /\b(where can i|how can i|what should i use|best place|best option|safer option)\b/i.test(normalized) &&
+    /\b(usdc|eurc|funds?|cash|stablecoins?|money|idle funds?)\b/i.test(normalized)
+  ) {
+    return { isVaultDomain: true, action: "list", vaultSymbol: explicitVaultSymbol, amount };
+  }
+
+  const detectedAction = asksApy ? "check_apy" : detectVaultAction(prompt);
+  const inferredVaultSymbol =
+    explicitVaultSymbol ??
+    ((detectedAction === "deposit" || detectedAction === "withdraw")
+      ? inferVaultSymbolFromAssetHint(prompt)
+      : null);
+
+  return {
+    isVaultDomain: true,
+    action: detectedAction,
+    vaultSymbol: inferredVaultSymbol,
+    amount,
+  };
+}
+
+function isBridgeInfoPrompt(prompt: string): boolean {
+  return /\b(how|what|which|supported|support|explain|works?|flow|chains?)\b/i.test(prompt);
+}
+
+function isBridgeSourceDiscoveryPrompt(prompt: string): boolean {
+  return (
+    /\bbridge\b/i.test(prompt) &&
+    /\b(?:which|what|where|from\s+which|source|balance|balances|have\s+balance|has\s+balance|funded|funds|usdc|gas)\b/i.test(
+      prompt,
+    )
+  );
+}
+
+function formatBridgeAmountPrompt(amount: number | null, label: string): string {
+  return amount
+    ? `Bridge ${amount} USDC from ${label} to Arc.`
+    : `Bridge from ${label} to Arc.`;
+}
+
+function findPendingBridgeAmountSource(messages: LiveChatMessage[]): BridgeSource | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant" || !message.content) {
+      continue;
+    }
+    if (
+      /\bhow much\s+usdc\b[\s\S]*\bbridge\b/i.test(message.content) ||
+      /\bsource chain locked\b[\s\S]*\btell me how much\b/i.test(message.content)
+    ) {
+      const source = detectBridgeSource(message.content);
+      if (source) {
+        return source;
+      }
+    }
+  }
+  return null;
+}
+
+function formatBridgeBalanceShort(raw: bigint, decimals: number): string {
+  const formatted = Number(formatUnits(raw, decimals));
+  if (!Number.isFinite(formatted)) {
+    return "0";
+  }
+  if (formatted === 0) {
+    return "0";
+  }
+  if (formatted < 0.01) {
+    return "<0.01";
+  }
+  return formatted.toFixed(formatted >= 100 ? 0 : formatted >= 10 ? 2 : 3).replace(/\.?0+$/, "");
+}
+
+function bridgeTxExplorerUrl(sourceChain: BridgeSource, txHash: string): string {
+  return `${BRIDGE_SOURCE_CONFIG[sourceChain].explorerTxBase}${txHash}`;
+}
+
+function arcTxExplorerUrl(txHash: string): string {
+  return `https://testnet.arcscan.app/tx/${txHash}`;
+}
+
+function buildBridgeReceiptContent(input: {
+  amount: number;
+  sourceChain: BridgeSource;
+  sourceLabel: string;
+  userDcwAddress: `0x${string}`;
+  approvalTxHash?: string | null;
+  burnTxHash: string;
+  mintTxHash?: string | null;
+  paymentRequestId?: string | null;
+}): string {
+  return [
+    `Bridge: ${input.amount} USDC from ${input.sourceLabel} -> Arc`,
+    "Bridge complete on Arc.",
+    `Source signer: Connected EOA on ${input.sourceLabel}`,
+    `AgentFlow wallet: ${input.userDcwAddress}`,
+    input.approvalTxHash ? "Approval tx:" : null,
+    input.approvalTxHash ?? null,
+    input.approvalTxHash ? `Approval explorer: ${bridgeTxExplorerUrl(input.sourceChain, input.approvalTxHash)}` : null,
+    "Burn tx:",
+    input.burnTxHash,
+    `Burn explorer: ${bridgeTxExplorerUrl(input.sourceChain, input.burnTxHash)}`,
+    input.mintTxHash ? "Mint tx:" : null,
+    input.mintTxHash ?? null,
+    input.mintTxHash ? `Mint explorer: ${arcTxExplorerUrl(input.mintTxHash)}` : "Mint completed through Circle forwarder.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildVaultListContent(vaults: Array<Record<string, unknown>>): string {
+  if (!vaults.length) {
+    return "No vault options are available right now.";
+  }
+
+  const lines = ["## Yield vaults on Arc Testnet", ""];
+  for (const vault of vaults) {
+    const apy =
+      typeof (vault as { apy?: { apy?: number } }).apy?.apy === "number" &&
+      Number.isFinite((vault as { apy?: { apy?: number } }).apy?.apy)
+        ? `${((vault as { apy?: { apy?: number } }).apy?.apy as number).toFixed(1)}%`
+        : "5.3%";
+    const method = String((vault as { apy?: { method?: string } }).apy?.method || "");
+    lines.push(`### ${String(vault.label || "Vault")}`);
+    lines.push(`- **APY:** ${apy}${method === "mock_fallback" ? " (preview)" : ""}`);
+    lines.push(`- **Provider:** ${String(vault.provider || "unknown")}`);
+    lines.push(
+      `- **Network:** ${String(vault.network || "testnet")}${vault.experimental ? " (experimental)" : ""}`,
+    );
+    const notes = Array.isArray(vault.notes) ? vault.notes : [];
+    if (notes.length) {
+      lines.push(`- **Notes:** ${String(notes[0])}`);
+    }
+    lines.push("");
+  }
+  lines.push("Choose a vault below or tell me how much you want to deposit.");
+  return lines.join("\n");
+}
+
+function buildVaultExecutionContent(input: {
+  action: "deposit" | "withdraw";
+  txHash: string;
+  explorerLink?: string | null;
+  approvalTxHash?: string | null;
+  approvalExplorerLink?: string | null;
+  provider?: string | null;
+  vaultSymbol?: string | null;
+  sharesReceivedFormatted?: string | null;
+  sharesBurnedFormatted?: string | null;
+  assetsReceivedFormatted?: string | null;
+}): string {
+  if (input.action === "deposit") {
+    return [
+      "Vault deposit complete on Arc.",
+      input.vaultSymbol ? `Vault: ${input.vaultSymbol}` : null,
+      input.approvalTxHash ? "Approval tx:" : null,
+      input.approvalTxHash ?? null,
+      input.approvalTxHash && input.approvalExplorerLink
+        ? `Approval explorer: ${input.approvalExplorerLink}`
+        : null,
+      "Deposit tx:",
+      input.txHash,
+      input.explorerLink ? `Explorer: ${input.explorerLink}` : null,
+      input.sharesReceivedFormatted && input.vaultSymbol
+        ? `Shares received: ${input.sharesReceivedFormatted} ${input.vaultSymbol}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  return [
+    "Vault withdraw complete on Arc.",
+    input.vaultSymbol ? `Vault: ${input.vaultSymbol}` : null,
+    "Withdraw tx:",
+    input.txHash,
+    input.explorerLink ? `Explorer: ${input.explorerLink}` : null,
+    input.sharesBurnedFormatted && input.vaultSymbol
+      ? `Shares burned: ${input.sharesBurnedFormatted} ${input.vaultSymbol}`
+      : null,
+    input.assetsReceivedFormatted
+      ? `Assets received: ${input.assetsReceivedFormatted}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildSwapExecutionContent(input: {
+  amountIn: number;
+  tokenIn: `0x${string}`;
+  tokenOut: `0x${string}`;
+  quoteOutRaw?: string | null;
+  txHash: string;
+  explorerLink?: string | null;
+  approvalTxHash?: string | null;
+  approvalExplorerLink?: string | null;
+  executionTarget?: string | null;
+  provider?: string | null;
+}): string {
+  const txOwnerLabel = input.executionTarget ? `${input.executionTarget} Tx:` : "Tx:";
+  const lines = [
+    formatSwapAmountLine({
+      amountIn: input.amountIn,
+      quoteOutRaw: input.quoteOutRaw,
+      tokenIn: input.tokenIn,
+      tokenOut: input.tokenOut,
+    }),
+    "Swap complete on Arc.",
+    input.approvalTxHash ? "Approval tx:" : null,
+    input.approvalTxHash ?? null,
+    input.executionTarget ? `Executed from: ${txOwnerLabel}` : txOwnerLabel,
+    input.txHash,
+    input.explorerLink ? `Explorer: ${input.explorerLink}` : null,
+  ];
+  return lines.filter(Boolean).join("\n\n");
+}
+
+type BridgeKitStepLike = {
+  name?: string;
+  state?: string;
+  txHash?: string;
+  explorerUrl?: string;
+  forwarded?: boolean;
+};
+
+function findBridgeStepTx(
+  steps: BridgeKitStepLike[] | undefined,
+  matcher: RegExp,
+): string | null {
+  if (!steps) {
+    return null;
+  }
+  for (const step of steps) {
+    if (typeof step.name === "string" && matcher.test(step.name) && typeof step.txHash === "string") {
+      return step.txHash;
+    }
+  }
+  return null;
 }
 
 /**
  * Arc testnet: both directions use the same pool path; the swap agent accepts any { tokenIn, tokenOut }.
  */
 function resolveSwapTokenPair(prompt: string): {
-  tokenIn: string;
-  tokenOut: string;
+  tokenIn: `0x${string}`;
+  tokenOut: `0x${string}`;
   swapSpends: "usdc" | "eurc";
 } {
   const t = prompt.trim();
@@ -722,6 +1518,9 @@ function friendlyChatErrorMessage(error: unknown, fallback: string): string {
   const lower = message.toLowerCase();
 
   if (!message) return fallback;
+  if (/aborterror|operation was aborted|the operation was aborted/i.test(message)) {
+    return "The wallet handoff was interrupted before AgentFlow could finish this step. Try the bridge again and keep the wallet prompt open until it completes.";
+  }
   if (/user rejected|rejected|denied|declined|cancelled|canceled/.test(lower)) {
     return "The wallet request was cancelled, so AgentFlow did not start the run.";
   }
@@ -829,6 +1628,162 @@ function isBatchCsvAttachment(attachment: PendingChatAttachment | null): boolean
   return mime === "text/csv" || name.endsWith(".csv");
 }
 
+function splitCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (const char of line) {
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (char === "," && !inQuotes) {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  cells.push(current.trim());
+  return cells.map((cell) => cell.replace(/^["']|["']$/g, "").trim());
+}
+
+function buildSplitPromptFromCsv(name: string, csvText: string): string | null {
+  const lowerName = name.toLowerCase();
+  const lines = csvText
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const firstLine = lines[0]?.toLowerCase() ?? "";
+  const isSplit = lowerName.includes("split") || firstLine.split(/\t|,/).some((cell) => cell.trim() === "split");
+  if (!isSplit) return null;
+
+  const headerIndex = lines.findIndex((line) => {
+    const normalized = splitCsvLine(line).map((cell) => cell.toLowerCase().replace(/[_-]+/g, " "));
+    return normalized.some((cell) => ["recipient", "address", "wallet", "to"].includes(cell));
+  });
+  if (headerIndex < 0) return null;
+
+  const headers = splitCsvLine(lines[headerIndex]).map((cell) => cell.toLowerCase().replace(/[_-]+/g, " "));
+  const recipientIndex = headers.findIndex((cell) => ["recipient", "address", "wallet", "to"].includes(cell));
+  const noteIndex = headers.findIndex((cell) => ["note", "remark", "memo", "description"].includes(cell));
+  if (recipientIndex < 0) return null;
+
+  const rows = lines.slice(headerIndex + 1).map(splitCsvLine).filter((cells) => cells.length > recipientIndex);
+  const recipients = rows.map((cells) => cells[recipientIndex]).filter(Boolean);
+  if (recipients.length < 2) return null;
+
+  const firstCells = splitCsvLine(lines[0] ?? "");
+  const titleAmount = Number((lines[0]?.match(/(\d+(?:\.\d+)?)\s*(?:usdc|usd)?/i)?.[1] ?? "").trim());
+  const total = titleAmount;
+  if (!Number.isFinite(total) || total <= 0) return null;
+
+  const notes = noteIndex >= 0 ? rows.map((cells) => cells[noteIndex]?.trim() ?? "").filter(Boolean) : [];
+  const uniqueNotes = Array.from(new Set(notes));
+  const titleRemark =
+    firstCells[0]?.toLowerCase() === "split" && firstCells.length >= 3
+      ? firstCells
+          .slice(2)
+          .join(" ")
+          .replace(/\b(?:usdc|usd|total|amount|remark|note)\b/gi, "")
+          .trim()
+      : (lines[0]?.match(/\b(?:for|remark|note)\s+(.+)$/i)?.[1] ?? "").trim();
+  const remark = uniqueNotes.length === 1 ? uniqueNotes[0] : titleRemark;
+  return `split ${total} USDC between ${recipients.join(", ")}${remark ? ` for ${remark}` : ""}`;
+}
+
+function buildSchedulePromptFromCsv(name: string, csvText: string): string | null {
+  const lowerName = name.toLowerCase();
+  const lines = csvText
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return null;
+
+  const firstCells = splitCsvLine(lines[0]).map((cell) => cell.toLowerCase().replace(/[_-]+/g, " "));
+  const looksLikeSchedule =
+    /\bscheduled?[_-]?payment\b|\bschedule\b/.test(lowerName) ||
+    firstCells.includes("schedule") ||
+    firstCells.includes("schedule name") ||
+    firstCells.includes("frequency") ||
+    firstCells.includes("cadence");
+  if (!looksLikeSchedule) return null;
+
+  const headerIndex = lines.findIndex((line) => {
+    const normalized = splitCsvLine(line).map((cell) => cell.toLowerCase().replace(/[_-]+/g, " "));
+    return (
+      normalized.some((cell) => ["recipient", "address", "wallet", "to"].includes(cell)) &&
+      normalized.some((cell) => cell === "amount" || cell.startsWith("amount "))
+    );
+  });
+  if (headerIndex < 0) return null;
+
+  const headers = splitCsvLine(lines[headerIndex]).map((cell) => cell.toLowerCase().replace(/[_-]+/g, " "));
+  const recipientIndex = headers.findIndex((cell) => ["recipient", "address", "wallet", "to"].includes(cell));
+  const amountIndex = headers.findIndex((cell) => cell === "amount" || cell.startsWith("amount "));
+  const currencyIndex = headers.findIndex((cell) => ["currency", "token", "asset"].includes(cell));
+  const frequencyIndex = headers.findIndex((cell) => ["frequency", "cadence", "schedule"].includes(cell));
+  const dayIndex = headers.findIndex((cell) => ["day", "weekday", "day of week", "day of month"].includes(cell));
+  const noteIndex = headers.findIndex((cell) => ["note", "remark", "memo", "description"].includes(cell));
+  if (recipientIndex < 0 || amountIndex < 0 || frequencyIndex < 0) return null;
+
+  const rows = lines.slice(headerIndex + 1).map(splitCsvLine).filter((cells) => cells.length > Math.max(recipientIndex, amountIndex, frequencyIndex));
+  if (rows.length !== 1) return null;
+
+  const row = rows[0];
+  const recipient = row[recipientIndex]?.trim();
+  const amount = Number((row[amountIndex] ?? "").replace(/[$,]/g, ""));
+  const currency = (currencyIndex >= 0 ? row[currencyIndex] : "USDC")?.trim().toUpperCase() || "USDC";
+  const frequency = (row[frequencyIndex] ?? "").trim().toLowerCase();
+  const day = dayIndex >= 0 ? (row[dayIndex] ?? "").trim() : "";
+  const remark = noteIndex >= 0 ? (row[noteIndex] ?? "").trim() : "";
+  if (!recipient || !Number.isFinite(amount) || amount <= 0 || !frequency) return null;
+
+  let cadence = frequency;
+  if (/weekly|week/.test(frequency)) {
+    cadence = day ? `every ${day.toLowerCase()}` : "weekly";
+  } else if (/monthly|month/.test(frequency)) {
+    cadence = day ? `every ${day.toLowerCase()}` : "monthly";
+  } else if (/daily|day/.test(frequency)) {
+    cadence = "daily";
+  }
+
+  return `schedule ${amount} ${currency} to ${recipient} ${cadence}${remark ? ` for ${remark}` : ""}`;
+}
+
+function buildInvoicePromptFromCsv(name: string, csvText: string): string | null {
+  const lines = csvText
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length < 3) return null;
+
+  const marker = splitCsvLine(lines[0])[0]?.trim().toLowerCase();
+  if (marker !== "invoice") return null;
+
+  const headers = splitCsvLine(lines[1]).map((cell) => cell.toLowerCase().replace(/[_-]+/g, " "));
+  const recipientIndex = headers.findIndex((cell) => ["recipient", "address", "wallet", "to", "vendor", "vendor handle"].includes(cell));
+  const amountIndex = headers.findIndex((cell) => cell === "amount" || cell.startsWith("amount "));
+  const currencyIndex = headers.findIndex((cell) => ["currency", "token", "asset"].includes(cell));
+  const descriptionIndex = headers.findIndex((cell) => ["description", "remark", "note", "memo", "for"].includes(cell));
+  if (recipientIndex < 0 || amountIndex < 0) return null;
+
+  const rows = lines.slice(2).map(splitCsvLine).filter((cells) => cells.length > Math.max(recipientIndex, amountIndex));
+  if (rows.length !== 1) return null;
+
+  const row = rows[0];
+  const recipient = row[recipientIndex]?.trim();
+  const amount = Number((row[amountIndex] ?? "").replace(/[$,]/g, ""));
+  const currency = (currencyIndex >= 0 ? row[currencyIndex] : "USDC")?.trim().toUpperCase() || "USDC";
+  const description = descriptionIndex >= 0 ? (row[descriptionIndex] ?? "").trim() : "";
+  if (!recipient || !Number.isFinite(amount) || amount <= 0 || currency !== "USDC") return null;
+
+  return `create invoice for ${recipient} ${amount} USDC${description ? ` for ${description}` : ""}`;
+}
+
 function buildExecutionBlockResult(input: {
   intent: "Swap" | "Vault";
   vaultAction?: VaultAction;
@@ -908,50 +1863,6 @@ function buildExecutionBlockResult(input: {
         ],
       };
     }
-  }
-
-  if (input.vaultAction === "usyc_deposit") {
-    if (input.needsGasFunding && input.needsUsdcFunding) {
-        return {
-          blocked: true,
-          content: `I did not start the USYC subscribe because your execution wallet has no usable USDC on Arc yet.\n\nFund the execution wallet first, then try again.\n\n${addressLine}`,
-          trace: [
-            "USYC subscribe preflight stopped before payment",
-            "Execution wallet needs USDC on Arc for fees and the USYC position",
-          ],
-        };
-    }
-    if (input.needsGasFunding) {
-      return {
-        blocked: true,
-        content: `I did not start the USYC subscribe because your execution wallet does not have enough USDC on Arc yet.\n\nAdd a little more USDC for fees, then try again.\n\n${addressLine}`,
-        trace: [
-          "USYC subscribe preflight stopped before payment",
-          "Execution wallet needs more USDC on Arc for fees",
-        ],
-      };
-    }
-    if (input.needsUsdcFunding) {
-      return {
-        blocked: true,
-        content: `I did not start the USYC subscribe because your execution wallet has no USDC available to subscribe.\n\nSend USDC to the execution wallet, then try again.\n\n${addressLine}`,
-        trace: [
-          "USYC subscribe preflight stopped before payment",
-          "Execution wallet needs USDC balance to subscribe into USYC",
-        ],
-      };
-    }
-  }
-
-  if (input.vaultAction === "usyc_withdraw" && input.needsGasFunding) {
-    return {
-      blocked: true,
-      content: `I did not start the USYC redeem because your execution wallet does not have enough USDC on Arc for fees yet.\n\nAdd a little more USDC for fees, then try again.\n\n${addressLine}`,
-      trace: [
-        "USYC redeem preflight stopped before payment",
-        "Execution wallet needs more USDC on Arc for fees",
-      ],
-    };
   }
 
   if (input.vaultAction === "withdraw") {
@@ -1114,10 +2025,12 @@ function WalletPill({
   isAuthenticated,
   onSignIn,
   signInLoading,
+  signInError,
 }: {
   isAuthenticated: boolean;
   onSignIn: () => void;
   signInLoading: boolean;
+  signInError?: string | null;
 }) {
   return (
     <ConnectButton.Custom>
@@ -1157,24 +2070,31 @@ function WalletPill({
         }
 
         return (
-          <div className="flex items-center gap-2">
-            {!isAuthenticated ? (
+          <div className="flex flex-col items-end gap-2">
+            <div className="flex items-center gap-2">
+              {!isAuthenticated ? (
+                <button
+                  type="button"
+                  onClick={onSignIn}
+                  disabled={signInLoading}
+                  className="rounded-[10px] bg-[#f2ca50] px-5 py-2.5 text-sm font-semibold text-[#221900] shadow-[0_12px_34px_rgba(242,202,80,0.18)] transition hover:brightness-110 disabled:opacity-70"
+                >
+                  {signInLoading ? "Signing..." : "Sign session"}
+                </button>
+              ) : null}
               <button
                 type="button"
-                onClick={onSignIn}
-                disabled={signInLoading}
-                className="af-btn-primary af-transition rounded-full px-4 py-2 text-sm font-semibold transition hover:brightness-110 disabled:opacity-60"
+                onClick={openAccountModal}
+                className="rounded-full border border-white/10 bg-[#131313] px-5 py-2.5 text-sm font-semibold text-white/75 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition hover:bg-white/5 hover:text-white/90"
               >
-                {signInLoading ? "Signing..." : "Sign session"}
+                {account.displayName}
               </button>
+            </div>
+            {!isAuthenticated && signInError ? (
+              <div className="max-w-[320px] text-right text-xs text-rose-300">
+                {signInError}
+              </div>
             ) : null}
-            <button
-              type="button"
-              onClick={openAccountModal}
-              className="rounded-full border border-white/10 bg-[#131313] px-4 py-2 text-sm text-white/90 transition hover:bg-white/5"
-            >
-              {account.displayName}
-            </button>
           </div>
         );
       }}
@@ -1187,15 +2107,17 @@ function ChatPageInner() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const { address, isConnected } = useAccount();
+  const { address, isConnected, connector } = useAccount();
   const { data: walletClient } = useWalletClient();
   const chainId = useChainId();
+  const { switchChainAsync } = useSwitchChain();
   const { openConnectModal } = useConnectModal();
   const {
     isAuthenticated,
     getAuthHeaders,
     signIn,
     loading: signInLoading,
+    error: signInError,
   } = useAgentJwt();
 
   const initialTab = (searchParams.get("tab") as PromptTab | null) ?? "Research";
@@ -1217,6 +2139,15 @@ function ChatPageInner() {
     setChatSessionId(createChatSessionId());
   }, []);
   const [pendingAttachment, setPendingAttachment] = useState<PendingChatAttachment | null>(null);
+  const [pendingBridgeDraft, setPendingBridgeDraft] = useState<PendingBridgeDraft | null>(null);
+  const [pendingBridgeSelection, setPendingBridgeSelection] = useState<PendingBridgeSelection | null>(null);
+  const [pendingSwapSelection, setPendingSwapSelection] = useState<PendingSwapSelection | null>(null);
+  const [pendingSwapDraft, setPendingSwapDraft] = useState<PendingSwapDraft | null>(null);
+  const [pendingVaultSelection, setPendingVaultSelection] = useState<PendingVaultSelection | null>(null);
+  const [pendingVaultDraft, setPendingVaultDraft] = useState<PendingVaultDraft | null>(null);
+  const [cachedExecutionWalletAddress, setCachedExecutionWalletAddress] = useState<
+    `0x${string}` | null
+  >(null);
   const [voicePaymentLabel, setVoicePaymentLabel] = useState<string | null>(null);
   const [messages, setMessages] = useState<LiveChatMessage[]>([]);
   const [recentChats, setRecentChats] = useState<ChatHistoryItem[]>([]);
@@ -1225,6 +2156,21 @@ function ChatPageInner() {
   const abortRef = useRef<AbortController | null>(null);
   const previousWalletRef = useRef<string | null | undefined>(undefined);
   const [queuedResearchJobId, setQueuedResearchJobId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!address) {
+      setCachedExecutionWalletAddress(null);
+      return;
+    }
+
+    const cached = loadCachedExecutionWalletAddress(address);
+    if (cached) {
+      setCachedExecutionWalletAddress(cached);
+      return;
+    }
+
+    setCachedExecutionWalletAddress(null);
+  }, [address]);
 
   const selectedCategory = tabCategoryMap[selectedTab];
   const hasConversation = messages.length > 0;
@@ -1252,6 +2198,41 @@ function ChatPageInner() {
     () => [executionTarget, ...activeContexts],
     [executionTarget, activeContexts],
   );
+  const executionWarmKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const authHeaders = getAuthHeaders();
+    if (!isAuthenticated || !authHeaders?.Authorization) {
+      executionWarmKeyRef.current = null;
+      return;
+    }
+
+    const warmKey = `${address?.toLowerCase() ?? "unknown"}::${authHeaders.Authorization}`;
+    if (executionWarmKeyRef.current === warmKey) {
+      return;
+    }
+    executionWarmKeyRef.current = warmKey;
+
+    let cancelled = false;
+    void fetchExecutionWalletSummary(authHeaders)
+      .then((summary) => {
+        if (cancelled || !summary.userAgentWalletAddress || !address) {
+          return;
+        }
+        const executionWalletAddress = getAddress(
+          summary.userAgentWalletAddress,
+        ) as `0x${string}`;
+        setCachedExecutionWalletAddress(executionWalletAddress);
+        persistExecutionWalletAddress(address, executionWalletAddress);
+      })
+      .catch(() => {
+        /* Ignore background cache warmup failures. */
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [address, getAuthHeaders, isAuthenticated]);
 
   useEffect(() => {
     if (!queuedResearchJobId) {
@@ -1280,10 +2261,19 @@ function ChatPageInner() {
         const job = (await res.json()) as {
           status?: string;
           result?: string;
+          reportPayload?: Extract<PipelineEvent, { type: "report" }> | null;
+          receipt?: Extract<PipelineEvent, { type: "receipt" }> | null;
           error?: string;
         };
         if (job.status === "done" && typeof job.result === "string" && job.result.trim()) {
           const reportText = job.result.trim();
+          const reportPayload =
+            job.reportPayload && job.reportPayload.type === "report"
+              ? job.reportPayload
+              : ({
+                  type: "report",
+                  markdown: reportText,
+                } as Extract<PipelineEvent, { type: "report" }>);
           setQueuedResearchJobId(null);
           setMessages((previous) => [
             ...previous,
@@ -1292,6 +2282,11 @@ function ChatPageInner() {
               role: "assistant",
               title: "AgentFlow",
               content: reportText,
+              reportMeta: buildResearchReportMeta(reportPayload),
+              paymentMeta:
+                job.receipt?.entries && job.receipt.entries.length > 0
+                  ? { entries: job.receipt.entries }
+                  : undefined,
               status: "complete",
             },
           ]);
@@ -1397,6 +2392,8 @@ function ChatPageInner() {
     setMessages([]);
     setInput("");
     setPendingAttachment(null);
+    setPendingBridgeDraft(null);
+    setPendingBridgeSelection(null);
     setVoicePaymentLabel(null);
     setIsPaymentPanelOpen(false);
     setQueuedResearchJobId(null);
@@ -1444,12 +2441,102 @@ function ChatPageInner() {
     );
   };
 
+  const handleAssistantFeedback = async (
+    messageId: string,
+    feedback: "positive" | "negative",
+  ) => {
+    const target = messages.find((message) => message.id === messageId);
+    if (!target?.eventId) {
+      return;
+    }
+    updateMessage(messageId, (message) => ({ ...message, feedback }));
+    try {
+      await fetch("/api/chat/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          event_id: target.eventId,
+          feedback,
+        }),
+      });
+    } catch {
+      updateMessage(messageId, (message) => ({ ...message, feedback: undefined }));
+    }
+  };
+
+  const handleAgentRating = async (
+    messageId: string,
+    stars: number,
+    ratingMeta: NonNullable<LiveChatMessage["ratingMeta"]>,
+  ) => {
+    const headers = getAuthHeaders();
+    if (!headers?.Authorization) {
+      return;
+    }
+
+    updateMessage(messageId, (message) => ({
+      ...message,
+      ratingMeta: message.ratingMeta ?? ratingMeta,
+      agentRating: {
+        stars,
+        status: "pending",
+      },
+    }));
+
+    try {
+      const response = await fetch("/api/agent-ratings", {
+        method: "POST",
+        headers: {
+          ...headers,
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+        body: JSON.stringify({
+          ...ratingMeta,
+          stars,
+          surface: "web",
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: string;
+        status?: "pending" | "confirmed" | "failed";
+        reputationTx?: string | null;
+      };
+      if (!response.ok) {
+        throw new Error(payload.error || "Unable to rate this paid task.");
+      }
+
+      updateMessage(messageId, (message) => ({
+        ...message,
+        ratingMeta: message.ratingMeta ?? ratingMeta,
+        agentRating: {
+          stars,
+          status: payload.status === "confirmed" ? "confirmed" : "pending",
+          reputationTx: payload.reputationTx ?? null,
+        },
+      }));
+    } catch (error) {
+      updateMessage(messageId, (message) => ({
+        ...message,
+        ratingMeta: message.ratingMeta ?? ratingMeta,
+        agentRating: {
+          stars,
+          status: "failed",
+          error: error instanceof Error ? error.message : "Unable to rate this paid task.",
+        },
+      }));
+    }
+  };
+
   const resetChatThread = () => {
     abortRef.current?.abort();
     abortRef.current = null;
     setMessages([]);
     setInput("");
     setPendingAttachment(null);
+    setPendingBridgeDraft(null);
+    setPendingBridgeSelection(null);
     setVoicePaymentLabel(null);
     setIsPaymentPanelOpen(false);
     setQueuedResearchJobId(null);
@@ -1461,6 +2548,9 @@ function ChatPageInner() {
     setSelectedTab(item.tab);
     setInput(item.prompt);
     setPendingAttachment(null);
+    setPendingBridgeDraft(null);
+    setPendingBridgeSelection(null);
+    setPendingVaultDraft(null);
     setVoicePaymentLabel(null);
   }, []);
 
@@ -1530,8 +2620,9 @@ function ChatPageInner() {
         message?: string;
         success?: boolean;
         error?: string;
-        payment?: LiveChatMessage["paymentMeta"];
+        payment?: AgentRunPayment;
       };
+      const paymentMeta = buildPaymentMetaFromResult(input.action, payload);
 
       const fallbackMessage =
         input.action === "split"
@@ -1550,8 +2641,8 @@ function ChatPageInner() {
             : typeof payload.error === "string" && payload.error.trim()
               ? friendlyChatErrorMessage(payload.error, fallbackMessage)
             : fallbackMessage,
-        paymentMeta: payload.payment ?? message.paymentMeta,
-        activityMeta: payload.payment
+        paymentMeta: paymentMeta ?? message.paymentMeta,
+        activityMeta: paymentMeta
           ? {
               mode: "brain",
               clusters: [
@@ -1807,21 +2898,1587 @@ function ChatPageInner() {
       throw new Error("No speech was recognized in that recording.");
     }
 
-    setVoicePaymentLabel(formatVoicePaymentLabel(result, paidContext.address));
+    setVoicePaymentLabel(null);
     return text;
+  };
+
+  const resolveBridgeSessionContext = async (assistantId: string) => {
+    if (!address) {
+      updateMessage(assistantId, (message) => ({
+        ...message,
+        content: "Connect your wallet to prepare a bridge.",
+        trace: [...(message.trace || []), "Wallet connection required for bridge flow"],
+        status: "error",
+      }));
+      setIsStreaming(false);
+      openConnectModal?.();
+      return null;
+    }
+
+    let authHeaders = getAuthHeaders();
+    if (!isAuthenticated || !authHeaders) {
+      const sessionMessage = buildSessionSignatureMessage("EOA");
+      updateMessage(assistantId, (message) => ({
+        ...message,
+        content: sessionMessage.content,
+        trace: [...(message.trace || []), sessionMessage.trace],
+        status: "streaming",
+      }));
+
+      try {
+        await signIn();
+        authHeaders = authHeadersForWallet(address);
+      } catch (error) {
+        updateMessage(assistantId, (message) => ({
+          ...message,
+          content: friendlyChatErrorMessage(error, "Bridge session signing failed."),
+          trace: [...(message.trace || []), "Bridge session signing failed"],
+          status: "error",
+        }));
+        setIsStreaming(false);
+        return null;
+      }
+    }
+
+    if (!authHeaders) {
+      updateMessage(assistantId, (message) => ({
+        ...message,
+        content: "The signed session was not available after wallet confirmation.",
+        trace: [...(message.trace || []), "Bridge session was not attached"],
+        status: "error",
+      }));
+      setIsStreaming(false);
+      return null;
+    }
+
+    updateMessage(assistantId, (message) => ({
+      ...message,
+      content: "Secure session ready. Preparing your bridge destination wallet.",
+      trace: [...(message.trace || []), "Secure bridge session confirmed"],
+      status: "streaming",
+    }));
+
+    return {
+      payerAddress: getAddress(address) as `0x${string}`,
+      authHeaders,
+    };
+  };
+
+  const fetchBridgeSourceHoldings = async (
+    owner: `0x${string}`,
+  ): Promise<BridgeSourceHolding[]> => {
+    const entries = Object.entries(BRIDGE_SOURCE_CONFIG) as Array<
+      [BridgeSource, (typeof BRIDGE_SOURCE_CONFIG)[BridgeSource]]
+    >;
+
+    const holdings = await Promise.all(
+      entries.map(async ([sourceChain, sourceConfig]) => {
+        const publicClient = createPublicClient({
+          chain: sourceConfig.chain,
+          transport: http(),
+        });
+
+        const [usdcBalanceRaw, nativeBalanceRaw] = await Promise.all([
+          publicClient
+            .readContract({
+              address: sourceConfig.usdcAddress,
+              abi: ERC20_ALLOWANCE_ABI,
+              functionName: "balanceOf",
+              args: [owner],
+            })
+            .then((value) => value as bigint)
+            .catch(() => BigInt(0)),
+          publicClient.getBalance({ address: owner }).catch(() => BigInt(0)),
+        ]);
+
+        return {
+          sourceChain,
+          label: sourceConfig.label,
+          usdcBalanceRaw,
+          nativeBalanceRaw,
+        };
+      }),
+    );
+
+    return holdings.sort((a, b) => {
+      if (a.usdcBalanceRaw === b.usdcBalanceRaw) {
+        return a.label.localeCompare(b.label);
+      }
+      return a.usdcBalanceRaw > b.usdcBalanceRaw ? -1 : 1;
+    });
+  };
+
+  const prepareBridgeDraftInChat = async (input: {
+    assistantId: string;
+    amount: number;
+    sourceChain: BridgeSource;
+    bridgeContext: {
+      payerAddress: `0x${string}`;
+      authHeaders: Record<string, string>;
+    };
+  }) => {
+    const { assistantId, amount, sourceChain, bridgeContext } = input;
+    const sourceConfig = BRIDGE_SOURCE_CONFIG[sourceChain];
+    const knownDestination = cachedExecutionWalletAddress;
+    updateMessage(assistantId, (message) => ({
+      ...message,
+      content: `Preparing a ${amount} USDC bridge from ${sourceConfig.label} to Arc.`,
+      trace: [
+        `Source chain: ${sourceConfig.label}`,
+        knownDestination
+          ? `Using your AgentFlow wallet on Arc (${knownDestination})`
+          : "Loading your AgentFlow wallet on Arc",
+      ],
+      status: "streaming",
+    }));
+
+    const userDcwAddress = await (async () => {
+      if (knownDestination) {
+        return knownDestination;
+      }
+
+      const slowPrepTimer = window.setTimeout(() => {
+        updateMessage(assistantId, (message) => ({
+          ...message,
+          content: `Still preparing your ${sourceConfig.label} bridge. This first session can take a few extra seconds while AgentFlow loads your Arc wallet address.`,
+          trace: [...(message.trace || []), "Still loading your AgentFlow wallet address for this browser session"],
+          status: "streaming",
+        }));
+      }, 4000);
+
+      try {
+        const executionSummary = await fetchExecutionWalletSummary(bridgeContext.authHeaders);
+        const destination = getAddress(
+          executionSummary.userAgentWalletAddress,
+        ) as `0x${string}`;
+        setCachedExecutionWalletAddress(destination);
+        persistExecutionWalletAddress(bridgeContext.payerAddress, destination);
+        return destination;
+      } finally {
+        window.clearTimeout(slowPrepTimer);
+      }
+    })();
+
+    updateMessage(assistantId, (message) => ({
+      ...message,
+      content: `Preparing a ${amount} USDC bridge from ${sourceConfig.label} to Arc.`,
+      trace: [
+        `Source chain: ${sourceConfig.label}`,
+        `Mint recipient: ${userDcwAddress}`,
+        "Bridge will use your connected wallet for approval and burn",
+        "Circle Forwarder will complete the Arc mint",
+      ],
+      status: "streaming",
+    }));
+
+    updateMessage(assistantId, (message) => ({
+      ...message,
+      content: `Preparing a ${amount} USDC bridge from ${sourceConfig.label} to Arc.`,
+      trace: [...(message.trace || []), "AgentFlow is validating the native Circle bridge route"],
+      status: "streaming",
+    }));
+
+    setPendingBridgeDraft({
+      assistantId,
+      sourceChain,
+      amount,
+      payerAddress: bridgeContext.payerAddress,
+      userDcwAddress,
+      authHeaders: bridgeContext.authHeaders,
+    });
+
+    updateMessage(assistantId, (message) => ({
+      ...message,
+      content:
+        `Ready to bridge ${amount} USDC from ${sourceConfig.label} to Arc.\n\n` +
+        `Your USDC will arrive in your AgentFlow wallet (${userDcwAddress}).\n\n` +
+        `Click Yes, bridge to approve USDC if needed, sign the source-chain bridge in your browser wallet, then let AgentFlow record the bridge receipt and nanopayment after Circle forwards the funds to Arc.`,
+      trace: [
+        ...(message.trace || []),
+        "Native Circle bridge route ready",
+        "Next wallet actions happen on the source chain first",
+        "AgentFlow records the paid bridge receipt after Circle completes the forwarder mint to Arc",
+      ],
+      confirmation: {
+        required: true,
+        action: "bridge",
+      },
+      status: "complete",
+    }));
+  };
+
+  const continuePendingBridgeSelection = async (input: {
+    amount: number;
+    selection: PendingBridgeSelection;
+  }) => {
+    const { amount, selection } = input;
+    setIsStreaming(true);
+    const followupAssistantId = `assistant-bridge-${Date.now()}`;
+
+    setMessages((previous) => [
+      ...previous,
+      {
+        id: followupAssistantId,
+        role: "assistant",
+        title: "Bridge",
+        content: "",
+        trace: [],
+        status: "streaming",
+      },
+    ]);
+
+    try {
+      await prepareBridgeDraftInChat({
+        assistantId: followupAssistantId,
+        amount,
+        sourceChain: selection.sourceChain,
+        bridgeContext: {
+          payerAddress: selection.payerAddress,
+          authHeaders: selection.authHeaders,
+        },
+      });
+      setPendingBridgeSelection(null);
+    } catch (error) {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content: friendlyChatErrorMessage(error, "Bridge flow failed."),
+        trace: [...(message.trace || []), "Bridge flow failed"],
+        status: "error",
+      }));
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  const continuePendingVaultSelection = async (input: {
+    amount: number;
+    selection: PendingVaultSelection;
+  }) => {
+    const { amount, selection } = input;
+    setIsStreaming(true);
+    const followupAssistantId = `assistant-vault-${Date.now()}`;
+    const assetSymbol = vaultAssetSymbol(selection.vaultSymbol);
+    const vaultAddress = VAULT_ADDRESS_BY_SYMBOL[selection.vaultSymbol];
+
+    setMessages((previous) => [
+      ...previous,
+      {
+        id: followupAssistantId,
+        role: "assistant",
+        title: "Vault",
+        content: "",
+        trace: [],
+        status: "streaming",
+      },
+    ]);
+
+    try {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content: `Preparing a vault ${selection.action} preview for ${amount} ${assetSymbol}.`,
+        trace: [
+          `Vault selected: ${vaultLabel(selection.vaultSymbol)}`,
+          `Amount captured: ${amount} ${assetSymbol}`,
+          "AgentFlow is preparing the live vault preview",
+        ],
+        status: "streaming",
+      }));
+
+      const result = await runPaidAgent<VaultAgentResponse & AgentRunPaymentResult, Record<string, unknown>>({
+        slug: "vault",
+        walletClient: walletClient!,
+        payer: selection.payerAddress,
+        authHeaders: selection.authHeaders,
+        onAwaitSignature: () => {
+          const paymentMessage = buildPaymentSignatureMessage("DCW");
+          updateMessage(followupAssistantId, (message) => ({
+            ...message,
+            content: paymentMessage.content,
+            trace: [...(message.trace || []), paymentMessage.trace],
+            status: "streaming",
+          }));
+        },
+        body: {
+          action: selection.action,
+          amount,
+          walletAddress: selection.payerAddress,
+          executionTarget: "DCW",
+          vaultAddress,
+          vaultSymbol: selection.vaultSymbol,
+          amountTokenHint: assetSymbol,
+        },
+      });
+
+      if (!result.success) {
+        throw new Error(result.error || "Vault preview failed");
+      }
+
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content:
+          selection.action === "deposit"
+            ? `Ready to deposit ${amount} ${assetSymbol} into ${vaultLabel(selection.vaultSymbol)}.\n\nReply YES to continue or NO to cancel.`
+            : `Ready to withdraw ${amount} ${assetSymbol} from ${vaultLabel(selection.vaultSymbol)}.\n\nReply YES to continue or NO to cancel.`,
+        trace: [...(message.trace || []), "Vault preview is ready"],
+        confirmation: {
+          required: true,
+          action: "vault",
+        },
+        status: "complete",
+      }));
+      setPendingVaultDraft({
+        assistantId: followupAssistantId,
+        action: selection.action,
+        vaultSymbol: selection.vaultSymbol,
+        vaultAddress,
+        amount,
+        payerAddress: selection.payerAddress,
+        authHeaders: selection.authHeaders,
+      });
+      setPendingVaultSelection(null);
+    } catch (error) {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content: friendlyChatErrorMessage(error, "Vault preparation failed."),
+        trace: [...(message.trace || []), "Vault preparation failed"],
+        status: "error",
+      }));
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  const continuePendingSwapSelection = async (input: {
+    amount: number;
+    selection: PendingSwapSelection;
+  }) => {
+    const { amount, selection } = input;
+    const followupAssistantId = selection.assistantId;
+    const syntheticPrompt = `swap ${amount} ${selection.tokenInSymbol} to ${selection.tokenOutSymbol}`;
+    const { tokenIn, tokenOut, swapSpends } = resolveSwapTokenPair(syntheticPrompt);
+    const tokenPair = { tokenIn, tokenOut };
+    const slippage = 1;
+
+    try {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content: "Fetching a live quote and routing the swap through AgentFlow Swap.",
+        trace: [
+          swapSpends === "eurc"
+            ? `Preparing ${amount} EURC -> USDC swap request`
+            : `Preparing ${amount} USDC -> EURC swap request`,
+          `Using ${slippage}% slippage guard`,
+          "Execution target: DCW",
+        ],
+        status: "streaming",
+      }));
+
+      const result = await runPaidAgent<SwapAgentResponse & AgentRunPaymentResult, Record<string, unknown>>({
+        slug: "swap",
+        walletClient: walletClient!,
+        payer: selection.payerAddress,
+        authHeaders: selection.authHeaders,
+        onAwaitSignature: () => {
+          const paymentMessage = buildPaymentSignatureMessage("DCW");
+          updateMessage(followupAssistantId, (message) => ({
+            ...message,
+            content: paymentMessage.content,
+            trace: [...(message.trace || []), paymentMessage.trace],
+            status: "streaming",
+          }));
+        },
+        body: {
+          walletAddress: selection.payerAddress,
+          amount,
+          slippage,
+          tokenPair,
+          executionTarget: "DCW",
+        },
+      });
+
+      if (!result.success) {
+        throw new Error(result.error || "Swap agent failed");
+      }
+
+      updateMessage(followupAssistantId, (message) => {
+        const r = result.receipt;
+        const amountIn = r?.amountIn ?? amount;
+        const isPreview = result.action === "preview" && Boolean(result.payload);
+        if (isPreview) {
+          return {
+            ...message,
+            content: buildSwapPreviewContent({
+              amount,
+              tokenInSymbol: selection.tokenInSymbol,
+              tokenOutSymbol: selection.tokenOutSymbol,
+              expectedOutFormatted: result.expectedOutFormatted,
+              optimalSlippage: result.payload?.optimalSlippage,
+              provider: result.provider,
+            }),
+            trace: [
+              ...(message.trace || []),
+              result.provider ? `Provider: ${result.provider}` : "Swap quote prepared",
+              typeof result.payload?.optimalSlippage === "number"
+                ? `Slippage guard: ${result.payload.optimalSlippage}%`
+                : "Slippage guard prepared",
+            ],
+            quickActionGroups: [
+              {
+                title: `${selection.tokenInSymbol} -> ${selection.tokenOutSymbol}`,
+                actions: [
+                  { label: "YES", prompt: "YES" },
+                  { label: "NO", prompt: "NO", tone: "secondary" },
+                ],
+              },
+            ],
+            status: "complete",
+          };
+        }
+
+        const swapReceipt = result.txHash
+          ? buildSwapExecutionContent({
+              amountIn,
+              quoteOutRaw: r?.quoteOutRaw,
+              tokenIn: r?.tokenPair?.tokenIn ?? tokenPair.tokenIn,
+              tokenOut: r?.tokenPair?.tokenOut ?? tokenPair.tokenOut,
+              txHash: result.txHash,
+              explorerLink: r?.explorerLink,
+              approvalTxHash: result.approvalTxHash,
+              approvalExplorerLink: r?.approvalExplorerLink,
+              executionTarget: r?.executionTarget ?? "DCW",
+              provider: result.provider ?? null,
+            })
+          : "";
+        return {
+          ...message,
+          content: result.txHash
+            ? swapReceipt
+            : "Swap completed, but no transaction hash was returned.",
+          trace: [
+            ...(message.trace || []),
+            "Swap quote approved",
+            `Swap executed from ${r?.executionTarget ?? "DCW"}`,
+            result.txHash ? `Swap verified - ${result.txHash.slice(0, 10)}...` : "Swap verified",
+          ],
+          paymentMeta: buildPaymentMetaFromResult("swap", result, selection.payerAddress),
+          status: "complete",
+        };
+      });
+
+      if (result.action === "preview" && result.payload) {
+        setPendingSwapDraft({
+          assistantId: followupAssistantId,
+          payerAddress: selection.payerAddress,
+          authHeaders: selection.authHeaders,
+          amount,
+          tokenPair,
+          tokenInSymbol: selection.tokenInSymbol,
+          tokenOutSymbol: selection.tokenOutSymbol,
+          requestedSlippage: slippage,
+          provider: result.payload.provider,
+          routeData: result.payload.routeData,
+          expectedOutRaw: result.expectedOutRaw || result.payload.quoteAmountOutRaw,
+          quoteOutRaw: result.payload.quoteAmountOutRaw,
+          optimalSlippage: result.payload.optimalSlippage,
+        });
+      }
+      setPendingSwapSelection(null);
+    } catch (error) {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content: friendlyChatErrorMessage(error, "Swap flow failed."),
+        trace: [...(message.trace || []), "Swap flow failed"],
+        status: "error",
+      }));
+    }
+  };
+
+  const executePendingVault = async (draft: PendingVaultDraft) => {
+    const followupAssistantId = `assistant-vault-${Date.now()}-execute`;
+    setMessages((previous) => [
+      ...previous,
+      {
+        id: followupAssistantId,
+        role: "assistant",
+        title: "Vault",
+        content: "",
+        trace: [],
+        status: "streaming",
+      },
+    ]);
+
+    try {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content:
+          draft.action === "deposit"
+            ? `Executing deposit of ${draft.amount} ${vaultAssetSymbol(draft.vaultSymbol)} into ${vaultLabel(draft.vaultSymbol)}.`
+            : `Executing withdraw of ${draft.amount} ${vaultAssetSymbol(draft.vaultSymbol)} from ${vaultLabel(draft.vaultSymbol)}.`,
+        trace: [
+          `Vault selected: ${vaultLabel(draft.vaultSymbol)}`,
+          `Amount confirmed: ${draft.amount} ${vaultAssetSymbol(draft.vaultSymbol)}`,
+          "AgentFlow is executing the vault transaction",
+        ],
+        status: "streaming",
+      }));
+
+      const result = await runPaidAgent<VaultAgentResponse & AgentRunPaymentResult, Record<string, unknown>>({
+        slug: "vault",
+        walletClient: walletClient!,
+        payer: draft.payerAddress,
+        authHeaders: draft.authHeaders,
+        onAwaitSignature: () => {
+          const paymentMessage = buildPaymentSignatureMessage("DCW");
+          updateMessage(followupAssistantId, (message) => ({
+            ...message,
+            content: paymentMessage.content,
+            trace: [...(message.trace || []), paymentMessage.trace],
+            status: "streaming",
+          }));
+        },
+        body: {
+          action: draft.action,
+          amount: draft.amount,
+          walletAddress: draft.payerAddress,
+          executionTarget: "DCW",
+          vaultAddress: draft.vaultAddress,
+          vaultSymbol: draft.vaultSymbol,
+          amountTokenHint: vaultAssetSymbol(draft.vaultSymbol),
+          confirmed: true,
+        },
+      });
+
+      if (!result.success) {
+        throw new Error(result.error || "Vault execution failed");
+      }
+
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content:
+          result.txHash
+              ? buildVaultExecutionContent({
+                  action: draft.action,
+                  txHash: result.txHash,
+                  explorerLink: result.receipt?.explorerLink,
+                  approvalTxHash: result.approvalTxHash,
+                  approvalExplorerLink: result.receipt?.approvalExplorerLink,
+                  provider: result.provider || null,
+                vaultSymbol: result.vaultSymbol || draft.vaultSymbol,
+                sharesReceivedFormatted: result.sharesReceivedFormatted || null,
+                sharesBurnedFormatted: result.sharesBurnedFormatted || null,
+                assetsReceivedFormatted: result.assetsReceivedFormatted || null,
+              })
+            : `Vault ${draft.action} completed.`,
+        trace: [
+          ...(message.trace || []),
+          result.txHash
+            ? `Vault ${draft.action} verified - ${result.txHash.slice(0, 10)}...`
+            : `Vault ${draft.action} complete`,
+        ],
+        paymentMeta: buildPaymentMetaFromResult("vault", result, draft.payerAddress),
+        status: "complete",
+      }));
+      setPendingVaultDraft(null);
+    } catch (error) {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content: friendlyChatErrorMessage(error, "Vault execution failed."),
+        trace: [...(message.trace || []), "Vault execution failed"],
+        quickActionGroups: [
+          {
+            title: vaultLabel(draft.vaultSymbol),
+            actions: [
+              { label: "YES", prompt: "YES" },
+              { label: "NO", prompt: "NO", tone: "secondary" },
+            ],
+          },
+        ],
+        status: "error",
+      }));
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  const executePendingSwap = async (draft: PendingSwapDraft) => {
+    const followupAssistantId = `assistant-swap-${Date.now()}-execute`;
+    setMessages((previous) => [
+      ...previous,
+      {
+        id: followupAssistantId,
+        role: "assistant",
+        title: "Swap",
+        content: "",
+        trace: [],
+        status: "streaming",
+      },
+    ]);
+
+    try {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content: `Executing swap of ${draft.amount} ${draft.tokenInSymbol} to ${draft.tokenOutSymbol}.`,
+        trace: [
+          `Amount confirmed: ${draft.amount} ${draft.tokenInSymbol}`,
+          `Route confirmed: ${draft.tokenInSymbol} -> ${draft.tokenOutSymbol}`,
+          "AgentFlow is executing the swap transaction",
+        ],
+        status: "streaming",
+      }));
+
+      const result = await runPaidAgent<SwapAgentResponse & AgentRunPaymentResult, Record<string, unknown>>({
+        slug: "swap",
+        walletClient: walletClient!,
+        payer: draft.payerAddress,
+        authHeaders: draft.authHeaders,
+        onAwaitSignature: () => {
+          const paymentMessage = buildPaymentSignatureMessage("DCW");
+          updateMessage(followupAssistantId, (message) => ({
+            ...message,
+            content: paymentMessage.content,
+            trace: [...(message.trace || []), paymentMessage.trace],
+            status: "streaming",
+          }));
+        },
+        body: {
+          walletAddress: draft.payerAddress,
+          amount: draft.amount,
+          slippage: draft.requestedSlippage,
+          tokenPair: draft.tokenPair,
+          executionTarget: "DCW",
+          confirmed: true,
+          provider: draft.provider,
+          routeData: draft.routeData,
+          expectedOutRaw: draft.expectedOutRaw,
+        },
+      });
+
+      if (!result.success || !result.txHash) {
+        throw new Error(result.error || "Swap execution failed");
+      }
+      const txHash = result.txHash;
+
+      updateMessage(followupAssistantId, (message) => {
+        const r = result.receipt;
+        const amountIn = r?.amountIn ?? draft.amount;
+        return {
+          ...message,
+          content: buildSwapExecutionContent({
+            amountIn,
+            quoteOutRaw: r?.quoteOutRaw ?? draft.quoteOutRaw,
+            tokenIn: r?.tokenPair?.tokenIn ?? draft.tokenPair.tokenIn,
+            tokenOut: r?.tokenPair?.tokenOut ?? draft.tokenPair.tokenOut,
+            txHash,
+            explorerLink: r?.explorerLink,
+            approvalTxHash: result.approvalTxHash,
+            approvalExplorerLink: r?.approvalExplorerLink,
+            executionTarget: r?.executionTarget ?? "DCW",
+            provider: result.provider ?? null,
+          }),
+          trace: [
+            ...(message.trace || []),
+            "Swap quote approved",
+            `Swap executed from ${r?.executionTarget ?? "DCW"}`,
+            `Swap verified - ${txHash.slice(0, 10)}...`,
+          ],
+          paymentMeta: buildPaymentMetaFromResult("swap", result, draft.payerAddress),
+          status: "complete",
+        };
+      });
+      setPendingSwapDraft(null);
+    } catch (error) {
+      updateMessage(followupAssistantId, (message) => ({
+        ...message,
+        content: friendlyChatErrorMessage(error, "Swap execution failed."),
+        trace: [...(message.trace || []), "Swap execution failed"],
+        quickActionGroups: [
+          {
+            title: `${draft.tokenInSymbol} -> ${draft.tokenOutSymbol}`,
+            actions: [
+              { label: "YES", prompt: "YES" },
+              { label: "NO", prompt: "NO", tone: "secondary" },
+            ],
+          },
+        ],
+        status: "error",
+      }));
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  const executePendingBridge = async (draft: PendingBridgeDraft) => {
+    if (!address) {
+      throw new Error("Connect your wallet to continue the bridge.");
+    }
+
+    const connectedAddress = getAddress(address) as `0x${string}`;
+    if (connectedAddress !== draft.payerAddress) {
+      throw new Error("Reconnect the same wallet you used to prepare this bridge, then try again.");
+    }
+
+    const sourceConfig = BRIDGE_SOURCE_CONFIG[draft.sourceChain];
+    if (!sourceConfig.bridgeKitChain) {
+      throw new Error(
+        `${sourceConfig.label} is not enabled in the native Circle bridge path yet.`,
+      );
+    }
+
+    if (chainId !== sourceConfig.chainId) {
+      updateMessage(draft.assistantId, (message) => ({
+        ...message,
+        content: `Switching your wallet to ${sourceConfig.label} so we can sign the bridge from the source chain.`,
+        trace: [...(message.trace || []), `Requesting wallet network switch to ${sourceConfig.label}`],
+        status: "streaming",
+      }));
+
+      try {
+        await withTimeout(
+          switchChainAsync({ chainId: sourceConfig.chainId }),
+          BRIDGE_SWITCH_TIMEOUT_MS,
+          `Wallet switch to ${sourceConfig.label} timed out. Approve the network switch and try the bridge again.`,
+        );
+      } catch (error) {
+        throw new Error(
+          `Wallet switch to ${sourceConfig.label} was not completed. Approve the network switch and try the bridge again.`,
+        );
+      }
+    }
+
+    if (!connector) {
+      throw new Error("Selected wallet provider is not available. Reconnect your wallet and try the bridge again.");
+    }
+
+    const browserProvider = (await connector.getProvider?.({
+      chainId: sourceConfig.chainId,
+    })) as EIP1193Provider | undefined;
+    if (!browserProvider) {
+      throw new Error(
+        `AgentFlow could not read the selected ${connector.name} provider on ${sourceConfig.label}.`,
+      );
+    }
+
+    updateMessage(draft.assistantId, (message) => ({
+      ...message,
+      content: `Connecting ${connector.name} for your ${sourceConfig.label} bridge.`,
+      trace: [
+        ...(message.trace || []),
+        `Using selected wallet provider: ${connector.name}`,
+        `Connector id: ${connector.id}`,
+      ],
+      status: "streaming",
+    }));
+
+    updateMessage(draft.assistantId, (message) => ({
+      ...message,
+      content: `MetaMask should now prompt for the source-chain bridge on ${sourceConfig.label}.`,
+      trace: [
+        ...(message.trace || []),
+        "Circle BridgeKit will request approval only if it is needed",
+        "Circle Forwarder will handle the Arc mint automatically",
+      ],
+      status: "streaming",
+    }));
+
+    const adapter = await createViemAdapterFromProvider({
+      provider: browserProvider,
+      capabilities: {
+        addressContext: "user-controlled",
+      },
+    });
+
+    const kit = new BridgeKit();
+    const amount = draft.amount.toString();
+    let bridgeStage: "start" | "approve" | "burn" | "attestation" | "mint" = "start";
+    let progressWatchdog: number | null = null;
+
+    const clearProgressWatchdog = () => {
+      if (progressWatchdog != null) {
+        window.clearTimeout(progressWatchdog);
+        progressWatchdog = null;
+      }
+    };
+
+    const scheduleProgressWatchdog = () => {
+      clearProgressWatchdog();
+      const messageByStage: Record<typeof bridgeStage, { content: string; trace: string }> = {
+        start: {
+          content: `Still waiting for the ${sourceConfig.label} bridge confirmation in your browser wallet.`,
+          trace: "Browser wallet confirmation is still pending",
+        },
+        approve: {
+          content: `Approval is done on ${sourceConfig.label}. Circle is still preparing the bridge burn.`,
+          trace: "Waiting for the source-chain burn transaction",
+        },
+        burn: {
+          content: `Burn confirmed on ${sourceConfig.label}. Circle is still waiting on attestation and forwarder delivery to Arc.`,
+          trace: "Waiting for Circle attestation and Arc delivery",
+        },
+        attestation: {
+          content: "Circle attestation is ready. Waiting for the Arc mint confirmation.",
+          trace: "Waiting for the Arc mint confirmation",
+        },
+        mint: {
+          content: "Arc mint is confirmed. AgentFlow is still recording the bridge receipt and nanopayment.",
+          trace: "Waiting for AgentFlow to record the paid bridge receipt",
+        },
+      };
+
+      progressWatchdog = window.setTimeout(() => {
+        const next = messageByStage[bridgeStage];
+        updateMessage(draft.assistantId, (message) => ({
+          ...message,
+          content: next.content,
+          trace: [...(message.trace || []), next.trace],
+          status: "streaming",
+        }));
+      }, 12000);
+    };
+
+    const bridgeEventHandler: Parameters<BridgeKit["on"]>[1] = (event) => {
+      const method = typeof event?.method === "string" ? event.method : "";
+      const values = event?.values;
+      const txHash =
+        values &&
+        typeof values === "object" &&
+        "txHash" in values &&
+        typeof values.txHash === "string"
+          ? values.txHash
+          : null;
+
+      if (/approve/i.test(method)) {
+        bridgeStage = "approve";
+        updateMessage(draft.assistantId, (message) => ({
+          ...message,
+          content: `Approval confirmed on ${sourceConfig.label}. Circle is now preparing the source-chain burn.`,
+          trace: [
+            ...(message.trace || []),
+            ...(txHash
+              ? [
+                  {
+                    label: "Approval confirmed",
+                    txHash,
+                    explorerUrl: bridgeTxExplorerUrl(draft.sourceChain, txHash),
+                  },
+                ]
+              : ["Approval confirmed"]),
+          ],
+          status: "streaming",
+        }));
+        scheduleProgressWatchdog();
+        return;
+      }
+
+      if (/burn/i.test(method)) {
+        bridgeStage = "burn";
+        updateMessage(draft.assistantId, (message) => ({
+          ...message,
+          content: `Burn confirmed on ${sourceConfig.label}. Waiting for Circle attestation before forwarding the funds to Arc.`,
+          trace: [
+            ...(message.trace || []),
+            ...(txHash
+              ? [
+                  {
+                    label: "Burn confirmed",
+                    txHash,
+                    explorerUrl: bridgeTxExplorerUrl(draft.sourceChain, txHash),
+                  },
+                ]
+              : ["Burn confirmed"]),
+          ],
+          status: "streaming",
+        }));
+        scheduleProgressWatchdog();
+        return;
+      }
+
+      if (/fetchAttestation/i.test(method)) {
+        bridgeStage = "attestation";
+        updateMessage(draft.assistantId, (message) => ({
+          ...message,
+          content: "Circle attestation received. Waiting for the Arc mint confirmation.",
+          trace: [...(message.trace || []), "Circle attestation received"],
+          status: "streaming",
+        }));
+        scheduleProgressWatchdog();
+        return;
+      }
+
+      if (/mint/i.test(method)) {
+        bridgeStage = "mint";
+        updateMessage(draft.assistantId, (message) => ({
+          ...message,
+          content: "Arc mint confirmed. AgentFlow is now recording the bridge receipt and nanopayment.",
+          trace: [
+            ...(message.trace || []),
+            ...(txHash
+              ? [
+                  {
+                    label: "Arc mint confirmed",
+                    txHash,
+                    explorerUrl: arcTxExplorerUrl(txHash),
+                  },
+                ]
+              : ["Arc mint confirmed"]),
+          ],
+          status: "streaming",
+        }));
+        scheduleProgressWatchdog();
+      }
+    };
+
+    kit.on("*", bridgeEventHandler);
+
+    updateMessage(draft.assistantId, (message) => ({
+      ...message,
+      content: `Running the native Circle bridge from ${sourceConfig.label} to Arc.`,
+      trace: [...(message.trace || []), "Waiting for Circle to complete the bridge flow"],
+      status: "streaming",
+    }));
+    scheduleProgressWatchdog();
+
+    let result;
+    try {
+      result = await kit.bridge({
+        from: {
+          adapter,
+          chain: sourceConfig.bridgeKitChain,
+        },
+        to: {
+          chain: BridgeChain.Arc_Testnet,
+          recipientAddress: draft.userDcwAddress,
+          useForwarder: true,
+        },
+        amount,
+      });
+    } finally {
+      clearProgressWatchdog();
+      kit.off("*", bridgeEventHandler);
+    }
+
+    const steps = (Array.isArray(result.steps) ? result.steps : []) as BridgeKitStepLike[];
+    if (result.state !== "success") {
+      const failedStep = steps.find((step) => step.state === "error");
+      const failedName = failedStep?.name ? `${failedStep.name} failed.` : "Circle bridge failed.";
+      throw new Error(failedName);
+    }
+
+    const approvalTxHash = findBridgeStepTx(steps, /approve/i);
+    const burnTxHash = findBridgeStepTx(steps, /burn/i);
+    const mintTxHash = findBridgeStepTx(steps, /mint/i);
+
+    if (!burnTxHash) {
+      throw new Error("Circle bridge completed without returning the source-chain burn transaction hash.");
+    }
+
+    updateMessage(draft.assistantId, (message) => ({
+      ...message,
+      content: `Circle finished forwarding your bridge to Arc. AgentFlow is now recording the receipt and nanopayment.`,
+      trace: [
+        ...(message.trace || []),
+        ...(approvalTxHash
+          ? [
+              {
+                label: "Approval confirmed",
+                txHash: approvalTxHash,
+                explorerUrl: bridgeTxExplorerUrl(draft.sourceChain, approvalTxHash),
+              },
+            ]
+          : []),
+        {
+          label: "Burn confirmed",
+          txHash: burnTxHash,
+          explorerUrl: bridgeTxExplorerUrl(draft.sourceChain, burnTxHash),
+        },
+        ...(mintTxHash
+          ? [
+              {
+                label: "Arc mint confirmed",
+                txHash: mintTxHash,
+                explorerUrl: arcTxExplorerUrl(mintTxHash),
+              },
+            ]
+          : ["Circle Forwarder completed the Arc delivery"]),
+      ],
+      status: "streaming",
+    }));
+
+    const finalizeRequestId = createBrowserX402RequestId();
+    let paymentRequestId: string | null = null;
+    let paymentAttemptSnapshot: X402AttemptSnapshot | null = null;
+    let finalizeWarning: string | null = null;
+
+    if (sourceConfig.chainId !== ARC_CHAIN_ID) {
+      updateMessage(draft.assistantId, (message) => ({
+        ...message,
+        trace: [...(message.trace || []), "Switching wallet back to Arc"],
+        status: message.status,
+      }));
+
+      try {
+        await withTimeout(
+          switchChainAsync({ chainId: ARC_CHAIN_ID }),
+          BRIDGE_SWITCH_TIMEOUT_MS,
+          "Wallet switch back to Arc timed out. You can switch networks manually if needed.",
+        );
+      } catch {
+        updateMessage(draft.assistantId, (message) => ({
+          ...message,
+          trace: [
+            ...(message.trace || []),
+            "Bridge finished, but automatic switch back to Arc was skipped",
+          ],
+          status: message.status,
+        }));
+      }
+    }
+
+    try {
+      const arcWalletClient = await withTimeout(
+        getWalletClient(wagmiConfig, {
+          account: connectedAddress,
+          chainId: ARC_CHAIN_ID,
+          connector,
+        }),
+        BRIDGE_WALLET_CLIENT_TIMEOUT_MS,
+        "Arc wallet session took too long to reconnect for the bridge receipt payment.",
+      );
+      const finalized = await withTimeout(
+        finalizeBridgeRun({
+          requestId: finalizeRequestId,
+          walletClient: arcWalletClient,
+          payer: connectedAddress,
+          authHeaders: getAuthHeaders() ?? draft.authHeaders,
+          body: {
+            sourceChain: draft.sourceChain,
+            amount: draft.amount,
+            sourceTxHash: burnTxHash,
+            approvalTxHash,
+            mintTxHash,
+            recipientAddress: draft.userDcwAddress,
+          },
+          onAwaitSignature: () => {
+            updateMessage(draft.assistantId, (message) => ({
+              ...message,
+              content: "MetaMask should now prompt for the AgentFlow bridge receipt payment on Arc.",
+              trace: [...(message.trace || []), "Waiting for x402 bridge receipt payment signature"],
+              status: "streaming",
+            }));
+          },
+        }),
+        BRIDGE_FINALIZE_TIMEOUT_MS,
+        `Bridge receipt payment verification timed out. Request ID: ${finalizeRequestId}`,
+      );
+      paymentRequestId = finalized.requestId;
+      paymentAttemptSnapshot = await readX402AttemptSnapshot(finalized.requestId);
+    } catch (error) {
+      paymentAttemptSnapshot = await waitForX402AttemptTerminalState(finalizeRequestId);
+      if (paymentAttemptSnapshot?.stage === "succeeded") {
+        paymentRequestId = finalizeRequestId;
+      } else if (isBridgeFinalizePendingStage(paymentAttemptSnapshot?.stage)) {
+        paymentRequestId = finalizeRequestId;
+        finalizeWarning = `The bridge reached Arc, and AgentFlow is still verifying the bridge receipt payment. Request ID: ${finalizeRequestId}`;
+      } else {
+        finalizeWarning = paymentAttemptSnapshot?.error
+          ? `${paymentAttemptSnapshot.error}\nRequest ID: ${finalizeRequestId}`
+          : friendlyChatErrorMessage(
+              error,
+              `The bridge finished, but AgentFlow could not record the bridge receipt payment. Request ID: ${finalizeRequestId}`,
+            );
+      }
+    }
+
+    updateMessage(draft.assistantId, (message) => ({
+      ...message,
+      content: [
+        buildBridgeReceiptContent({
+          amount: draft.amount,
+          sourceChain: draft.sourceChain,
+          sourceLabel: sourceConfig.label,
+          userDcwAddress: draft.userDcwAddress,
+          approvalTxHash,
+          burnTxHash,
+          mintTxHash,
+          paymentRequestId,
+        }),
+        finalizeWarning ? `\n\nPayment note: ${finalizeWarning}` : null,
+      ]
+        .filter(Boolean)
+        .join(""),
+      paymentMeta: paymentRequestId
+        ? {
+            entries: [
+              {
+                requestId: paymentRequestId,
+                agent: "bridge",
+                price: paymentPriceLabel("bridge"),
+                payer: connectedAddress,
+                mode: "eoa",
+              },
+            ],
+          }
+        : message.paymentMeta,
+      trace: finalizeWarning
+        ? [
+            ...(message.trace || []),
+            paymentAttemptSnapshot?.stage && isBridgeFinalizePendingStage(paymentAttemptSnapshot.stage)
+              ? `Bridge receipt payment still pending verification (${paymentAttemptSnapshot.stage})`
+              : "Bridge receipt payment was not completed",
+          ]
+        : [...(message.trace || []), "Bridge receipt recorded by AgentFlow"],
+      status: "complete",
+    }));
+
+    if (paymentRequestId) {
+      setIsPaymentPanelOpen(true);
+    }
   };
 
   const submitMessage = async (
     rawInput: string,
     attachmentOverride?: PendingChatAttachment | null,
   ) => {
-    const trimmed = rawInput.trim();
+    const decodedQuickAction = decodeQuickActionMessage(rawInput);
+    const trimmed = decodedQuickAction.displayText.trim();
     const activeAttachment = attachmentOverride ?? pendingAttachment;
     if ((!trimmed && !activeAttachment) || isStreaming) {
       return;
     }
 
-    const localGuardReply = buildLocalPromptGuard(trimmed, activeAttachment);
+    const resolvedQuickActionPrompt =
+      decodedQuickAction.prompt ??
+      ((!activeAttachment &&
+        !pendingSwapSelection &&
+        !pendingVaultSelection &&
+        !pendingBridgeSelection &&
+        !pendingSwapDraft &&
+        !pendingVaultDraft &&
+        !pendingBridgeDraft)
+        ? resolveQuickActionPromptFromReply(trimmed, messages)
+        : null);
+    const effectiveInput = resolvedQuickActionPrompt ?? trimmed;
+
+    if (pendingSwapSelection && !activeAttachment) {
+      const followupAmount = parseOptionalAmount(trimmed);
+      if (followupAmount != null) {
+        const now = Date.now();
+        recordRecentChat(trimmed);
+        setMessages((previous) => [
+          ...previous,
+          {
+            id: `user-${now}`,
+            role: "user",
+            content: trimmed,
+            status: "complete",
+          },
+        ]);
+        setInput("");
+        setPendingAttachment(null);
+        setVoicePaymentLabel(null);
+        await continuePendingSwapSelection({
+          amount: followupAmount,
+          selection: pendingSwapSelection,
+        });
+        return;
+      }
+    }
+
+    if (pendingVaultSelection && !activeAttachment) {
+      const followupAmount = parseOptionalAmount(trimmed);
+      if (followupAmount != null) {
+        const now = Date.now();
+        recordRecentChat(trimmed);
+        setMessages((previous) => [
+          ...previous,
+          {
+            id: `user-${now}`,
+            role: "user",
+            content: trimmed,
+            status: "complete",
+          },
+        ]);
+        setInput("");
+        setPendingAttachment(null);
+        setVoicePaymentLabel(null);
+        await continuePendingVaultSelection({
+          amount: followupAmount,
+          selection: pendingVaultSelection,
+        });
+        return;
+      }
+    }
+
+    if (pendingBridgeSelection && !activeAttachment) {
+      const followupAmount = parseOptionalAmount(trimmed);
+      if (followupAmount != null) {
+        const now = Date.now();
+        recordRecentChat(trimmed);
+        setMessages((previous) => [
+          ...previous,
+          {
+            id: `user-${now}`,
+            role: "user",
+            content: trimmed,
+            status: "complete",
+          },
+        ]);
+        setInput("");
+        setPendingAttachment(null);
+        setVoicePaymentLabel(null);
+        await continuePendingBridgeSelection({
+          amount: followupAmount,
+          selection: pendingBridgeSelection,
+        });
+        return;
+      }
+    }
+
+    if (
+      (pendingSwapSelection || pendingVaultSelection || pendingBridgeSelection) &&
+      !activeAttachment &&
+      (/^yes$/i.test(trimmed) || isSoftPendingAcknowledgement(trimmed))
+    ) {
+      const now = Date.now();
+      const pendingTitle = pendingSwapSelection
+        ? "Swap"
+        : pendingVaultSelection
+          ? "Vault"
+          : "Bridge";
+      const pendingReminder = pendingSwapSelection
+        ? `Tell me the ${pendingSwapSelection.tokenInSymbol} amount you want to swap into ${pendingSwapSelection.tokenOutSymbol}.`
+        : pendingVaultSelection
+          ? `Tell me how much ${vaultAssetSymbol(pendingVaultSelection.vaultSymbol)} you want to ${pendingVaultSelection.action} ${pendingVaultSelection.vaultSymbol}.`
+          : `Tell me how much USDC you want to bridge from ${BRIDGE_SOURCE_CONFIG[pendingBridgeSelection!.sourceChain].label}.`;
+
+      recordRecentChat(trimmed);
+      setMessages((previous) => [
+        ...previous,
+        {
+          id: `user-${now}`,
+          role: "user",
+          content: trimmed,
+          status: "complete",
+        },
+        {
+          id: `assistant-${now}-amount-reminder`,
+          role: "assistant",
+          title: pendingTitle,
+          content: pendingReminder,
+          trace: ["Awaiting amount"],
+          status: "complete",
+        },
+      ]);
+      setInput("");
+      setPendingAttachment(null);
+      setVoicePaymentLabel(null);
+      return;
+    }
+
+    if (!activeAttachment && !pendingBridgeSelection) {
+      const recoveredSourceChain = findPendingBridgeAmountSource(messages);
+      const followupAmount = parseOptionalAmount(trimmed);
+      if (recoveredSourceChain && followupAmount != null) {
+        const now = Date.now();
+        const assistantId = `assistant-bridge-${now}`;
+        recordRecentChat(trimmed);
+        setMessages((previous) => [
+          ...previous,
+          {
+            id: `user-${now}`,
+            role: "user",
+            content: trimmed,
+            status: "complete",
+          },
+          {
+            id: assistantId,
+            role: "assistant",
+            title: "Bridge",
+            content: "",
+            trace: [],
+            status: "streaming",
+          },
+        ]);
+        setInput("");
+        setPendingAttachment(null);
+        setVoicePaymentLabel(null);
+        setIsStreaming(true);
+        try {
+          const bridgeContext = await resolveBridgeSessionContext(assistantId);
+          if (!bridgeContext) {
+            return;
+          }
+          await prepareBridgeDraftInChat({
+            assistantId,
+            amount: followupAmount,
+            sourceChain: recoveredSourceChain,
+            bridgeContext,
+          });
+        } catch (error) {
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content: friendlyChatErrorMessage(error, "Bridge flow failed."),
+            trace: [...(message.trace || []), "Bridge flow failed"],
+            status: "error",
+          }));
+        } finally {
+          setIsStreaming(false);
+        }
+        return;
+      }
+    }
+
+    if (pendingSwapDraft && !activeAttachment && /^(yes|no)$/i.test(trimmed)) {
+      const now = Date.now();
+      const isConfirm = /^yes$/i.test(trimmed);
+      recordRecentChat(trimmed);
+      setInput("");
+      setPendingAttachment(null);
+      setVoicePaymentLabel(null);
+      const followupAssistantId = `assistant-swap-${now}-confirm`;
+
+      if (!isConfirm) {
+        setPendingSwapDraft(null);
+        setMessages((previous) => [
+          ...previous.map((message) =>
+            message.id === pendingSwapDraft.assistantId
+              ? {
+                  ...message,
+                  quickActionGroups: undefined,
+                  status: (message.status === "error" ? "error" : "complete") as "error" | "complete",
+                }
+              : message,
+          ),
+          {
+            id: `user-${now}`,
+            role: "user",
+            content: "NO",
+            status: "complete",
+          },
+          {
+            id: followupAssistantId,
+            role: "assistant",
+            title: "Swap",
+            content: "Swap cancelled.",
+            trace: ["Swap cancelled"],
+            status: "complete",
+          },
+        ]);
+        return;
+      }
+
+      const executionDraft: PendingSwapDraft = { ...pendingSwapDraft };
+      flushSync(() => {
+        setMessages((previous) => [
+          ...previous.map((message) =>
+            message.id === pendingSwapDraft.assistantId
+              ? {
+                  ...message,
+                  quickActionGroups: undefined,
+                  status: (message.status === "error" ? "error" : "complete") as "error" | "complete",
+                }
+              : message,
+          ),
+          {
+            id: `user-${now}`,
+            role: "user",
+            content: "YES",
+            status: "complete",
+          },
+        ]);
+      });
+
+      setIsStreaming(true);
+      await executePendingSwap(executionDraft);
+      return;
+    }
+
+    if ((pendingSwapDraft || pendingVaultDraft || pendingBridgeDraft) && !activeAttachment && isSoftPendingAcknowledgement(trimmed)) {
+      const pendingTitle = pendingSwapDraft ? "Swap" : pendingVaultDraft ? "Vault" : "Bridge";
+      const pendingReminder = pendingSwapDraft
+        ? "Your swap quote is still pending. Reply YES to execute or NO to cancel."
+        : pendingVaultDraft
+          ? "Your vault action is still pending. Reply YES to continue or NO to cancel."
+          : "Your bridge is still pending. Reply YES to continue or NO to cancel.";
+      const now = Date.now();
+      recordRecentChat(trimmed);
+      setMessages((previous) => [
+        ...previous,
+        {
+          id: `user-${now}`,
+          role: "user",
+          content: trimmed,
+          status: "complete",
+        },
+        {
+          id: `assistant-${now}-pending-reminder`,
+          role: "assistant",
+          title: pendingTitle,
+          content: pendingReminder,
+          trace: ["Pending action reminder"],
+          status: "complete",
+        },
+      ]);
+      setInput("");
+      setPendingAttachment(null);
+      setVoicePaymentLabel(null);
+      return;
+    }
+
+    if (pendingBridgeDraft && !activeAttachment && /^(yes|no)$/i.test(trimmed)) {
+      const now = Date.now();
+      const isConfirm = /^yes$/i.test(trimmed);
+      const userConfirmationMessage: LiveChatMessage = {
+        id: `user-${now}`,
+        role: "user",
+        content: trimmed.toUpperCase(),
+        status: "complete",
+      };
+      recordRecentChat(trimmed);
+      setInput("");
+      setPendingAttachment(null);
+      setVoicePaymentLabel(null);
+
+      if (!isConfirm) {
+        setMessages((previous) => [
+          ...previous.map((message) =>
+            message.id === pendingBridgeDraft.assistantId
+              ? {
+                  ...message,
+                  content: "Bridge cancelled before any source-chain transaction was sent.",
+                  trace: [...(message.trace || []), "Bridge cancelled"],
+                  confirmation: undefined,
+                  status: "complete" as const,
+                }
+              : message,
+          ),
+          userConfirmationMessage,
+        ]);
+        setPendingBridgeDraft(null);
+        return;
+      }
+
+      setIsStreaming(true);
+      const followupAssistantId = `assistant-bridge-exec-${Date.now()}`;
+      const executionDraft: PendingBridgeDraft = {
+        assistantId: followupAssistantId,
+        sourceChain: pendingBridgeDraft.sourceChain,
+        amount: pendingBridgeDraft.amount,
+        payerAddress: pendingBridgeDraft.payerAddress,
+        userDcwAddress: pendingBridgeDraft.userDcwAddress,
+        authHeaders: pendingBridgeDraft.authHeaders,
+      };
+      flushSync(() => {
+        setMessages((previous) => [
+          ...previous.map((message) =>
+            message.id === pendingBridgeDraft.assistantId
+              ? {
+                  ...message,
+                  confirmation: undefined,
+                  status: (message.status === "error" ? "error" : "complete") as
+                    | "error"
+                    | "complete",
+                }
+              : message,
+          ),
+          userConfirmationMessage,
+          {
+            id: followupAssistantId,
+            role: "assistant",
+            title: "Bridge",
+            content: "",
+            trace: [],
+            status: "streaming",
+          },
+        ]);
+      });
+
+      try {
+        await executePendingBridge(executionDraft);
+        setPendingBridgeDraft(null);
+      } catch (error) {
+        updateMessage(followupAssistantId, (message) => ({
+          ...message,
+          content: friendlyChatErrorMessage(error, "Bridge execution failed."),
+          trace: [...(message.trace || []), "Bridge execution failed"],
+          confirmation: {
+            required: true,
+            action: "bridge",
+          },
+          status: "error",
+        }));
+      } finally {
+        setIsStreaming(false);
+      }
+      return;
+    }
+
+    if (pendingVaultDraft && !activeAttachment && /^(yes|no)$/i.test(trimmed)) {
+      const now = Date.now();
+      const isConfirm = /^yes$/i.test(trimmed);
+      recordRecentChat(trimmed);
+      const followupAssistantId = `assistant-vault-${now}-confirm`;
+
+      if (!isConfirm) {
+        setPendingVaultDraft(null);
+        setMessages((previous) => [
+          ...previous.map((message) =>
+            message.id === pendingVaultDraft.assistantId
+              ? {
+                  ...message,
+                  quickActionGroups: undefined,
+                  status: (message.status === "error" ? "error" : "complete") as "error" | "complete",
+                }
+              : message,
+          ),
+          {
+            id: `user-${now}`,
+            role: "user",
+            content: "NO",
+            status: "complete",
+          },
+          {
+            id: followupAssistantId,
+            role: "assistant",
+            title: "Vault",
+            content: "Vault action cancelled.",
+            trace: ["Vault action cancelled"],
+            status: "complete",
+          },
+        ]);
+        return;
+      }
+
+      const executionDraft: PendingVaultDraft = { ...pendingVaultDraft };
+      flushSync(() => {
+        setMessages((previous) => [
+          ...previous.map((message) =>
+            message.id === pendingVaultDraft.assistantId
+              ? {
+                  ...message,
+                  quickActionGroups: undefined,
+                  status: (message.status === "error" ? "error" : "complete") as "error" | "complete",
+                }
+              : message,
+          ),
+          {
+            id: `user-${now}`,
+            role: "user",
+            content: "YES",
+            status: "complete",
+          },
+        ]);
+      });
+
+      setIsStreaming(true);
+      try {
+        await executePendingVault(executionDraft);
+      } finally {
+        setPendingVaultDraft(null);
+      }
+      return;
+    }
+
+    const localGuardReply = buildLocalPromptGuard(effectiveInput, activeAttachment);
     if (localGuardReply) {
       const now = Date.now();
       recordRecentChat(trimmed || (activeAttachment ? attachmentSummaryLabel(activeAttachment) : ""));
@@ -1862,8 +4519,8 @@ function ChatPageInner() {
       setPortfolioContext(null);
     }
     const messageWithContext = contextToInject
-      ? `${trimmed}\n\nPortfolio context:\n${contextToInject}`
-      : trimmed;
+      ? `${effectiveInput}\n\nPortfolio context:\n${contextToInject}`
+      : effectiveInput;
 
     // CSV attachments → route to the batch-payment fast-path instead of Vision.
     // We inline the CSV body into the outgoing message with a "batch pay" header so
@@ -1872,8 +4529,18 @@ function ChatPageInner() {
     if (isBatchCsvAttachment(activeAttachment)) {
       const csvText = decodeTextDataUrl(activeAttachment?.dataUrl);
       if (csvText && csvText.trim()) {
-        const prefix = trimmed || "batch pay";
-        csvBatchMessage = `${prefix}\n${csvText.trim()}`;
+        const trimmedCsv = csvText.trim();
+        const csvStartsWithBatchCommand =
+          /^\s*(?:batch\s+pay(?:ment)?|payroll|bulk\s+pay|pay\s+multiple|pay\s+everyone)\b/i.test(trimmedCsv);
+        csvBatchMessage =
+          buildInvoicePromptFromCsv(activeAttachment?.name ?? "", csvText) ??
+          buildSchedulePromptFromCsv(activeAttachment?.name ?? "", csvText) ??
+          buildSplitPromptFromCsv(activeAttachment?.name ?? "", csvText) ??
+          (trimmed
+            ? `${trimmed}\n${trimmedCsv}`
+            : csvStartsWithBatchCommand
+              ? trimmedCsv
+              : `batch pay\n${trimmedCsv}`);
       }
     }
 
@@ -1881,7 +4548,7 @@ function ChatPageInner() {
       ? inferPromptIntent(csvBatchMessage, selectedTab)
       : activeAttachment
       ? "Vision"
-      : inferPromptIntent(trimmed, selectedTab);
+      : inferPromptIntent(effectiveInput, selectedTab);
     const routedTab = promptTabs.includes(inferredIntent as PromptTab)
       ? (inferredIntent as PromptTab)
       : null;
@@ -1895,7 +4562,16 @@ function ChatPageInner() {
       : activeAttachment
       ? "Vision"
       : inferredIntent;
-    const useBrainConversation = !activeAttachment || Boolean(csvBatchMessage);
+    const normalizedEffectiveInput = normalizePromptForIntent(effectiveInput);
+    const promptBridgeSource = detectBridgeSource(effectiveInput);
+    const useNativeBridgeFlow =
+      !activeAttachment &&
+      intent === "Bridge" &&
+      ((explicitBridgeActionPattern.test(normalizedEffectiveInput) &&
+        (!isBridgeInfoPrompt(normalizedEffectiveInput) || isBridgeSourceDiscoveryPrompt(normalizedEffectiveInput))) ||
+        Boolean(promptBridgeSource));
+    const useBrainConversation =
+      (!activeAttachment || Boolean(csvBatchMessage)) && !useNativeBridgeFlow;
 
     recordRecentChat(trimmed || (activeAttachment ? attachmentSummaryLabel(activeAttachment) : ""));
 
@@ -1918,16 +4594,27 @@ function ChatPageInner() {
     const assistantMessage: LiveChatMessage = {
       id: assistantId,
       role: "assistant",
-      title: useBrainConversation ? "AgentFlow" : getAssistantTitle(intent),
+      title: useNativeBridgeFlow
+        ? "Bridge"
+        : useBrainConversation
+          ? "AgentFlow"
+          : getAssistantTitle(intent),
       content:
-        useBrainConversation
+        useNativeBridgeFlow
+          ? "Preparing bridge..."
+          : useBrainConversation
           ? ""
           : intent === "Conversation"
             ? ""
             : intent === "Vision"
               ? "Preparing attachment analysis..."
               : "Preparing the AgentFlow run...",
-      trace: useBrainConversation || intent === "Conversation" ? undefined : [],
+      trace:
+        useNativeBridgeFlow
+          ? []
+          : useBrainConversation || intent === "Conversation"
+            ? undefined
+            : [],
       status: "streaming",
     };
 
@@ -1936,6 +4623,112 @@ function ChatPageInner() {
     setPendingAttachment(null);
     setVoicePaymentLabel(null);
     setIsStreaming(true);
+
+    if (useNativeBridgeFlow) {
+      setPendingBridgeSelection(null);
+      const bridgeContext = await resolveBridgeSessionContext(assistantId);
+      if (!bridgeContext) {
+        return;
+      }
+
+      const sourceChain = promptBridgeSource;
+      const amount = parseOptionalAmount(effectiveInput);
+
+      if (!sourceChain) {
+        try {
+          const holdings = await fetchBridgeSourceHoldings(bridgeContext.payerAddress);
+          const fundedChains = holdings.filter((entry) => entry.usdcBalanceRaw > BigInt(0));
+          const choices = (fundedChains.length ? fundedChains : holdings).map((entry) => ({
+            label:
+              `${entry.label} (${formatBridgeBalanceShort(entry.usdcBalanceRaw, 6)} USDC` +
+              `, ${formatBridgeBalanceShort(entry.nativeBalanceRaw, 18)} gas)`,
+            prompt: formatBridgeAmountPrompt(amount, entry.label),
+            tone: "primary" as const,
+          }));
+
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content:
+              fundedChains.length > 0
+                ? amount
+                  ? `I found supported source chains where this wallet already holds USDC. Choose one and I will build the ${amount} USDC bridge without making you type the source chain.`
+                  : "I found supported source chains where this wallet already holds USDC. Choose one below, then tell me how much USDC you want to bridge."
+                : "I did not detect USDC on the currently supported source chains for this wallet. You can still choose a supported chain below if you plan to fund it first.",
+            trace: [
+              "Bridge source-chain check completed",
+              "Circle/Arc bridge flow signs approve and burn on the source chain in your browser wallet",
+            ],
+            quickActionGroups: choices.length
+              ? [
+                  {
+                    title: fundedChains.length
+                      ? "Choose source chain"
+                      : "Supported source chains",
+                    actions: choices,
+                  },
+                ]
+              : undefined,
+            status: "complete",
+          }));
+        } catch (error) {
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content:
+              "I couldn't read supported source-chain balances right now. Tell me which source chain you want to use, or ask me to try the balance check again.",
+            trace: [
+              ...(message.trace || []),
+              friendlyChatErrorMessage(error, "Bridge source-chain lookup failed."),
+            ],
+            status: "error",
+          }));
+        } finally {
+          setIsStreaming(false);
+        }
+        return;
+      }
+
+      if (amount == null) {
+        setPendingBridgeSelection({
+          assistantId,
+          sourceChain,
+          payerAddress: bridgeContext.payerAddress,
+          authHeaders: bridgeContext.authHeaders,
+        });
+        updateMessage(assistantId, (message) => ({
+          ...message,
+          content: `Source chain locked to ${BRIDGE_SOURCE_CONFIG[sourceChain].label}. Tell me how much USDC you want to bridge from there to Arc.`,
+          trace: [
+            `Source chain selected: ${BRIDGE_SOURCE_CONFIG[sourceChain].label}`,
+            "Next step needs the USDC amount before preparing the browser-wallet signing flow",
+          ],
+          status: "complete",
+        }));
+        setIsStreaming(false);
+        return;
+      }
+
+      try {
+        await prepareBridgeDraftInChat({
+          assistantId,
+          amount,
+          sourceChain,
+          bridgeContext,
+        });
+      } catch (error) {
+        updateMessage(assistantId, (message) => ({
+          ...message,
+          content:
+            (error as Error).name === "AbortError"
+              ? "Bridge flow was interrupted before any transaction was created."
+              : friendlyChatErrorMessage(error, "Bridge flow failed."),
+          trace: [...(message.trace || []), "Bridge flow failed"],
+          status: "error",
+        }));
+      } finally {
+        setIsStreaming(false);
+      }
+      return;
+    }
 
     if (useBrainConversation) {
       abortRef.current?.abort();
@@ -1952,12 +4745,27 @@ function ChatPageInner() {
         const outgoingMessage = csvBatchMessage ?? messageWithContext;
         await streamConversationReply({
           message: outgoingMessage,
+          rawUserMessage: effectiveInput,
+          quickActionContext: decodedQuickAction.prompt
+            ? {
+                prompt: decodedQuickAction.prompt,
+                ...(decodedQuickAction.actionId
+                  ? { actionId: decodedQuickAction.actionId }
+                  : {}),
+              }
+            : undefined,
           messages: [...messages, userMessage].map((message) => ({
             role: message.role,
             content: message.content,
           })),
           walletAddress: address,
           executionTarget,
+          browserTimeZone:
+            typeof Intl !== "undefined"
+              ? Intl.DateTimeFormat().resolvedOptions().timeZone
+              : undefined,
+          browserLocale:
+            typeof navigator !== "undefined" ? navigator.language : undefined,
           sessionId,
           signal: controller.signal,
           authHeaders: getAuthHeaders() ?? undefined,
@@ -1967,6 +4775,7 @@ function ChatPageInner() {
             }
             updateMessage(assistantId, (message) => ({
               ...message,
+              eventId: meta.eventId ?? message.eventId,
               title: meta.title ?? message.title,
               trace: meta.trace ?? message.trace,
               reportMeta: meta.reportMeta
@@ -1982,7 +4791,9 @@ function ChatPageInner() {
                   }
                 : message.activityMeta,
               paymentMeta: meta.paymentMeta ?? message.paymentMeta,
+              ratingMeta: meta.ratingMeta ?? message.ratingMeta,
               confirmation: meta.confirmation ?? message.confirmation,
+              quickActionGroups: meta.quickActionGroups ?? message.quickActionGroups,
               paymentLink: meta.paymentLink ?? message.paymentLink,
             }));
           },
@@ -2064,6 +4875,25 @@ function ChatPageInner() {
           )
         ) {
           localStorage.setItem("agentpay:schedules:refresh", String(Date.now()));
+        }
+
+        const inferredPendingVaultSelection = inferPendingVaultSelectionFromAssistantReply({
+          assistantId,
+          content: streamedContent,
+          payerAddress: address as `0x${string}` | null | undefined,
+          authHeaders: getAuthHeaders(),
+        });
+        const inferredPendingSwapSelection = inferPendingSwapSelectionFromAssistantReply({
+          assistantId,
+          content: streamedContent,
+          payerAddress: address as `0x${string}` | null | undefined,
+          authHeaders: getAuthHeaders(),
+        });
+        if (inferredPendingSwapSelection) {
+          setPendingSwapSelection(inferredPendingSwapSelection);
+        }
+        if (inferredPendingVaultSelection) {
+          setPendingVaultSelection(inferredPendingVaultSelection);
         }
 
         if (!receivedDelta && !sawReportCompletion && !pipelineErrorHandled) {
@@ -2268,6 +5098,38 @@ function ChatPageInner() {
       return;
     }
 
+    if (intent === "Bridge") {
+      setPendingBridgeSelection(null);
+      const bridgeContext = await resolveBridgeSessionContext(assistantId);
+      if (!bridgeContext) {
+        return;
+      }
+
+      try {
+        const sourceChain = detectBridgeSource(trimmed);
+        const amount = parseOptionalAmount(trimmed);
+        if (!sourceChain || amount == null) {
+          throw new Error("Bridge request needs both an amount and a supported source chain.");
+        }
+        await prepareBridgeDraftInChat({
+          assistantId,
+          amount,
+          sourceChain,
+          bridgeContext,
+        });
+      } catch (error) {
+        updateMessage(assistantId, (message) => ({
+          ...message,
+          content: friendlyChatErrorMessage(error, "Bridge flow failed."),
+          trace: [...(message.trace || []), "Bridge flow failed"],
+          status: "error",
+        }));
+      } finally {
+        setIsStreaming(false);
+      }
+      return;
+    }
+
     const paidContext = await requirePaidAgentContext(assistantId, {
       executionTarget,
     });
@@ -2422,19 +5284,21 @@ function ChatPageInner() {
           const pairIn = r?.tokenPair?.tokenIn ?? tokenPair.tokenIn;
           const pairOut = r?.tokenPair?.tokenOut ?? tokenPair.tokenOut;
           const amountIn = r?.amountIn ?? amount;
-          const amountBlock =
-            result.txHash && amountIn > 0
-              ? `${formatSwapAmountLine({
+          return {
+            ...message,
+            content: result.txHash
+              ? buildSwapExecutionContent({
                   amountIn,
                   quoteOutRaw: r?.quoteOutRaw,
                   tokenIn: pairIn,
                   tokenOut: pairOut,
-                })}\n\n`
-              : "";
-          return {
-            ...message,
-            content: result.txHash
-              ? `${amountBlock}Swap complete on Arc.\n\nExecuted from: ${resolvedExecutionTarget}\nTx: ${result.txHash}\n\nExplorer: ${r?.explorerLink || "Unavailable"}`
+                  txHash: result.txHash,
+                  explorerLink: r?.explorerLink,
+                  approvalTxHash: result.approvalTxHash,
+                  approvalExplorerLink: r?.approvalExplorerLink,
+                  executionTarget: resolvedExecutionTarget,
+                  provider: result.provider ?? null,
+                })
               : "Swap completed, but no transaction hash was returned.",
             trace: [
               ...(message.trace || []),
@@ -2450,34 +5314,151 @@ function ChatPageInner() {
       }
 
       if (intent === "Vault") {
-        const action = detectVaultAction(trimmed);
-        const isUsycAction = action === "usyc_deposit" || action === "usyc_withdraw";
-        if (isUsycAction && executionTarget === "EOA") {
-          const preflight = await preflightEoaUsycAction({
-            action,
-            walletAddress: payerAddress,
-            amount: parseAmount(trimmed, 1),
+        const vaultIntent = normalizeVaultIntent(trimmed);
+        const action = vaultIntent.action === "list" || vaultIntent.action === "position"
+          ? "check_apy"
+          : vaultIntent.action;
+        const parsedAmount = vaultIntent.amount;
+        const selectedVaultSymbol = vaultIntent.vaultSymbol;
+
+        setPendingVaultSelection(null);
+
+        if (vaultIntent.action === "position") {
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content: "Loading your live vault positions on Arc.",
+            trace: ["Vault agent is checking current vault positions"],
+            status: "streaming",
+          }));
+
+          const positionResult = await runPaidAgent<VaultAgentResponse & AgentRunPaymentResult, Record<string, unknown>>({
+            slug: "vault",
+            walletClient: activeWalletClient,
+            payer: payerAddress,
+            authHeaders,
+            body: { action: "position", walletAddress: payerAddress, executionTarget: "DCW" },
           });
-          if (!preflight.ok) {
-            updateMessage(assistantId, (message) => ({
-              ...message,
-              content: preflight.error,
-              trace: [...(message.trace || []), ...preflight.trace],
-              status: "complete",
-            }));
-            return;
-          }
 
           updateMessage(assistantId, (message) => ({
             ...message,
-            trace: [...(message.trace || []), ...preflight.trace],
+            content: positionResult.success
+              ? String((positionResult as unknown as { answer?: string; message?: string }).answer || (positionResult as unknown as { message?: string }).message || "Vault positions loaded.")
+              : positionResult.error || "I couldn't load your vault positions.",
+            paymentMeta: buildPaymentMetaFromResult("vault", positionResult, payerAddress),
+            status: "complete",
           }));
-        } else if (
-          action === "deposit" ||
-          action === "withdraw" ||
-          action === "usyc_deposit" ||
-          action === "usyc_withdraw"
+          return;
+        }
+
+        if ((action === "deposit" || action === "withdraw") && selectedVaultSymbol && parsedAmount == null) {
+          setPendingVaultSelection({
+            assistantId,
+            action: action as "deposit" | "withdraw",
+            vaultSymbol: selectedVaultSymbol,
+            amount: null,
+            payerAddress,
+            authHeaders,
+          });
+
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content:
+              `Vault selected: ${vaultLabel(selectedVaultSymbol)}.\n\n` +
+              `Tell me how much ${vaultAssetSymbol(selectedVaultSymbol)} you want to ${action === "deposit" ? "deposit" : "withdraw"}.`,
+            quickActionGroups: [
+              {
+                title: vaultLabel(selectedVaultSymbol),
+                actions: [
+                  {
+                    label: `1 ${vaultAssetSymbol(selectedVaultSymbol)}`,
+                    prompt: `${action} 1 ${vaultAssetSymbol(selectedVaultSymbol)} ${action === "deposit" ? "to" : "from"} ${selectedVaultSymbol}`,
+                  },
+                  {
+                    label: `10 ${vaultAssetSymbol(selectedVaultSymbol)}`,
+                    prompt: `${action} 10 ${vaultAssetSymbol(selectedVaultSymbol)} ${action === "deposit" ? "to" : "from"} ${selectedVaultSymbol}`,
+                  },
+                  {
+                    label: `100 ${vaultAssetSymbol(selectedVaultSymbol)}`,
+                    prompt: `${action} 100 ${vaultAssetSymbol(selectedVaultSymbol)} ${action === "deposit" ? "to" : "from"} ${selectedVaultSymbol}`,
+                  },
+                ],
+              },
+            ],
+            trace: [
+              `Vault selected: ${vaultLabel(selectedVaultSymbol)}`,
+              `Next step needs the ${vaultAssetSymbol(selectedVaultSymbol)} amount`,
+            ],
+            status: "complete",
+          }));
+          return;
+        }
+
+        if (
+          (vaultIntent.action === "list" ||
+            ((action === "deposit" || action === "withdraw") ||
+              (action === "check_apy" && parsedAmount == null))) &&
+          !selectedVaultSymbol
         ) {
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content: "Loading live vault options on Arc.",
+            trace: ["Vault agent is fetching live vault options and APY"],
+            status: "streaming",
+          }));
+
+          const vaultList = await runPaidAgent<VaultAgentResponse & AgentRunPaymentResult, Record<string, unknown>>({
+            slug: "vault",
+            walletClient: activeWalletClient,
+            payer: payerAddress,
+            authHeaders,
+            body: { action: "list", walletAddress: payerAddress, executionTarget: "DCW" },
+          });
+
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content: buildVaultListContent(Array.isArray(vaultList.vaults) ? vaultList.vaults : []),
+            quickActionGroups: [
+              {
+                title:
+                  (action === "deposit" || action === "withdraw") && parsedAmount != null
+                    ? `Choose vault for ${action} ${parsedAmount}`
+                    : "Choose vault",
+                actions: [
+                  {
+                    label: "Lunex USDC Vault",
+                    prompt:
+                      (action === "deposit" || action === "withdraw") && parsedAmount != null
+                        ? `${action} ${parsedAmount} USDC ${action === "deposit" ? "to" : "from"} luneUSDC`
+                        : "use luneUSDC vault",
+                  },
+                  {
+                    label: "Lunex EURC Vault",
+                    prompt:
+                      (action === "deposit" || action === "withdraw") && parsedAmount != null
+                        ? `${action} ${parsedAmount} EURC ${action === "deposit" ? "to" : "from"} luneEURC`
+                        : "use luneEURC vault",
+                  },
+                  {
+                    label: "My positions",
+                    prompt: "show my vault positions",
+                    actionId: "vault.position",
+                    tone: "secondary",
+                  },
+                ],
+              },
+            ],
+            trace: [
+              "Vault options loaded",
+              (action === "deposit" || action === "withdraw") && parsedAmount != null
+                ? `Amount understood: ${parsedAmount}. Choose the vault next.`
+                : "Choose a vault first, then AgentFlow will ask for amount",
+            ],
+            status: "complete",
+          }));
+          return;
+        }
+
+        if (action === "deposit" || action === "withdraw") {
           const executionSummary = await fetchExecutionWalletSummary(authHeaders);
           const block = buildExecutionBlockResult({
             intent: "Vault",
@@ -2505,27 +5486,11 @@ function ChatPageInner() {
           content:
             action === "check_apy"
               ? "Checking the live AgentFlow Vault APY."
-              : action === "usyc_deposit"
-                ? executionTarget === "EOA"
-                  ? `Preparing USYC subscribe from your connected wallet for ${amount} USDC.`
-                  : `Running USYC subscribe for ${amount} USDC.`
-                : action === "usyc_withdraw"
-                  ? executionTarget === "EOA"
-                    ? `Preparing USYC redeem from your connected wallet for ${amount} USYC.`
-                    : `Running USYC redeem for ${amount} USYC.`
-                  : `Running vault ${action} for ${amount} USDC.`,
+              : `Running vault ${action} for ${amount} USDC.`,
           trace: [
             action === "check_apy"
               ? "Vault agent reading APY from chain"
-              : action === "usyc_deposit"
-                ? executionTarget === "EOA"
-                  ? "Vault agent validating Circle USYC subscribe for the connected EOA"
-                  : "Vault agent preparing Circle USYC subscribe transaction"
-                : action === "usyc_withdraw"
-                  ? executionTarget === "EOA"
-                    ? "Vault agent validating Circle USYC redeem for the connected EOA"
-                    : "Vault agent preparing Circle USYC redeem transaction"
-                  : `Vault agent preparing ${action} transaction`,
+              : `Vault agent preparing ${action} transaction`,
           ],
         }));
 
@@ -2546,82 +5511,42 @@ function ChatPageInner() {
           body:
             action === "check_apy"
               ? { action, walletAddress: payerAddress }
-              : { action, amount, walletAddress: payerAddress, executionTarget },
+              : {
+                  action,
+                  amount,
+                  walletAddress: payerAddress,
+                  executionTarget,
+                  ...(selectedVaultSymbol ? { vaultSymbol: selectedVaultSymbol, amountTokenHint: vaultAssetSymbol(selectedVaultSymbol) } : {}),
+                },
         });
 
         if (!result.success) {
           throw new Error(result.error || "Vault agent failed");
         }
 
-        if (isUsycAction && executionTarget === "EOA" && result.executionMode === "EOA" && result.eoaPlan) {
-          updateMessage(assistantId, (message) => ({
-            ...message,
-            content:
-              action === "usyc_deposit"
-                ? "Payment settled. Confirm the USYC subscribe transaction in your wallet."
-                : "Payment settled. Confirm the USYC redeem transaction in your wallet.",
-            trace: [
-              ...(message.trace || []),
-              action === "usyc_deposit"
-                ? "Waiting for EOA signature on Teller deposit"
-                : "Waiting for EOA signature on Teller redeem",
-            ],
-          }));
-
-          const eoaResult = await executeEoaUsycPlan({
-            walletClient: activeWalletClient,
-            plan: result.eoaPlan,
-          });
-
-          updateMessage(assistantId, (message) => ({
-            ...message,
-            content:
-              action === "usyc_deposit"
-                ? `USYC subscribe complete on Arc.\n\nReceived: ~${eoaResult.usycReceived || "Unavailable"} USYC\nTx: ${eoaResult.txHash}\n\nExplorer: https://testnet.arcscan.app/tx/${eoaResult.txHash}`
-                : `USYC redeem complete on Arc.\n\nReceived: ~${eoaResult.usdcReceived || "Unavailable"} USDC\nTx: ${eoaResult.txHash}\n\nExplorer: https://testnet.arcscan.app/tx/${eoaResult.txHash}`,
-            trace: [
-              ...(message.trace || []),
-              eoaResult.approvalSkipped
-                ? "Existing Teller allowance reused"
-                : "Allowance approval confirmed in wallet",
-              action === "usyc_deposit"
-                ? `USYC subscribe verified - ${eoaResult.txHash.slice(0, 10)}...`
-                : `USYC redeem verified - ${eoaResult.txHash.slice(0, 10)}...`,
-            ],
-            paymentMeta: buildPaymentMetaFromResult("vault", result, payerAddress),
-            status: "complete",
-          }));
-          return;
-        }
-
         updateMessage(assistantId, (message) => ({
           ...message,
           content:
             action === "check_apy"
-              ? `AgentFlow Vault APY: ${typeof result.apy === "number" ? `${result.apy.toFixed(2)}%` : "Unavailable"}`
-              : action === "usyc_deposit"
-                ? result.txHash
-                  ? `USYC subscribe complete on Arc.\n\nReceived: ~${result.usycReceived || "Unavailable"} USYC\nTx: ${result.txHash}\n\nExplorer: ${result.explorerLink || "Unavailable"}`
-                  : "USYC subscribe completed."
-                : action === "usyc_withdraw"
-                  ? result.txHash
-                    ? `USYC redeem complete on Arc.\n\nReceived: ~${result.usdcReceived || "Unavailable"} USDC\nTx: ${result.txHash}\n\nExplorer: ${result.explorerLink || "Unavailable"}`
-                    : "USYC redeem completed."
+              ? `## AgentFlow Vault APY\n\n- **Current APY:** ${typeof result.apy === "number" ? `${result.apy.toFixed(2)}%` : "Unavailable"}`
               : result.txHash
-                ? `Vault ${action} complete on Arc.\n\nTx: ${result.txHash}\n\nExplorer: ${result.explorerLink || "Unavailable"}`
+                ? buildVaultExecutionContent({
+                    action: action as "deposit" | "withdraw",
+                    txHash: result.txHash,
+                    explorerLink: result.receipt?.explorerLink,
+                    approvalTxHash: result.approvalTxHash,
+                    approvalExplorerLink: result.receipt?.approvalExplorerLink,
+                    provider: result.provider || null,
+                    vaultSymbol: result.vaultSymbol || null,
+                    sharesReceivedFormatted: result.sharesReceivedFormatted || null,
+                    sharesBurnedFormatted: result.sharesBurnedFormatted || null,
+                    assetsReceivedFormatted: result.assetsReceivedFormatted || null,
+                  })
                 : `Vault ${action} completed.`,
           trace: [
             ...(message.trace || []),
             action === "check_apy"
               ? "Vault APY read complete"
-              : action === "usyc_deposit"
-                ? result.txHash
-                  ? `USYC subscribe verified - ${result.txHash.slice(0, 10)}...`
-                  : "USYC subscribe complete"
-                : action === "usyc_withdraw"
-                  ? result.txHash
-                    ? `USYC redeem verified - ${result.txHash.slice(0, 10)}...`
-                    : "USYC redeem complete"
               : result.txHash
                 ? `Vault ${action} verified - ${result.txHash.slice(0, 10)}...`
                 : `Vault ${action} complete`,
@@ -2632,110 +5557,6 @@ function ChatPageInner() {
         return;
       }
 
-      if (intent === "Bridge") {
-        abortRef.current?.abort();
-        const controller = new AbortController();
-        abortRef.current = controller;
-
-        const amount = parseAmount(trimmed, 0.1);
-        const sourceChain = detectBridgeSource(trimmed);
-        const bridgeHeadTrace: [string, string] = [
-          `Bridge request prepared for ${amount} USDC`,
-          `Source chain: ${sourceChain}`,
-        ];
-
-        updateMessage(assistantId, (message) => ({
-          ...message,
-          content: `Starting a bridge from ${sourceChain} to Arc.`,
-          trace: [...bridgeHeadTrace],
-        }));
-
-        await streamBridgeAgent({
-          walletClient: activeWalletClient,
-          payer: payerAddress,
-          authHeaders,
-          body: {
-            walletAddress: payerAddress,
-            amount,
-            sourceChain,
-            targetChain: "arc-testnet",
-          },
-          signal: controller.signal,
-          onEvent: ({ event, data }) => {
-            if (event === "payment") {
-              const mode: "dcw" | "eoa" = data.mode === "eoa" ? "eoa" : "dcw";
-              updateMessage(assistantId, (message) => ({
-                ...message,
-                paymentMeta: {
-                  entries: [
-                    {
-                      requestId: String(data.requestId || ""),
-                      agent: String(data.agent || "bridge"),
-                      price: String(data.price || paymentPriceLabel("bridge")),
-                      payer: typeof data.payer === "string" ? data.payer : payerAddress,
-                      mode,
-                      sponsored: false,
-                      transactionRef: null,
-                      settlementTxHash: null,
-                    },
-                  ].filter((entry) => entry.requestId),
-                },
-              }));
-              return;
-            }
-            if (event === "done") {
-              const fromResult = traceEntriesFromBridgeResult(data.result, sourceChain);
-              updateMessage(assistantId, (message) => {
-                let trace = message.trace ?? [];
-                if (data.success === true) {
-                  if (fromResult.length > 0) {
-                    trace = [...bridgeHeadTrace, ...fromResult, "Bridge run finished"];
-                  } else {
-                    const tail = bridgeTraceFromStreamEvent("done", data, sourceChain);
-                    trace = tail ? [...(message.trace ?? []), tail] : (message.trace ?? []);
-                  }
-                } else {
-                  trace = [
-                    ...bridgeHeadTrace,
-                    typeof data.reason === "string" ? data.reason : "Bridge failed",
-                  ];
-                }
-                return {
-                  ...message,
-                  content:
-                    data.success === true
-                      ? "Bridge flow finished. Use the settlement timeline to open each transaction on a block explorer."
-                      : typeof data.reason === "string"
-                        ? data.reason
-                        : message.content,
-                  trace,
-                  status: data.success === true ? "complete" : "error",
-                };
-              });
-              return;
-            }
-
-            const nextTrace = bridgeTraceFromStreamEvent(event, data, sourceChain);
-
-            updateMessage(assistantId, (message) => ({
-              ...message,
-              content:
-                event === "error"
-                  ? typeof data.message === "string"
-                    ? data.message
-                    : message.content
-                  : message.content,
-              trace: nextTrace ? [...(message.trace || []), nextTrace] : message.trace,
-              status: event === "error" ? "error" : "streaming",
-            }));
-          },
-        });
-
-        if (abortRef.current === controller) {
-          abortRef.current = null;
-        }
-        return;
-      }
     } catch (error) {
       if ((error as Error).name === "AbortError") {
         updateMessage(assistantId, (message) => ({
@@ -2793,6 +5614,7 @@ function ChatPageInner() {
                   signIn().catch(() => {});
                 }}
                 signInLoading={signInLoading}
+                signInError={signInError}
               />
             </>
           }
@@ -2806,6 +5628,8 @@ function ChatPageInner() {
                 <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                 <ChatThread
                   messages={messages}
+                  onFeedback={handleAssistantFeedback}
+                  onRateAgent={handleAgentRating}
                   onSendMessage={(message) => {
                     void submitMessage(message, null);
                   }}
@@ -2853,9 +5677,9 @@ function ChatPageInner() {
               </div>
             ) : (
               <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
-                <div className="mx-auto flex h-full w-full max-w-5xl flex-col justify-start px-6 pb-8 pt-[clamp(7rem,20vh,12rem)] xl:px-10">
+                <div className="mx-auto flex h-full w-full max-w-[1064px] flex-col justify-start px-6 pb-8 pt-[clamp(11.25rem,26vh,14rem)] xl:px-10">
                   <div className="text-center">
-                    <h1 className="font-headline text-[clamp(2.35rem,4.2vw,3.5rem)] font-black leading-[1] tracking-tight text-white">
+                    <h1 className="font-headline text-[clamp(2.6rem,4.35vw,4.05rem)] font-black leading-[1] tracking-tight text-white">
                       How can I help today?
                     </h1>
                   </div>

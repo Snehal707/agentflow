@@ -1,0 +1,179 @@
+{
+  "name": "bitcoin-price-and-drivers",
+  "captured_at": "2026-05-23T17:08:39.606Z",
+  "task": "Bitcoin price today and crypto market drivers",
+  "brief": {
+    "query": "Bitcoin price today and crypto market drivers",
+    "intent": "Relevant",
+    "scope": "broad",
+    "time_sensitivity": "live",
+    "required_freshness_days": 1,
+    "geography": [
+      "Global"
+    ],
+    "domains_priority": [
+      "Finance",
+      "Economics",
+      "Cryptocurrency"
+    ],
+    "domains_avoid": [
+      "rss",
+      "news.google.com",
+      "Sports",
+      "Entertainment"
+    ],
+    "preferred_source_types": [
+      "Official",
+      "Market data",
+      "Reputable news"
+    ],
+    "must_answer": [
+      "Current Bitcoin price",
+      "Key drivers of crypto market movement"
+    ],
+    "avoid_drift": [
+      "Individual stock analysis",
+      "Non-crypto news",
+      "Political opinions"
+    ],
+    "minimum_source_diversity": 3,
+    "sub_questions": [
+      "What is Bitcoin's current price?",
+      "What factors are driving crypto market activity?",
+      "How do macroeconomic trends impact Bitcoin?",
+      "What is the sentiment among crypto investors?",
+      "Are there any regulatory developments affecting Bitcoin?"
+    ],
+    "evaluation_rubric": "Comprehensive, accurate, timely coverage of Bitcoin price and crypto market drivers with diverse credible sources."
+  },
+  "queries": [
+    "Bitcoin price today and crypto market drivers",
+    "Bitcoin price today and crypto market drivers overview 2026",
+    "Bitcoin price today and crypto market drivers latest developments 2026",
+    "Bitcoin price today and crypto market drivers statistics data report",
+    "Bitcoin price today and crypto market drivers risks challenges analysis",
+    "Bitcoin price today and crypto market drivers official data report",
+    "Bitcoin price today and crypto market drivers Reuters 2026",
+    "Bitcoin price today and crypto market drivers BBC 2026",
+    "Bitcoin price today and crypto market drivers Wikipedia background",
+    "Bitcoin price today and crypto market drivers academic research overview",
+    "Bitcoin price today and crypto market drivers Current Bitcoin price",
+    "Current Bitcoin price 2026",
+    "Bitcoin price today and crypto market drivers Key drivers of crypto market movement",
+    "Key drivers of crypto market movement 2026",
+    "What is Bitcoin's current price",
+    "latest What is Bitcoin's current price 2026",
+    "official What is Bitcoin's current price report site:.gov OR site:.org",
+    "What is Bitcoin's current price statistics data numbers",
+    "criticism concerns What is Bitcoin's current price",
+    "What factors are driving crypto market activity",
+    "latest What factors are driving crypto market activity 2026",
+    "official What factors are driving crypto market activity report site:.gov OR site:.org",
+    "What factors are driving crypto market activity statistics data numbers",
+    "criticism concerns What factors are driving crypto market activity",
+    "How do macroeconomic trends impact Bitcoin",
+    "latest How do macroeconomic trends impact Bitcoin 2026",
+    "official How do macroeconomic trends impact Bitcoin report site:.gov OR site:.org",
+    "How do macroeconomic trends impact Bitcoin statistics data numbers",
+    "criticism concerns How do macroeconomic trends impact Bitcoin",
+    "What is the sentiment among crypto investors",
+    "latest What is the sentiment among crypto investors 2026",
+    "official What is the sentiment among crypto investors report site:.gov OR site:.org",
+    "What is the sentiment among crypto investors statistics data numbers",
+    "criticism concerns What is the sentiment among crypto investors",
+    "Are there any regulatory developments affecting Bitcoin",
+    "latest Are there any regulatory developments affecting Bitcoin 2026",
+    "official Are there any regulatory developments affecting Bitcoin report site:.gov OR site:.org",
+    "Are there any regulatory developments affecting Bitcoin statistics data numbers",
+    "criticism concerns Are there any regulatory developments affecting Bitcoin",
+    "What is Bitcoin's current price? site:www.coingecko.com",
+    "What factors are driving crypto market activity? site:www.coingecko.com",
+    "What is Bitcoin's current price? site:www.reutersagency.com",
+    "What factors are driving crypto market activity? site:www.reutersagency.com",
+    "What is Bitcoin's current price? site:indexer.dydx.trade",
+    "What factors are driving crypto market activity? site:indexer.dydx.trade"
+  ],
+  "sources": [
+    {
+      "url": "https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm",
+      "title": "CFTC Commitments of Traders",
+      "date": "2026-05-19T00:00:00.000",
+      "snippet": "Title: CFTC COT: BITCOIN CASH PERP STYLE - COINBASE DERIVATIVES, LLC\nURL: https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm\nDate: 2026-05-19T00:00:00.000\nMarket and exchange: BITCOIN CASH PERP STYLE - COINBASE DERIVATIVES, LLC Report date: 2026-05-19T00:00:00.000 CFTC market code: 133LM5 Open interest: 1839 Non-commercial long: 1468 Non-commercial short: 762 Commercial long: 0 Commercial short: 1005\n\n---\n\nTitle: CFTC COT: BITCOIN - CHICAGO MERCANTILE EXCHANGE\nURL: https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm\nDate: 2026-05-19T00:00:00.000\nMarket and exchange: BITCOIN - CHICAGO MERCANTILE EXCHANGE Report date: 2026-05-19T00:00:00.000 CFTC market code: 133741 Open interest: 23000 Non-commercial long: 17791 Non-commercial short: 15679 Commercial long: 212 Commercial short: 2484\n\n---\n\nTitle: CFTC COT: NANO BITCOIN PERP STYLE - COINBASE DERIVATIVES, LLC\nURL: https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm\nDate: 2026-05-19T00:00:00.000\nMarket and exchange: NANO BITCOIN PERP STYLE - COINBASE DERIVATIVES, LLC Report date: 2026-05-19T00:00:00.000 CFTC market code: 133LM4 Open interest: 169919 Non-commercial long: 154539 Non-commercial short: 162169 Commercial long: 2434 Commercial short: 1010",
+      "domain": "www.cftc.gov",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.coingecko.com",
+      "title": "CoinGecko",
+      "date": "",
+      "snippet": "Title: Bitcoin\nURL: https://www.coingecko.com\nSymbol: BTC ID: bitcoin Rank: 1\n\n---\n\nTitle: Bitcoin Cash\nURL: https://www.coingecko.com\nSymbol: BCH ID: bitcoin-cash Rank: 16\n\n---\n\nTitle: Bitcoin SV\nURL: https://www.coingecko.com\nSymbol: BSV ID: bitcoin-cash-sv Rank: 150",
+      "domain": "www.coingecko.com",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.reutersagency.com",
+      "title": "Reuters",
+      "date": "",
+      "snippet": "Title: Reuters\nURL: https://www.reutersagency.com\nThis website stores cookies on your computer. These cookies are used to collect information about how you interact with our website and allow us to remember you. We use this information in order to improve and customize your browsing experience and for analytics and metrics about our visitors both on this website and other media. To find out more about the cookies we use, see our Privacy Statement , Cookie & IBA Statement and Vendors List . Cookies settings AcceptDecline Skip to main content Reuters Leading the Future of News ================================== 2,600 Journalists 165 Countries 12 Languages Bringing the world to the world in real-time -------------------------------------------",
+      "domain": "www.reutersagency.com",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.imf.org",
+      "title": "IMF",
+      "date": "",
+      "snippet": "Title: IMF NGDP_RPCH\nURL: https://www.imf.org\nSDN 2031: 4.5 AFG 2025: 3 ALB 2031: 3.2 DZA 2031: 2.6 AND 2031: 1.5",
+      "domain": "www.imf.org",
+      "reliability": "high"
+    },
+    {
+      "url": "https://coinpaprika.com",
+      "title": "CoinPaprika",
+      "date": "",
+      "snippet": "Title: Bitcoin\nURL: https://coinpaprika.com\nSymbol: BTC ID: btc-bitcoin Rank: 1\n\n---\n\nTitle: Wrapped Bitcoin\nURL: https://coinpaprika.com\nSymbol: WBTC ID: wbtc-wrapped-bitcoin Rank: 13\n\n---\n\nTitle: Bitcoin Cash\nURL: https://coinpaprika.com\nSymbol: BCH ID: bch-bitcoin-cash Rank: 21",
+      "domain": "coinpaprika.com",
+      "reliability": "high"
+    },
+    {
+      "url": "https://api.binance.com",
+      "title": "Binance Public API",
+      "date": "",
+      "snippet": "Title: BTCUSDT Binance ticker\nURL: https://api.binance.com\nLast price: 75465.67000000 24h change: -1.924% Volume: 14687.18981000",
+      "domain": "api.binance.com",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.kraken.com",
+      "title": "Kraken API",
+      "date": "",
+      "snippet": "Title: XXBTZUSD Kraken ticker\nURL: https://www.kraken.com\nLast price: 75357.20000 24h volume: 1874.87805898",
+      "domain": "www.kraken.com",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.coinbase.com",
+      "title": "Coinbase API",
+      "date": "",
+      "snippet": "Title: BTC/USD Coinbase spot price\nURL: https://www.coinbase.com\nSpot price: 75380.035 USD",
+      "domain": "www.coinbase.com",
+      "reliability": "high"
+    },
+    {
+      "url": "https://www.deribit.com",
+      "title": "Deribit Public API",
+      "date": "",
+      "snippet": "Title: Deribit BTC-5JUN26\nURL: https://www.deribit.com\nLast: 75372.5 Bid/ask: 75385 / 75387.5 Open interest: 9389500 Volume USD: 2930060 Price change: -1.9066%\n\n---\n\nTitle: Deribit BTC-PERPETUAL\nURL: https://www.deribit.com\nLast: 75364 Bid/ask: 75368 / 75368.5 Open interest: 1029496030 Volume USD: 392041930 Price change: -1.9445%\n\n---\n\nTitle: Deribit BTC-27MAY26\nURL: https://www.deribit.com\nLast: 74285 Bid/ask: 75080 / 75640 Open interest: 10 Volume USD: 10 Price change: 0%",
+      "domain": "www.deribit.com",
+      "reliability": "high"
+    },
+    {
+      "url": "https://stablecoins.llama.fi",
+      "title": "DeFiLlama Stablecoins",
+      "date": "",
+      "snippet": "Title: Tether USDT\nURL: https://stablecoins.llama.fi\nSymbol: USDT Peg type: peggedUSD Peg mechanism: fiat-backed Price: 0.9988222122731325 Circulating pegged USD: 189466175908.3349 Chains: Tron, Ethereum, BSC, Solana, Arbitrum, Aptos, Polygon, Plasma\n\n---\n\nTitle: USD Coin USDC\nURL: https://stablecoins.llama.fi\nSymbol: USDC Peg type: peggedUSD Peg mechanism: fiat-backed Price: 0.9997036619655146 Circulating pegged USD: 76559459445.79544 Chains: Ethereum, Solana, Hyperliquid L1, Base, Arbitrum, Polygon, BSC, Avalanche\n\n---\n\nTitle: Sky Dollar USDS\nURL: https://stablecoins.llama.fi\nSymbol: USDS Peg type: peggedUSD Peg mechanism: crypto-backed Price: 0.9996222295285887 Circulating pegged USD: 8833630786.099564 Chains: Ethereum, Base, OP Mainnet, Unichain, Arbitrum, Solana, Avalanche",
+      "domain": "stablecoins.llama.fi",
+      "reliability": "high"
+    }
+  ],
+  "captured_runtime_version": "0.1.0"
+}

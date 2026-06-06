@@ -598,24 +598,5 @@ function applyLiveFundApy(row: Record<string, unknown>, liveVaultAPY: number): R
 }
 
 async function readLiveVaultApyPercent(): Promise<number> {
-  const mod = (await import('../lib/vault-apy')) as Record<string, unknown> & {
-    default?: Record<string, unknown>;
-  };
-  const readVaultApyPercent =
-    (mod.readVaultApyPercent as ((address: `0x${string}`) => Promise<number>) | undefined) ??
-    (mod.default?.readVaultApyPercent as ((address: `0x${string}`) => Promise<number>) | undefined);
-  const resolveVaultAddress =
-    (mod.resolveVaultAddress as (() => `0x${string}` | null) | undefined) ??
-    (mod.default?.resolveVaultAddress as (() => `0x${string}` | null) | undefined);
-
-  if (!readVaultApyPercent || !resolveVaultAddress) {
-    return 5.0;
-  }
-
-  const vaultAddress = resolveVaultAddress();
-  if (!vaultAddress) {
-    return 5.0;
-  }
-
-  return readVaultApyPercent(vaultAddress);
+  return Number(process.env.VAULT_TARGET_APY || '5.3');
 }

@@ -1,11 +1,15 @@
 import { type Address, type WalletClient } from "viem";
-import { defaultPriceBySlug, getAgentRunUrl, BACKEND } from "@/lib/agentEndpoints";
+import { defaultPriceBySlug, getAgentRunUrl } from "@/lib/agentEndpoints";
 import { ARC_CHAIN_ID } from "@/lib/arcChain";
+import { fetchBrowserApi, getBrowserBackendUrl } from "@/lib/browserApi";
+import { persistPortfolioSnapshot } from "@/lib/persistedWalletCache";
 import {
+  createBrowserX402RequestId,
   payProtectedFetchWithMeta,
   payProtectedResource,
   type PayProtectedResourceResult,
 } from "@/lib/x402BrowserClient";
+import { sanitizeAssistantStreamDelta } from "../../lib/sanitizeAssistantStreamDelta";
 
 export type PipelineStepKey = "research" | "analyst" | "writer";
 
@@ -235,8 +239,8 @@ type ExecutionWalletSummaryCacheEntry = {
   expiresAt: number;
 };
 
-const PORTFOLIO_SNAPSHOT_TTL_MS = 8_000;
-const EXECUTION_WALLET_SUMMARY_TTL_MS = 8_000;
+const PORTFOLIO_SNAPSHOT_TTL_MS = 60_000;
+const EXECUTION_WALLET_SUMMARY_TTL_MS = 30_000;
 const portfolioSnapshotCache = new Map<string, PortfolioSnapshotCacheEntry>();
 const portfolioSnapshotInflight = new Map<string, Promise<PortfolioSnapshotResponse>>();
 const executionWalletSummaryCache = new Map<string, ExecutionWalletSummaryCacheEntry>();
@@ -343,6 +347,20 @@ function normalizeExecutionWalletSummary(
   };
 }
 
+function findHoldingBalance(
+  holdings: PortfolioHolding[],
+  matcher: (holding: PortfolioHolding) => boolean,
+): { raw: string; formatted: string } {
+  const holding = holdings.find(matcher);
+  if (!holding) {
+    return { raw: "0", formatted: "0" };
+  }
+  return {
+    raw: holding.balanceRaw || "0",
+    formatted: holding.balanceFormatted || "0",
+  };
+}
+
 type PipelineInput = {
   task: string;
   walletAddress: string;
@@ -357,14 +375,23 @@ export type ConversationMessage = {
 
 type ConversationInput = {
   message: string;
+  /** Visible user text only (omit portfolio / injected context). Used server-side for capability FAQ routing only. */
+  rawUserMessage?: string;
+  quickActionContext?: {
+    actionId?: string;
+    prompt: string;
+  };
   messages: ConversationMessage[];
   walletAddress?: string;
   executionTarget?: "EOA" | "DCW";
+  browserTimeZone?: string;
+  browserLocale?: string;
   sessionId?: string;
   signal?: AbortSignal;
   authHeaders?: Record<string, string>;
   onDelta: (delta: string) => void;
   onMeta?: (meta: {
+    eventId?: string;
     title?: string;
     trace?: Array<string | { label: string; txHash?: string; explorerUrl?: string }>;
     reportMeta?: {
@@ -391,10 +418,25 @@ type ConversationInput = {
         settlementTxHash?: string | null;
       }>;
     };
+    ratingMeta?: {
+      taskId: string;
+      requestId: string;
+      agentSlug: string;
+      settlementRef: string;
+    };
     confirmation?: {
       required: boolean;
       action: "swap" | "vault" | "bridge" | "execute" | "schedule" | "split" | "invoice" | "batch";
     };
+    quickActionGroups?: Array<{
+      title?: string;
+      actions: Array<{
+        label: string;
+        prompt: string;
+        actionId?: string;
+        tone?: "primary" | "secondary";
+      }>;
+    }>;
     paymentLink?: {
       handle: string;
       displayHandle: string;
@@ -423,21 +465,12 @@ type PortfolioRunInput = {
 };
 
 type PaidAgentRunInput<TBody extends Record<string, unknown>> = {
-  slug: "ascii" | "swap" | "vault" | "vision" | "transcribe";
+  slug: "swap" | "vault" | "vision" | "transcribe";
   walletClient: WalletClient;
   payer: Address;
   authHeaders: Record<string, string>;
   body: TBody;
   onAwaitSignature?: () => void;
-};
-
-type BridgeRunInput = {
-  walletClient: WalletClient;
-  payer: Address;
-  authHeaders: Record<string, string>;
-  body: Record<string, unknown>;
-  signal?: AbortSignal;
-  onEvent: (event: { event: string; data: Record<string, unknown> }) => void;
 };
 
 type AgentRunPayment = {
@@ -494,8 +527,32 @@ function attachBrowserPaymentMetadata<TResponse>(
   return data as TResponse;
 }
 
+async function runAuthedAgent<TResponse>(
+  slug: "transcribe",
+  body: Record<string, unknown>,
+  authHeaders: Record<string, string>,
+): Promise<TResponse> {
+  const response = await fetch(getAgentRunUrl(slug), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders,
+    },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+
+  const json = (await response.json().catch(() => ({}))) as TResponse & {
+    error?: string;
+  };
+  if (!response.ok) {
+    throw new Error(json.error || `${slug} run failed`);
+  }
+  return json;
+}
+
 async function runDcwPaidAgent<TResponse>(
-  slug: "ascii" | "swap" | "vault" | "portfolio" | "vision" | "transcribe",
+  slug: "swap" | "vault" | "portfolio" | "vision" | "transcribe",
   body: Record<string, unknown>,
   authHeaders: Record<string, string>,
 ): Promise<TResponse> {
@@ -531,7 +588,7 @@ async function runDcwPaidAgent<TResponse>(
 }
 
 export async function ensureCircleWallet(walletAddress: string): Promise<void> {
-  const response = await fetch(`${BACKEND}/wallet/create`, {
+  const response = await fetch(getBrowserBackendUrl("/wallet/create"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ userAddress: walletAddress }),
@@ -548,7 +605,7 @@ export async function ensureCircleWallet(walletAddress: string): Promise<void> {
 export async function streamAgentFlow(input: PipelineInput): Promise<void> {
   await ensureCircleWallet(input.walletAddress);
 
-  const response = await fetch(`${BACKEND}/run`, {
+  const response = await fetch(getBrowserBackendUrl("/run"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -609,7 +666,7 @@ export async function streamAgentFlow(input: PipelineInput): Promise<void> {
 export async function streamConversationReply(
   input: ConversationInput,
 ): Promise<void> {
-  const response = await fetch(`${BACKEND}/api/chat/respond`, {
+  const response = await fetch(getBrowserBackendUrl("/api/chat/respond"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -618,9 +675,17 @@ export async function streamConversationReply(
     },
     body: JSON.stringify({
       message: input.message,
+      ...(input.rawUserMessage !== undefined
+        ? { rawUserMessage: input.rawUserMessage }
+        : {}),
+      ...(input.quickActionContext
+        ? { quickActionContext: input.quickActionContext }
+        : {}),
       messages: input.messages,
       walletAddress: input.walletAddress,
       executionTarget: input.executionTarget,
+      browserTimeZone: input.browserTimeZone,
+      browserLocale: input.browserLocale,
     }),
     signal: input.signal,
   });
@@ -656,6 +721,7 @@ export async function streamConversationReply(
       analysis?: unknown;
       liveData?: unknown;
       meta?: {
+        eventId?: string;
         title?: string;
         trace?: Array<string | { label: string; txHash?: string; explorerUrl?: string }>;
         reportMeta?: {
@@ -681,6 +747,12 @@ export async function streamConversationReply(
             transactionRef?: string | null;
             settlementTxHash?: string | null;
           }>;
+        };
+        ratingMeta?: {
+          taskId: string;
+          requestId: string;
+          agentSlug: string;
+          settlementRef: string;
         };
         confirmation?: {
           required: boolean;
@@ -741,7 +813,7 @@ export async function streamConversationReply(
       input.onMeta(rec.meta);
     }
     if (rec.delta) {
-      const cleanDelta = rec.delta.replace(/\[\[AFMETA:[^\]]*\]\]/g, "");
+      const cleanDelta = sanitizeAssistantStreamDelta(rec.delta);
       if (cleanDelta) {
         input.onDelta(cleanDelta);
       }
@@ -791,7 +863,7 @@ export async function fetchPortfolioSnapshot(
     }
   }
 
-  const url = new URL(`${BACKEND}/api/portfolio/snapshot`);
+  const url = new URL(getBrowserBackendUrl("/api/portfolio/snapshot"));
   url.searchParams.set("walletAddress", walletAddress);
 
   const request = (async () => {
@@ -802,6 +874,7 @@ export async function fetchPortfolioSnapshot(
     if (!response.ok) {
       throw new Error(normalizePortfolioSnapshotError(json.error));
     }
+    persistPortfolioSnapshot(json);
     portfolioSnapshotCache.set(normalizedWallet, {
       snapshot: json,
       expiresAt: Date.now() + PORTFOLIO_SNAPSHOT_TTL_MS,
@@ -819,7 +892,7 @@ export async function fetchPortfolioSnapshot(
 
 export async function fetchExecutionWalletSummary(
   authHeaders: Record<string, string>,
-  options?: { force?: boolean },
+  options?: { force?: boolean; hydrateFromPortfolioSnapshot?: boolean },
 ): Promise<ExecutionWalletSummary> {
   const cacheKey = authHeaders.Authorization ?? JSON.stringify(authHeaders);
   const now = Date.now();
@@ -835,16 +908,16 @@ export async function fetchExecutionWalletSummary(
   }
 
   const request = (async () => {
-    const response = await fetch(`/api/wallet/execution`, {
+    const response = await fetchBrowserApi(`/api/wallet/execution-summary`, {
       headers: {
         ...authHeaders,
       },
       cache: "no-store",
     });
 
-    const json = (await response.json()) as Partial<ExecutionWalletSummary> & {
+    const json = (await response.json()) as (Partial<ExecutionWalletSummary> & {
       error?: string;
-    };
+    });
     if (!response.ok) {
       throw new Error(normalizeExecutionWalletSummaryError(json.error));
     }
@@ -922,6 +995,10 @@ export async function runPortfolioAgent(
 export async function runPaidAgent<TResponse, TBody extends Record<string, unknown>>(
   input: PaidAgentRunInput<TBody>,
 ): Promise<TResponse> {
+  if (input.slug === "transcribe") {
+    return runAuthedAgent<TResponse>(input.slug, input.body, input.authHeaders);
+  }
+
   const requestedExecutionTarget = (() => {
     const raw = (input.body as { executionTarget?: unknown }).executionTarget;
     return typeof raw === "string" ? raw.toUpperCase() : "";
@@ -952,10 +1029,35 @@ export async function runPaidAgent<TResponse, TBody extends Record<string, unkno
   return attachBrowserPaymentMetadata(input.slug, input.payer, result);
 }
 
-export async function streamBridgeAgent(input: BridgeRunInput): Promise<void> {
-  const { response, requestId } = await payProtectedFetchWithMeta({
-    url: getAgentRunUrl("bridge"),
+export async function finalizeBridgeRun(input: {
+  requestId?: string;
+  walletClient: WalletClient;
+  payer: Address;
+  authHeaders: Record<string, string>;
+  body: {
+    sourceChain: string;
+    amount: number;
+    sourceTxHash?: string | null;
+    approvalTxHash?: string | null;
+    mintTxHash?: string | null;
+    recipientAddress?: string | null;
+  };
+  onAwaitSignature?: () => void;
+}): Promise<{
+  requestId: string;
+  payment: {
+    requestId: string;
+    agent: string;
+    price: string;
+    payer: Address;
+    mode: "eoa";
+  };
+}> {
+  const requestId = input.requestId?.trim() || createBrowserX402RequestId();
+  const { response, requestId: finalizedRequestId } = await payProtectedFetchWithMeta({
+    url: "/api/bridge/finalize",
     method: "POST",
+    requestId,
     body: input.body,
     walletClient: input.walletClient,
     payer: input.payer,
@@ -964,74 +1066,23 @@ export async function streamBridgeAgent(input: BridgeRunInput): Promise<void> {
       "Content-Type": "application/json",
       ...input.authHeaders,
     },
-    signal: input.signal,
+    onAwaitSignature: input.onAwaitSignature,
   });
 
-  input.onEvent({
-    event: "payment",
-    data: {
-      requestId,
+  if (!response.ok) {
+    throw new Error("Bridge finalize failed");
+  }
+
+  return {
+    requestId: finalizedRequestId,
+    payment: {
+      requestId: finalizedRequestId,
       agent: "bridge",
       price: paymentPriceLabel("bridge"),
       payer: input.payer,
       mode: "eoa",
     },
-  });
-
-  if (!response.body) {
-    throw new Error("Bridge agent did not return a stream.");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-  let currentEvent = "message";
-
-  const flushBlock = (block: string) => {
-    const lines = block.split("\n");
-    let dataLine = "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("event:")) {
-        currentEvent = trimmed.slice(6).trim() || "message";
-      } else if (trimmed.startsWith("data:")) {
-        dataLine += trimmed.slice(5).trim();
-      }
-    }
-
-    if (!dataLine) {
-      return;
-    }
-
-    input.onEvent({
-      event: currentEvent,
-      data: JSON.parse(dataLine) as Record<string, unknown>,
-    });
-    currentEvent = "message";
   };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      buffer += decoder.decode();
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    const blocks = buffer.split("\n\n");
-    buffer = blocks.pop() ?? "";
-
-    for (const block of blocks) {
-      if (block.trim()) {
-        flushBlock(block);
-      }
-    }
-  }
-
-  if (buffer.trim()) {
-    flushBlock(buffer);
-  }
 }
 
 export type GatewayWithdrawResult = {
@@ -1056,7 +1107,7 @@ export type GatewayDepositInfo = {
 export async function fetchGatewayDepositInfo(
   authHeaders: Record<string, string>,
 ): Promise<GatewayDepositInfo> {
-  const response = await fetch(`${BACKEND}/api/wallet/gateway/deposit`, {
+  const response = await fetch(getBrowserBackendUrl("/api/wallet/gateway/deposit"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1077,21 +1128,62 @@ export type GatewayBalanceApiResponse = {
   queriedDepositors: string[];
 };
 
-/** GET Next.js `/api/wallet/gateway/balance` (proxies backend; requires session). */
+export type UnifiedBalanceApiResponse = {
+  configured: boolean;
+  token: "USDC";
+  currency: "USDC";
+  confirmed: string;
+  pending: string;
+  walletAddress?: string;
+  queriedDepositors: string[];
+  breakdown: Array<{
+    depositor: string;
+    totalConfirmed: string;
+    totalPending: string;
+    chains: Array<{
+      chain: string;
+      confirmed: string;
+      pending: string;
+      pendingTransactions: Array<{
+        transactionHash: string;
+        amount: string;
+        blockTimestamp: string;
+      }>;
+    }>;
+  }>;
+  error?: string;
+};
+
 export async function fetchGatewayBalance(
   authHeaders: Record<string, string>,
 ): Promise<GatewayBalanceApiResponse> {
-  const origin =
-    typeof window !== "undefined"
-      ? window.location.origin
-      : (process.env.NEXT_PUBLIC_FRONTEND_URL || "http://localhost:3005").replace(/\/+$/, "");
-  const response = await fetch(`${origin}/api/wallet/gateway/balance`, {
+  const response = await fetchBrowserApi(`/api/wallet/unified-balance`, {
     headers: { ...authHeaders },
     cache: "no-store",
   });
-  const json = (await response.json()) as GatewayBalanceApiResponse & { error?: string };
+  const json = (await response.json()) as UnifiedBalanceApiResponse;
   if (!response.ok) {
     throw new Error(json.error || "Gateway balance fetch failed");
+  }
+  return {
+    balance: json.confirmed ?? "0",
+    currency: "USDC",
+    walletAddress: json.walletAddress ?? "",
+    queriedDepositors: json.queriedDepositors ?? [],
+  };
+}
+
+/** Read-only Arc Unified Balance via Circle App Kit; requires session. */
+export async function fetchUnifiedBalance(
+  authHeaders: Record<string, string>,
+): Promise<UnifiedBalanceApiResponse> {
+  const response = await fetchBrowserApi(`/api/wallet/unified-balance`, {
+    headers: { ...authHeaders },
+    cache: "no-store",
+  });
+  const json = (await response.json()) as UnifiedBalanceApiResponse & { error?: string };
+  if (!response.ok) {
+    throw new Error(json.error || "Unified Balance fetch failed");
   }
   return json;
 }
@@ -1106,7 +1198,7 @@ export async function moveGatewayToExecution(input: {
   executionWalletAddress: string;
   newBalance: string;
 }> {
-  const response = await fetch(`${BACKEND}/api/wallet/gateway/to-execution`, {
+  const response = await fetch(getBrowserBackendUrl("/api/wallet/gateway/to-execution"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1137,7 +1229,7 @@ export async function depositGatewayFromExecution(input: {
   authHeaders: Record<string, string>;
   amount: string;
 }): Promise<GatewayDepositResult> {
-  const response = await fetch(`${BACKEND}/api/wallet/deposit-gateway`, {
+  const response = await fetch(getBrowserBackendUrl("/api/wallet/gateway/deposit"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1158,7 +1250,7 @@ export async function withdrawGatewayUsdc(input: {
   amount: string;
   toAddress?: string;
 }): Promise<GatewayWithdrawResult> {
-  const response = await fetch(`${BACKEND}/api/wallet/gateway/withdraw`, {
+  const response = await fetch(getBrowserBackendUrl("/api/wallet/gateway/withdraw"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1185,7 +1277,7 @@ export async function withdrawExecutionWalletUsdc(input: {
   amountUsdc: number;
   toAddress: string;
 }): Promise<{ success: boolean; txHash?: string }> {
-  const response = await fetch(`${BACKEND}/api/wallet/withdraw`, {
+  const response = await fetch(getBrowserBackendUrl("/api/wallet/withdraw"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

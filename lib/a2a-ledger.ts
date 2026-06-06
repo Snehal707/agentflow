@@ -4,6 +4,7 @@ import {
   pickX402SettlementReference,
   type X402SettlementTransaction,
 } from './x402ServerClient';
+import { insertAgentEconomyLedger } from './agent-economy-ledger';
 
 function isMissingTransactionsColumnError(message: string): boolean {
   return (
@@ -59,6 +60,26 @@ export async function insertAgentToAgentLedger(
   if (error) {
     console.error(`[a2a] ledger insert FAILED (${input.context}):`, error.message);
     return { ok: false, error: error.message };
+  }
+
+  const economyLedger = await insertAgentEconomyLedger({
+    requestId: input.requestId ?? pickX402SettlementReference(input.settlement) ?? null,
+    buyerWallet: input.fromWallet,
+    sellerWallet: input.toWallet,
+    buyerAgent: input.buyerAgent,
+    sellerAgent: input.sellerAgent,
+    amount: input.amount,
+    paymentRail: 'x402/gateway',
+    settlement: input.settlement,
+    metadata: {
+      context: input.context,
+      remark: input.remark,
+      source: 'transactions_mirror',
+    },
+  });
+
+  if (!economyLedger.ok) {
+    console.warn(`[a2a] agent economy ledger insert failed (${input.context}):`, economyLedger.error);
   }
 
   console.log(

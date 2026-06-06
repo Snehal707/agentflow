@@ -17,6 +17,7 @@ import {
   fetchExecutionWalletSummary,
   type ExecutionWalletSummary,
 } from "@/lib/liveAgentClient";
+import { emitWalletRefresh, subscribeWalletRefresh } from "@/lib/walletRefresh";
 
 const erc20TransferAbi = [
   {
@@ -108,6 +109,15 @@ export function ExecutionWalletPanel({
     void refreshSummary();
   }, [isConnected, walletAddress, isAuthenticated, authBearer, refreshSummary]);
 
+  useEffect(() => {
+    if (!isConnected || !walletAddress || !isAuthenticated || !authBearer) {
+      return;
+    }
+    return subscribeWalletRefresh(() => {
+      void refreshSummary();
+    });
+  }, [isConnected, walletAddress, isAuthenticated, authBearer, refreshSummary]);
+
   /** Avoid flashing “Loading…” on every re-fetch when we already have data (stale-while-revalidate). */
   const showInitialLoading = isLoading && !summary;
 
@@ -173,6 +183,10 @@ export function ExecutionWalletPanel({
       setActionState("success");
       setActionMessage("USDC sent to the agent wallet.");
       await refreshSummary();
+      emitWalletRefresh({
+        source: "execution-wallet-fund",
+        walletAddress: summary.userAgentWalletAddress,
+      });
     } catch (error) {
       setActionState("error");
       setActionMessage(

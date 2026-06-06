@@ -57,3 +57,12 @@ foundry/lib/openzeppelin-contracts/
 /STRICT_GAP_CHECKLIST_PER_ROUTE.md
 /agentflow-v3-cursor-prompt.md
 /batch-test.csv
+
+# Recovery scratch (git-wipe recovery 2026-06-06)
+/.recovery/
+
+# Runtime telemetry / logs / pid (not source)
+/.agentflow-telemetry/
+/.stack-logs-op/
+/.logs/
+/.verify-research-logs/

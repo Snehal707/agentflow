@@ -11,6 +11,12 @@ type ChatThreadProps = {
   selectedAssistantId?: string | null;
   onSelectAssistant?: (id: string) => void;
   onSendMessage?: (message: string) => void;
+  onFeedback?: (messageId: string, feedback: "positive" | "negative") => void;
+  onRateAgent?: (
+    messageId: string,
+    stars: number,
+    ratingMeta: NonNullable<LiveChatMessage["ratingMeta"]>,
+  ) => void;
   onConfirmAction?: (input: {
     messageId: string;
     action: "schedule" | "split" | "invoice" | "batch";
@@ -18,6 +24,47 @@ type ChatThreadProps = {
     label: string;
   }) => void;
 };
+
+type QuickActionGroup = NonNullable<LiveChatMessage["quickActionGroups"]>[number];
+type QuickAction = QuickActionGroup["actions"][number];
+type PredmarketRenderableBlock =
+  | { type: "markdown"; content: string }
+  | { type: "group"; title?: string; content?: string; actions: QuickAction[] };
+
+function cleanQuickActionContextTitle(value?: string): string {
+  return (value || "").replace(/\.\.\.$/, "").trim();
+}
+
+function extractPredmarketResearchTitleFromPrompt(prompt?: string): string {
+  const raw = (prompt || "").trim();
+  if (!raw) return "";
+
+  const match = raw.match(
+    /research\s+the\s+prediction\s+market\s+topic:\s*([\s\S]*?)(?=\s*Listed outcomes in AgentFlow:|$)/i,
+  );
+  return match?.[1]?.replace(/\s+/g, " ").trim() || "";
+}
+
+function quickActionDisplayLabel(action: QuickAction, contextTitle?: string): string {
+  const promptDerivedTitle =
+    action.label === "Research"
+      ? extractPredmarketResearchTitleFromPrompt(action.prompt)
+      : "";
+  const cleanedTitle = cleanQuickActionContextTitle(
+    promptDerivedTitle || contextTitle,
+  );
+  if (action.label === "Research" && cleanedTitle) {
+    return `Research: ${cleanedTitle}`;
+  }
+  return action.label;
+}
+
+function encodeQuickActionMessage(action: QuickAction, contextTitle?: string): string {
+  return `[[AF_ACTION:${encodeURIComponent(JSON.stringify({
+    prompt: action.prompt,
+    ...(action.actionId ? { actionId: action.actionId } : {}),
+  }))}]]${quickActionDisplayLabel(action, contextTitle)}`;
+}
 
 /** Swap / vault completion messages are plain markdown in a default bubble - elevate visually. */
 function isArcTxReceiptMessage(message: LiveChatMessage): boolean {
@@ -29,7 +76,9 @@ function isArcTxReceiptMessage(message: LiveChatMessage): boolean {
     /^Executed swap:/m.test(c) ||
     /^Executed (?:deposit|withdraw):/m.test(c) ||
     /^Swap complete on Arc\./m.test(c) ||
-    /^Vault \w+ complete on Arc\./m.test(c) ||
+    /^Vault (?:deposit|withdraw) complete on Arc\./m.test(c) ||
+    /^Bridge complete on Arc\./m.test(c) ||
+    /^Bridge:\s.+-> Arc/m.test(c) ||
     /^Bridged .* USDC to Arc/m.test(c) ||
     /\bcomplete on Arc\.\s*\n\nTx:/m.test(c) ||
     /^Sent payment successfully on Arc\./m.test(c) ||
@@ -59,6 +108,79 @@ function stripConfirmationCta(content: string): string {
     )
     .replace(/\n*Confirm\s+to\s+send\s+all\s+transfers[^.]*\.?\s*$/i, "")
     .trimEnd();
+}
+
+function stripPortfolioPaymentFooter(content: string): string {
+  return content
+    .replace(/\n*_Paid Portfolio Agent \([^)]+ via x402\)\._\s*$/i, "")
+    .trimEnd();
+}
+
+function shortPaymentRef(value?: string | null): string {
+  if (!value) return "";
+  return value.length > 18 ? `${value.slice(0, 10)}...${value.slice(-6)}` : value;
+}
+
+function deriveRatingMeta(message: LiveChatMessage): LiveChatMessage["ratingMeta"] | undefined {
+  if (message.ratingMeta) {
+    return message.ratingMeta;
+  }
+  const entries = message.paymentMeta?.entries ?? [];
+  const entry = entries.find(
+    (candidate) =>
+      candidate.mode !== "a2a" &&
+      !candidate.sponsored &&
+      candidate.requestId &&
+      Boolean(candidate.transactionRef || candidate.settlementTxHash),
+  );
+  if (!entry) {
+    return undefined;
+  }
+  const agentSlug = entry.sellerAgent || entry.agent;
+  if (!agentSlug || agentSlug === "analyst" || agentSlug === "writer") {
+    return undefined;
+  }
+  return {
+    taskId: entry.requestId,
+    requestId: entry.requestId,
+    agentSlug,
+    settlementRef: entry.transactionRef || entry.settlementTxHash || "",
+  };
+}
+
+/** Only for assistant bubbles; preserves inner fenced code blocks. */
+function stripOuterCodeFenceForAssistantText(content: string): string {
+  const raw = typeof content === "string" ? content : "";
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("```")) {
+    return raw;
+  }
+
+  const openMatch = trimmed.match(/^```[^\r\n]*(?:\r\n|[\r\n])/);
+  if (!openMatch) {
+    return raw;
+  }
+
+  let afterOpen = trimmed.slice(openMatch[0].length);
+
+  let searchEnd = afterOpen.length;
+  while (searchEnd >= 0) {
+    const closeLineStart = afterOpen.lastIndexOf("\n```", searchEnd);
+    if (closeLineStart === -1) {
+      break;
+    }
+    const afterFenceLine = afterOpen.slice(closeLineStart + 1).trim();
+    if (afterFenceLine === "```") {
+      return afterOpen.slice(0, closeLineStart).trimEnd();
+    }
+    searchEnd = closeLineStart - 1;
+  }
+
+  if (!/\n```/.test(afterOpen) && afterOpen.endsWith("```")) {
+    return afterOpen.slice(0, -3).trimEnd();
+  }
+
+  return raw;
 }
 
 type AssistantReportParts = {
@@ -211,7 +333,7 @@ function containsFencedCodeBlock(content: string): boolean {
   return /```[\s\S]*```/.test(content);
 }
 
-function looksLikeAsciiArt(content: string): boolean {
+function looksLikeAlignedTextBlock(content: string): boolean {
   const lines = content
     .split(/\r?\n/)
     .map((line) => line.replace(/\t/g, "    "))
@@ -223,6 +345,179 @@ function looksLikeAsciiArt(content: string): boolean {
 
   const alignedLines = lines.filter((line) => line.length >= 8 && / {2,}/.test(line));
   return alignedLines.length >= 3;
+}
+
+type PlainAssistantBlock =
+  | { type: "paragraph"; content: string }
+  | { type: "bullet_list"; items: string[] };
+
+function normalizePseudoListParagraph(paragraph: string): string {
+  return paragraph
+    .replace(/\s+-\s+(?=[A-Z][^:\n]{1,40}:)/g, "\n- ")
+    .replace(/(?<=\S)\s+(?=What do you want to do(?: first)?\?)/g, "\n\n");
+}
+
+function normalizeCollapsedAssistantFormatting(content: string): string {
+  return content
+    .replace(/\r\n/g, "\n")
+    // Preserve decimal values like "0.999999" in receipts while still breaking
+    // true numbered steps like "1. Confirm..." onto their own lines.
+    .replace(/:\s*((?:\d{1,3})\.)\s+(?=[A-Z(])/g, ":\n\n$1 ")
+    .replace(/([a-z)\]])((?:\d{1,3})\.)\s+(?=[A-Z(])/g, "$1\n\n$2 ")
+    .replace(/\b(About|Around|In)\s*(\d+)\b/g, "$1 $2")
+    .replace(/([a-z])(?=(Want to|Do you want|Would you like|If you want|You can also|Then open|Search for))/g, "$1\n\n")
+    .replace(/([^.?!\n])\s*(?=(Reply YES|Reply NO|Want to pick up|Want me to|What do you want to do\??))/g, "$1\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function formatPlainAssistantBlocks(content: string): PlainAssistantBlock[] {
+  const normalized = normalizeCollapsedAssistantFormatting(content);
+  if (!normalized) {
+    return [];
+  }
+
+  const preprocessed = normalizePseudoListParagraph(normalized);
+  const paragraphs = preprocessed
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  const blocks: PlainAssistantBlock[] = [];
+  for (const paragraph of paragraphs) {
+    const lines = paragraph
+      .split(/\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const bulletLines = lines.filter((line) => /^-\s+/.test(line));
+    if (bulletLines.length >= 2 && bulletLines.length === lines.length) {
+      blocks.push({
+        type: "bullet_list",
+        items: bulletLines.map((line) => line.replace(/^-\s+/, "").trim()),
+      });
+      continue;
+    }
+
+    blocks.push({
+      type: "paragraph",
+      content: paragraph,
+    });
+  }
+
+  return blocks;
+}
+
+function normalizeGroupTitle(value?: string): string {
+  return (value || "").replace(/\.\.\.$/, "").trim().toLowerCase();
+}
+
+function extractMarketAddress(value?: string): string | null {
+  const match = (value || "").match(/\b0x[a-fA-F0-9]{40}\b/);
+  return match ? match[0].toLowerCase() : null;
+}
+
+function parsePredmarketInlineBlocks(
+  content: string,
+  groups?: LiveChatMessage["quickActionGroups"],
+): PredmarketRenderableBlock[] | null {
+  if (!groups?.length) {
+    return null;
+  }
+
+  const normalized = content.replace(/\r\n/g, "\n");
+  const isList =
+    normalized.startsWith("## Prediction markets on AchMarket") ||
+    normalized.startsWith("## Your prediction market positions");
+  if (!isList) {
+    return null;
+  }
+
+  const categoryGroup = groups.find((group) =>
+    group.actions.some((action) =>
+      /show (?:prediction markets|crypto markets|sports markets|politics markets|entertainment markets)/i.test(
+        action.prompt,
+      ),
+    ),
+  );
+  const marketGroups = groups.filter((group) => group !== categoryGroup);
+  if (!marketGroups.length) {
+    return null;
+  }
+
+  const sectionMatches = Array.from(
+    normalized.matchAll(/^(###\s+[^\n]+)\n([\s\S]*?)(?=^###\s+|^##\s+⚠️|\Z)/gm),
+  );
+  if (!sectionMatches.length) {
+    return null;
+  }
+
+  const firstSectionIndex = sectionMatches[0]?.index ?? -1;
+  const noteIndex = normalized.search(/^##\s+⚠️/m);
+  const introEnd =
+    firstSectionIndex >= 0 ? firstSectionIndex : noteIndex >= 0 ? noteIndex : normalized.length;
+  const intro = normalized.slice(0, introEnd).trim();
+  const notes = noteIndex >= 0 ? normalized.slice(noteIndex).trim() : "";
+
+  const blocks: PredmarketRenderableBlock[] = [];
+  if (intro) {
+    blocks.push({ type: "markdown", content: intro });
+  }
+  if (categoryGroup) {
+    blocks.push({
+      type: "group",
+      title: categoryGroup.title,
+      actions: categoryGroup.actions,
+    });
+  }
+
+  for (const match of sectionMatches) {
+    const heading = match[1] || "";
+    const body = (match[2] || "").trim();
+    const title = heading.replace(/^###\s+[^\s]+\s*/, "").trim();
+    const addressInSection = extractMarketAddress(body);
+    const matchedGroup =
+      marketGroups.find((group) => normalizeGroupTitle(group.title) === normalizeGroupTitle(title)) ||
+      marketGroups.find((group) =>
+        normalizeGroupTitle(title).includes(normalizeGroupTitle(group.title)) ||
+        normalizeGroupTitle(group.title).includes(normalizeGroupTitle(title)),
+      ) ||
+      (addressInSection
+        ? marketGroups.find((group) =>
+            group.actions.some((action) => extractMarketAddress(action.prompt) === addressInSection),
+          )
+        : undefined);
+
+    if (matchedGroup) {
+      blocks.push({
+        type: "group",
+        title,
+        content: `${heading}\n${body}`.trim(),
+        actions: matchedGroup.actions,
+      });
+    } else {
+      blocks.push({
+        type: "markdown",
+        content: `${heading}\n${body}`.trim(),
+      });
+    }
+  }
+
+  if (notes) {
+    blocks.push({ type: "markdown", content: notes });
+  }
+
+  return blocks;
+}
+
+function looksLikePredmarketStructuredMessage(content: string): boolean {
+  const normalized = content.replace(/\r\n/g, "\n").trim();
+  return (
+    normalized.startsWith("## Prediction markets on AchMarket") ||
+    normalized.startsWith("## Your prediction market positions") ||
+    normalized.startsWith("## ")
+  ) &&
+    /- \*\*Address:\*\* `0x[a-fA-F0-9]{40}`/m.test(normalized);
 }
 
 function StatusDots() {
@@ -256,6 +551,8 @@ export function ChatThread({
   selectedAssistantId,
   onSelectAssistant,
   onSendMessage,
+  onFeedback,
+  onRateAgent,
   onConfirmAction,
 }: ChatThreadProps) {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -307,25 +604,48 @@ export function ChatThread({
       <div className="space-y-12">
         {messages.map((message, index) => {
           const isAssistant = message.role === "assistant";
+          const ratingMeta =
+            isAssistant && message.status === "complete"
+              ? deriveRatingMeta(message)
+              : undefined;
+          const hasImplicitConfirmationPrompt =
+            (/reply\s*YES\b/i.test(message.content) ||
+              /\bconfirm(?:\s+with)?\s+YES\b/i.test(message.content)) &&
+            /\bNO\b/i.test(message.content);
           const showConfirmationActions =
             isAssistant &&
             typeof onSendMessage === "function" &&
-            message.confirmation?.required === true &&
+            (message.confirmation?.required === true || hasImplicitConfirmationPrompt) &&
             index === messages.length - 1;
           const renderedContent = isAssistant
-            ? stripConfirmationCta(stripDisplayMetadata(message.content)).trimStart()
+            ? normalizeCollapsedAssistantFormatting(
+                stripOuterCodeFenceForAssistantText(
+                  stripConfirmationCta(stripDisplayMetadata(message.content)).trimStart(),
+                ),
+              )
             : message.content;
+          const portfolioCard = isAssistant && message.reportMeta?.kind === "portfolio";
+          const portfolioPaid =
+            portfolioCard && (message.paymentMeta?.entries?.length ?? 0) > 0;
+          const visibleRenderedContent = portfolioCard
+            ? stripPortfolioPaymentFooter(renderedContent)
+            : renderedContent;
           const reportParts = isAssistant
-            ? splitAssistantReport(renderedContent)
-            : { progress: "", report: renderedContent, hasReport: false };
+            ? splitAssistantReport(visibleRenderedContent)
+            : { progress: "", report: visibleRenderedContent, hasReport: false };
           const markdownContent = reportParts.hasReport
             ? normalizeReportMarkdown(reportParts.report)
-            : renderedContent;
+            : visibleRenderedContent;
+          const predmarketInlineBlocks =
+            isAssistant
+              ? parsePredmarketInlineBlocks(markdownContent, message.quickActionGroups)
+              : null;
           const progressLines = reportParts.hasReport
             ? formatProgressLines(reportParts.progress)
             : [];
           const isReportMessage =
             isAssistant &&
+            !predmarketInlineBlocks &&
             (Boolean(message.reportMeta) ||
               reportParts.hasReport ||
               looksLikeReportContent(markdownContent) ||
@@ -347,11 +667,11 @@ export function ChatThread({
           const fencedCodeBlock = isAssistant && containsFencedCodeBlock(renderedContent);
           const markdownLikeAssistantMessage =
             isAssistant && isMarkdownLikeAssistantMessage(markdownContent);
-          const asciiArtBlock =
+          const alignedTextBlock =
             isAssistant &&
             !isReportMessage &&
             !fencedCodeBlock &&
-            looksLikeAsciiArt(renderedContent);
+            looksLikeAlignedTextBlock(renderedContent);
           const selectableAssistantMessage =
             isAssistant &&
             Boolean(onSelectAssistant) &&
@@ -400,14 +720,16 @@ export function ChatThread({
                   </div>
                 ) : (
                   <div
-                    className={`min-w-0 max-w-full overflow-hidden leading-relaxed ${
+                    className={`min-w-0 max-w-full ${isReportMessage ? "overflow-visible" : "overflow-hidden"} leading-relaxed ${
                       isAssistant
                         ? message.status === "error"
                           ? "rounded-xl rounded-tl-none border border-[#ffb4ab]/20 border-l-2 border-l-[#ffb4ab] bg-[#241818]/80 p-4 text-[#ffe7e3]"
                         : txReceipt
                           ? selected
-                            ? "rounded-xl rounded-tl-none border border-[#f2ca50]/25 border-l-[3px] border-l-[#f2ca50] bg-gradient-to-br from-[#f2ca50]/5 via-[#141a18] to-[#1d2025]/95 p-5 text-[#f6f6fc] shadow-[0_0_48px_-16px_rgba(242,202,80,0.20)]"
-                            : "rounded-xl rounded-tl-none border border-[#f2ca50]/15 border-l-[3px] border-l-[#f2ca50]/80 bg-gradient-to-br from-[#f2ca50]/5 via-[#121816] to-[#1d2025]/90 p-5 text-[#f6f6fc] shadow-[0_0_40px_-18px_rgba(242,202,80,0.15)]"
+                            ? "rounded-xl rounded-tl-none border border-[#f2ca50]/25 border-l-[3px] border-l-[#f2ca50] bg-gradient-to-br from-[#201b0f] via-[#171411] to-[#1d2025]/95 p-5 text-[#f6f6fc] shadow-[0_0_48px_-16px_rgba(242,202,80,0.20)]"
+                            : "rounded-xl rounded-tl-none border border-[#f2ca50]/15 border-l-[3px] border-l-[#f2ca50]/80 bg-gradient-to-br from-[#1c180e] via-[#151210] to-[#1d2025]/90 p-5 text-[#f6f6fc] shadow-[0_0_40px_-18px_rgba(242,202,80,0.15)]"
+                          : portfolioCard
+                            ? "rounded-xl rounded-tl-none border border-[#f2ca50]/20 border-l-[3px] border-l-[#f2ca50] bg-[#171717] px-5 py-5 text-white/90 shadow-[0_18px_50px_-34px_rgba(242,202,80,0.55)]"
                           : selected
                             ? isReportMessage
                               ? "rounded-2xl rounded-tl-none border border-white/10 border-l-2 border-l-[#f2ca50] bg-[#201f1f]/70 px-6 py-5 text-white/90"
@@ -450,6 +772,31 @@ export function ChatThread({
                             </div>
                           </div>
                         ) : null}
+                        {portfolioCard ? (
+                          <div className="not-prose mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-[#f2ca50]/15 pb-4">
+                            <div className="flex items-center gap-3">
+                              <span
+                                className="material-symbols-outlined text-[24px] text-[#f2ca50]"
+                                style={{ fontVariationSettings: '"FILL" 1' }}
+                              >
+                                account_balance_wallet
+                              </span>
+                              <div>
+                                <div className="text-[11px] font-black uppercase tracking-[0.18em] text-[#f2ca50]">
+                                  Portfolio Agent
+                                </div>
+                                <div className="mt-0.5 text-[12px] text-white/48">
+                                  Live DCW holdings and positions
+                                </div>
+                              </div>
+                            </div>
+                            {portfolioPaid ? (
+                              <span className="rounded-full border border-[#f2ca50]/25 bg-[#f2ca50]/10 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.16em] text-[#f2ca50]">
+                                x402 paid
+                              </span>
+                            ) : null}
+                          </div>
+                        ) : null}
                         {reportParts.hasReport && progressLines.length > 0 ? (
                           <div className="not-prose mb-5 border-b border-[#f2ca50]/15 pb-4">
                             <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.22em] text-[#f2ca50]">
@@ -481,14 +828,189 @@ export function ChatThread({
                             Needs attention
                           </div>
                         ) : null}
-                        {plainAssistantBubble && !fencedCodeBlock && !asciiArtBlock && !markdownLikeAssistantMessage ? (
-                          <div className="whitespace-pre-wrap break-words text-[15px] leading-7 text-white/90">
-                            {renderedContent}
+                        {predmarketInlineBlocks ? (
+                          <div className="space-y-4">
+                            {predmarketInlineBlocks.map((block, blockIndex) =>
+                              block.type === "markdown" ? (
+                                <ReactMarkdown
+                                  key={`${message.id}-predmarket-inline-markdown-${blockIndex}`}
+                                  remarkPlugins={[remarkGfm]}
+                                  components={{
+                                    h1: ({ children }) => (
+                                      <h1 className="mb-4 mt-0 border-b border-[#f2ca50]/20 pb-3 text-[clamp(1.35rem,2vw,1.85rem)] font-semibold leading-tight text-white">
+                                        {children}
+                                      </h1>
+                                    ),
+                                    h2: ({ children }) => (
+                                      <h2 className="mb-2 mt-7 flex items-center gap-2 text-[1.08rem] font-semibold leading-snug text-[#f2ca50]">
+                                        <span className="h-1.5 w-1.5 rounded-full bg-[#f2ca50]" />
+                                        {children}
+                                      </h2>
+                                    ),
+                                    h3: ({ children }) => (
+                                      <h3 className="mb-2 mt-5 text-base font-semibold text-white">
+                                        {children}
+                                      </h3>
+                                    ),
+                                    p: ({ children }) => (
+                                      <p className="my-3 first:mt-0 last:mb-0 text-[15px] leading-7 text-white/88">
+                                        {children}
+                                      </p>
+                                    ),
+                                    ul: ({ children }) => (
+                                      <ul className="my-3 space-y-2 pl-0">{children}</ul>
+                                    ),
+                                    li: ({ children }) => (
+                                      <li className="flex gap-2 text-[15px] leading-7 text-white/82">
+                                        <span className="mt-3 h-1 w-1 shrink-0 rounded-full bg-[#f2ca50]/80" />
+                                        <div className="min-w-0 flex-1">{children}</div>
+                                      </li>
+                                    ),
+                                    strong: ({ children }) => (
+                                      <strong className="font-semibold text-[#f7d768]">{children}</strong>
+                                    ),
+                                    hr: () => <hr className="my-6 border-[#f2ca50]/15" />,
+                                    a: ({ href, children }) => (
+                                      <a
+                                        href={href}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="break-all text-[#f2ca50] underline decoration-[rgba(242,202,80,0.5)] underline-offset-2 hover:text-white/90"
+                                      >
+                                        {children}
+                                      </a>
+                                    ),
+                                    code: ({ className, children, ...props }) => {
+                                      const codeText = String(children).replace(/\n$/, "");
+                                      const blockCode = !Boolean((props as { inline?: boolean }).inline);
+                                      if (blockCode) {
+                                        return (
+                                          <code
+                                            {...props}
+                                            className={`${className} font-mono text-[12px] leading-[1.15] text-white/92`}
+                                          >
+                                            {codeText}
+                                          </code>
+                                        );
+                                      }
+                                      return (
+                                        <code
+                                          {...props}
+                                          className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[0.92em] text-[#f2ca50]"
+                                        >
+                                          {codeText}
+                                        </code>
+                                      );
+                                    },
+                                  }}
+                                >
+                                  {block.content}
+                                </ReactMarkdown>
+                              ) : (
+                                <div
+                                  key={`${message.id}-predmarket-inline-group-${blockIndex}`}
+                                  className={
+                                    block.content
+                                      ? "space-y-3 rounded-2xl border border-white/10 bg-[#171717] px-4 py-4"
+                                      : "space-y-2"
+                                  }
+                                >
+                                  {block.content ? (
+                                    <ReactMarkdown
+                                      remarkPlugins={[remarkGfm]}
+                                      components={{
+                                        h3: ({ children }) => (
+                                          <h3 className="mb-2 mt-0 text-[13px] font-black uppercase tracking-[0.16em] text-white/72">
+                                            {children}
+                                          </h3>
+                                        ),
+                                        p: ({ children }) => (
+                                          <p className="my-2 first:mt-0 last:mb-0 text-[15px] leading-7 text-white/88">
+                                            {children}
+                                          </p>
+                                        ),
+                                        ul: ({ children }) => (
+                                          <ul className="my-2 space-y-2 pl-0">{children}</ul>
+                                        ),
+                                        li: ({ children }) => (
+                                          <li className="flex gap-2 text-[15px] leading-7 text-white/82">
+                                            <span className="mt-3 h-1 w-1 shrink-0 rounded-full bg-[#f2ca50]/80" />
+                                            <div className="min-w-0 flex-1">{children}</div>
+                                          </li>
+                                        ),
+                                        strong: ({ children }) => (
+                                          <strong className="font-semibold text-[#f7d768]">{children}</strong>
+                                        ),
+                                        code: ({ children }) => (
+                                          <code className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[0.92em] text-[#f2ca50]">
+                                            {children}
+                                          </code>
+                                        ),
+                                      }}
+                                    >
+                                      {block.content}
+                                    </ReactMarkdown>
+                                  ) : block.title ? (
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/45">
+                                      {block.title}
+                                    </div>
+                                  ) : null}
+                                  <div className="flex flex-wrap gap-2">
+                                    {block.actions.map((action, actionIndex) => (
+                                      <button
+                                        key={`${message.id}-inline-action-${blockIndex}-${actionIndex}`}
+                                        type="button"
+                                        onClick={() =>
+                                          onSendMessage?.(
+                                            encodeQuickActionMessage(action, block.title),
+                                          )
+                                        }
+                                        className={
+                                          action.tone === "secondary"
+                                            ? "inline-flex min-h-10 items-center justify-center gap-2 rounded-full border border-white/10 bg-[#201f1f] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-white/55 transition hover:border-[rgba(242,202,80,0.25)] hover:text-white/90"
+                                            : "inline-flex min-h-10 items-center justify-center gap-2 rounded-full border border-[rgba(242,202,80,0.35)] bg-[rgba(242,202,80,0.12)] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#f2ca50] transition hover:bg-[rgba(242,202,80,0.20)]"
+                                        }
+                                      >
+                                        {action.label}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ),
+                            )}
                           </div>
-                        ) : asciiArtBlock ? (
+                        ) : plainAssistantBubble && !fencedCodeBlock && !alignedTextBlock && !markdownLikeAssistantMessage ? (
+                          <div className="space-y-3 break-words text-[15px] leading-7 text-white/90">
+                            {formatPlainAssistantBlocks(renderedContent).map((block, blockIndex) =>
+                              block.type === "bullet_list" ? (
+                                <ul
+                                  key={`${message.id}-plain-bullets-${blockIndex}`}
+                                  className="space-y-2"
+                                >
+                                  {block.items.map((item, itemIndex) => (
+                                    <li
+                                      key={`${message.id}-plain-bullets-${blockIndex}-${itemIndex}`}
+                                      className="flex gap-2 text-[15px] leading-7 text-white/88"
+                                    >
+                                      <span className="mt-3 h-1 w-1 shrink-0 rounded-full bg-[#f2ca50]/80" />
+                                      <div className="min-w-0 flex-1">{item}</div>
+                                    </li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <p
+                                  key={`${message.id}-plain-paragraph-${blockIndex}`}
+                                  className="whitespace-pre-wrap"
+                                >
+                                  {block.content}
+                                </p>
+                              ),
+                            )}
+                          </div>
+                        ) : alignedTextBlock ? (
                           <div className="not-prose overflow-x-auto rounded-lg border border-white/10 bg-black/30 px-3 py-3">
                             <pre className="m-0 w-max min-w-full whitespace-pre font-mono text-[12px] leading-[1.15] text-white/92">
-                              {renderedContent}
+                              {visibleRenderedContent}
                             </pre>
                           </div>
                         ) : (
@@ -596,6 +1118,41 @@ export function ChatThread({
                             {markdownContent}
                           </ReactMarkdown>
                         )}
+                        {portfolioPaid ? (
+                          <div className="not-prose mt-5 border-t border-[#f2ca50]/15 pt-4">
+                            <div className="mb-3 text-[10px] font-black uppercase tracking-[0.2em] text-white/38">
+                              Nanopayment
+                            </div>
+                            {(message.paymentMeta?.entries?.length ?? 0) > 0 ? (
+                              <div className="space-y-2">
+                                {message.paymentMeta?.entries.map((entry) => (
+                                  <div
+                                    key={entry.requestId}
+                                    className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-[12px]"
+                                  >
+                                    <span className="text-white/62">
+                                      {entry.agent.charAt(0).toUpperCase()}
+                                      {entry.agent.slice(1)} Agent via Gateway/DCW
+                                    </span>
+                                    <span className="font-mono text-[#f2ca50]">
+                                      {entry.price || "x402"}
+                                    </span>
+                                    <span className="basis-full font-mono text-[11px] text-white/35">
+                                      request {shortPaymentRef(entry.requestId)}
+                                      {entry.transactionRef
+                                        ? ` · ref ${shortPaymentRef(entry.transactionRef)}`
+                                        : ""}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="text-[12px] text-white/45">
+                                Paid Portfolio Agent via x402.
+                              </div>
+                            )}
+                          </div>
+                        ) : null}
                       </div>
                     ) : (
                       <div className="space-y-3">
@@ -747,6 +1304,104 @@ export function ChatThread({
                         </button>
                       </>
                     )}
+                  </div>
+                ) : null}
+                {isAssistant && message.quickActionGroups?.length && !predmarketInlineBlocks ? (
+                  <div className="space-y-3">
+                    {message.quickActionGroups.map((group, groupIndex) => (
+                      <div key={`${message.id}-quick-actions-${groupIndex}`} className="space-y-2">
+                        {group.title ? (
+                          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/45">
+                            {group.title}
+                          </div>
+                        ) : null}
+                        <div className="flex flex-wrap gap-2">
+                          {group.actions.map((action, actionIndex) => (
+                            <button
+                              key={`${message.id}-quick-action-${groupIndex}-${actionIndex}`}
+                              type="button"
+                              onClick={() =>
+                                onSendMessage?.(
+                                  encodeQuickActionMessage(action, group.title),
+                                )
+                              }
+                              className={
+                                action.tone === "secondary"
+                                  ? "inline-flex min-h-10 items-center justify-center gap-2 rounded-full border border-white/10 bg-[#201f1f] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-white/55 transition hover:border-[rgba(242,202,80,0.25)] hover:text-white/90"
+                                  : "inline-flex min-h-10 items-center justify-center gap-2 rounded-full border border-[rgba(242,202,80,0.35)] bg-[rgba(242,202,80,0.12)] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#f2ca50] transition hover:bg-[rgba(242,202,80,0.20)]"
+                              }
+                            >
+                              {action.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {ratingMeta ? (
+                  <div className="flex items-center gap-1 rounded-full border border-[rgba(242,202,80,0.22)] bg-[#201f1f]/70 px-2 py-1">
+                    <span className="mr-1 text-[10px] font-black uppercase tracking-[0.16em] text-white/35">
+                      Rate
+                    </span>
+                    {[1, 2, 3, 4, 5].map((stars) => {
+                      const selected = Number(message.agentRating?.stars ?? 0) >= stars;
+                      const disabled = message.agentRating?.status === "pending";
+                      return (
+                        <button
+                          key={stars}
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => onRateAgent?.(message.id, stars, ratingMeta)}
+                          title={`Rate ${stars} star${stars === 1 ? "" : "s"}`}
+                          aria-label={`Rate this paid agent task ${stars} star${stars === 1 ? "" : "s"}`}
+                          className={`text-lg leading-none transition ${
+                            selected
+                              ? "text-[#f2ca50]"
+                              : "text-white/25 hover:text-[#f2ca50]"
+                          } ${disabled ? "cursor-wait opacity-60" : ""}`}
+                        >
+                          ★
+                        </button>
+                      );
+                    })}
+                    {message.agentRating?.status === "failed" && message.agentRating.error ? (
+                      <span
+                        className="ml-2 max-w-[220px] truncate text-xs text-[#ffb4ab]"
+                        title={message.agentRating.error}
+                      >
+                        Retry
+                      </span>
+                    ) : null}
+                  </div>
+                ) : isAssistant && message.status === "complete" && message.eventId ? (
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => onFeedback?.(message.id, "positive")}
+                      title="Helpful"
+                      aria-label="Mark response helpful"
+                      className={`flex h-8 w-8 items-center justify-center rounded-full border transition ${
+                        message.feedback === "positive"
+                          ? "border-[#f2ca50]/45 bg-[#f2ca50]/15 text-[#f2ca50]"
+                          : "border-white/10 bg-[#201f1f]/70 text-white/35 hover:border-[#f2ca50]/30 hover:text-[#f2ca50]"
+                      }`}
+                    >
+                      <span className="material-symbols-outlined text-[17px]">thumb_up</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onFeedback?.(message.id, "negative")}
+                      title="Not helpful"
+                      aria-label="Mark response not helpful"
+                      className={`flex h-8 w-8 items-center justify-center rounded-full border transition ${
+                        message.feedback === "negative"
+                          ? "border-[#ffb4ab]/45 bg-[#ffb4ab]/12 text-[#ffb4ab]"
+                          : "border-white/10 bg-[#201f1f]/70 text-white/35 hover:border-[#ffb4ab]/30 hover:text-[#ffb4ab]"
+                      }`}
+                    >
+                      <span className="material-symbols-outlined text-[17px]">thumb_down</span>
+                    </button>
                   </div>
                 ) : null}
               </div>

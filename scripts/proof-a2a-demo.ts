@@ -102,8 +102,8 @@ function runWindowsStackCleanup(): void {
     );
     return;
   }
-  console.log('[proof-a2a] running stack-cleanup.js …');
-  execFileSync(process.execPath, [path.join(repoRoot, 'scripts', 'stack-cleanup.js')], {
+  console.log('[proof-a2a] running stack-cleanup.cjs ...');
+  execFileSync(process.execPath, [path.join(repoRoot, 'scripts', 'stack-cleanup.cjs')], {
     cwd: repoRoot,
     stdio: 'inherit',
   });

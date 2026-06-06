@@ -34,26 +34,9 @@ import { shortenAddress } from "@/lib/appData";
 import { formatServerDate, formatServerDateTime, parseServerDate } from "@/lib/dateUtils";
 import { AppSidebar } from "@/components/app/AppSidebar";
 import { SessionStatusChip } from "@/components/app/SessionStatusChip";
-import { ChatTopNavbar } from "@/components/chat/ChatTopNavbar";
 import { useSidebarPreference } from "@/lib/useSidebarPreference";
 
-type TabId =
-  | "send"
-  | "receive"
-  | "requests"
-  | "history"
-  | "scheduled"
-  | "invoices"
-  | "contacts"
-  | "batch";
-
-type PayContactRow = {
-  id: string;
-  name: string;
-  address: string;
-  label?: string | null;
-  notes?: string | null;
-};
+type TabId = "send" | "receive" | "requests" | "history" | "scheduled" | "invoices" | "batch";
 
 function formatUsd(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "$0.00";
@@ -79,7 +62,6 @@ export default function AgentPayPage() {
   } = useAgentJwt();
 
   const [tab, setTab] = useState<TabId>("send");
-  const [hydrated, setHydrated] = useState(false);
   const [payContext, setPayContext] = useState<PayContextResponse | null>(null);
 
   const [toAddress, setToAddress] = useState("");
@@ -136,16 +118,6 @@ export default function AgentPayPage() {
   const [batchResult, setBatchResult] = useState<any>(null);
   const [batchError, setBatchError] = useState<string | null>(null);
 
-  const [contacts, setContacts] = useState<PayContactRow[]>([]);
-  const [contactsLoading, setContactsLoading] = useState(false);
-  const [contactsError, setContactsError] = useState<string | null>(null);
-  const [contactName, setContactName] = useState("");
-  const [contactAddress, setContactAddress] = useState("");
-  const [contactLabel, setContactLabel] = useState("");
-  const [contactNotes, setContactNotes] = useState("");
-  const [addingContact, setAddingContact] = useState(false);
-  const [deletingContactId, setDeletingContactId] = useState<string | null>(null);
-
   const [paymentBaseUrl, setPaymentBaseUrl] = useState(
     process.env.NEXT_PUBLIC_APP_URL?.trim() || "",
   );
@@ -172,7 +144,6 @@ export default function AgentPayPage() {
   const [newDcwInput, setNewDcwInput] = useState("");
   const [dcwBusy, setDcwBusy] = useState(false);
   const arcDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const balanceFetchInFlight = useRef(false);
 
   const previewRecipient = toAddress.trim() || "recipient";
   const previewAmount = Number(amount);
@@ -186,12 +157,6 @@ export default function AgentPayPage() {
     try {
       const ctx = await fetchPayContext(headers);
       setPayContext(ctx);
-      if (ctx.chain_arc_name) {
-        setMyChainArc((prev) => ({
-          name: ctx.chain_arc_name ?? prev?.name ?? null,
-          expiresAt: ctx.chain_arc_expires_at ?? prev?.expiresAt ?? null,
-        }));
-      }
     } catch {
       setPayContext(null);
     }
@@ -200,8 +165,6 @@ export default function AgentPayPage() {
   const loadBalance = useCallback(async () => {
     const headers = getAuthHeaders();
     if (!headers) return;
-    if (balanceFetchInFlight.current) return;
-    balanceFetchInFlight.current = true;
     if (process.env.NODE_ENV === "development" && address) {
       console.log("[agentpay] fetching balance for:", address);
     }
@@ -215,7 +178,6 @@ export default function AgentPayPage() {
     } catch {
       setBalanceInfo(null);
     } finally {
-      balanceFetchInFlight.current = false;
       setBalanceLoading(false);
     }
   }, [getAuthHeaders, address]);
@@ -280,26 +242,6 @@ export default function AgentPayPage() {
     }
   }, [isAuthenticated, address, getAuthHeaders]);
 
-  const loadContacts = useCallback(async () => {
-    const headers = getAuthHeaders();
-    if (!headers) return;
-    setContactsLoading(true);
-    setContactsError(null);
-    try {
-      const res = await fetch("/api/pay/contacts", { headers });
-      const data = (await res.json()) as { contacts?: PayContactRow[]; error?: string };
-      if (!res.ok) {
-        throw new Error(data.error ?? "Could not load contacts");
-      }
-      setContacts(data.contacts ?? []);
-    } catch (e) {
-      setContactsError(e instanceof Error ? e.message : "Could not load contacts");
-      setContacts([]);
-    } finally {
-      setContactsLoading(false);
-    }
-  }, [getAuthHeaders]);
-
   const goTab = (id: TabId) => {
     setTab(id);
     if (id === "send") {
@@ -310,14 +252,7 @@ export default function AgentPayPage() {
     if (id !== "scheduled") {
       setScheduledToast(null);
     }
-    if (id !== "contacts") {
-      setContactsError(null);
-    }
   };
-
-  useEffect(() => {
-    setHydrated(true);
-  }, []);
 
   useEffect(() => {
     if (!paymentBaseUrl && typeof window !== "undefined") {
@@ -360,12 +295,6 @@ export default function AgentPayPage() {
   }, [tab, address, isAuthenticated, loadInvoices]);
 
   useEffect(() => {
-    if (tab === "contacts" && address && isAuthenticated) {
-      void loadContacts();
-    }
-  }, [tab, address, isAuthenticated, loadContacts]);
-
-  useEffect(() => {
     if (tab !== "scheduled" || !address || !isAuthenticated) {
       return;
     }
@@ -402,12 +331,9 @@ export default function AgentPayPage() {
     if (!headers) return;
     try {
       const r = await fetchMyArcName(headers);
-      setMyChainArc((prev) => ({
-        name: r.name ?? prev?.name ?? null,
-        expiresAt: r.expiresAt ?? prev?.expiresAt ?? null,
-      }));
+      setMyChainArc({ name: r.name, expiresAt: r.expiresAt });
     } catch {
-      /* keep prior state — do not clear name loaded from /pay/context */
+      setMyChainArc(null);
     }
   }, [getAuthHeaders]);
 
@@ -587,75 +513,6 @@ export default function AgentPayPage() {
     a.download = "agentpay-batch-template.csv";
     a.click();
     URL.revokeObjectURL(url);
-  };
-
-  const payFromContact = (addr: string) => {
-    setToAddress(addr);
-    goTab("send");
-  };
-
-  const handleAddContact = async () => {
-    const headers = getAuthHeaders();
-    if (!headers) return;
-    const name = contactName.trim().toLowerCase();
-    const address = contactAddress.trim();
-    if (!name || !address) {
-      setContactsError("Enter a display name and recipient address.");
-      return;
-    }
-    setAddingContact(true);
-    setContactsError(null);
-    try {
-      const body: Record<string, string> = { name, address };
-      const lab = contactLabel.trim();
-      const notes = contactNotes.trim();
-      if (lab) body.label = lab;
-      if (notes) body.notes = notes;
-      const res = await fetch("/api/pay/contacts", {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) {
-        throw new Error(data.error ?? "Could not save contact");
-      }
-      setContactName("");
-      setContactAddress("");
-      setContactLabel("");
-      setContactNotes("");
-      await loadContacts();
-    } catch (e) {
-      setContactsError(e instanceof Error ? e.message : "Could not save contact");
-    } finally {
-      setAddingContact(false);
-    }
-  };
-
-  const handleDeleteContact = async (id: string) => {
-    if (typeof window !== "undefined") {
-      const ok = window.confirm("Remove this contact from your address book?");
-      if (!ok) return;
-    }
-    const headers = getAuthHeaders();
-    if (!headers) return;
-    setDeletingContactId(id);
-    setContactsError(null);
-    try {
-      const res = await fetch(`/api/pay/contacts/${encodeURIComponent(id)}`, {
-        method: "DELETE",
-        headers,
-      });
-      const data = (await res.json().catch(() => ({}))) as { error?: string };
-      if (!res.ok) {
-        throw new Error(data.error ?? "Could not remove contact");
-      }
-      await loadContacts();
-    } catch (e) {
-      setContactsError(e instanceof Error ? e.message : "Could not remove contact");
-    } finally {
-      setDeletingContactId(null);
-    }
   };
 
   const handleBatchPreview = async () => {
@@ -907,50 +764,6 @@ export default function AgentPayPage() {
     payContext?.userAgentWalletAddress?.trim() ||
     "";
 
-  useEffect(() => {
-    if (tab !== "receive") {
-      return;
-    }
-    if (!address || !isAuthenticated || authLoading || balanceLoading) {
-      return;
-    }
-    const needsExecutionAddress = !dcwExecutionAddress;
-    const needsBalance = !balanceInfo && !balanceLoading;
-    const needsArcName = !myChainArc?.name;
-
-    if (!needsExecutionAddress && !needsBalance && !needsArcName) {
-      return;
-    }
-
-    // Keep retrying missing receive-panel data so a transient boot/API failure
-    // cannot leave the QR visible while the .arc name or USDC balance stays blank.
-    void loadContext();
-    if (needsBalance) void loadBalance();
-    if (needsArcName) void loadMyChainArc();
-
-    const timer = window.setInterval(() => {
-      void loadContext();
-      void loadBalance();
-      void loadMyChainArc();
-    }, 12000);
-
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [
-    tab,
-    address,
-    isAuthenticated,
-    authLoading,
-    balanceInfo,
-    balanceLoading,
-    dcwExecutionAddress,
-    loadContext,
-    loadBalance,
-    loadMyChainArc,
-    myChainArc?.name,
-  ]);
-
   const arcHandleTrimmed = payContext?.arc_handle?.trim() || "";
   const publicPayUrl = arcHandleTrimmed
     ? `${payPublicOrigin.replace(/\/+$/, "")}/pay/${encodeURIComponent(arcHandleTrimmed)}`
@@ -969,9 +782,6 @@ export default function AgentPayPage() {
     : "";
 
   const usdcAvailable = balanceInfo ? pickUsdcBalance(balanceInfo.holdings) : null;
-  const uiAddress = hydrated ? address : undefined;
-  const uiIsAuthenticated = hydrated ? isAuthenticated : false;
-  const uiAuthLoading = hydrated ? authLoading : false;
 
   const arcRegistrationFeePhrase =
     arcAvailCheck &&
@@ -1028,7 +838,6 @@ export default function AgentPayPage() {
     { id: "history", label: "History" },
     { id: "scheduled", label: "Scheduled" },
     { id: "invoices", label: "Invoices" },
-    { id: "contacts", label: "Contacts" },
     { id: "batch", label: "Batch" },
   ];
   const recentRelocations = (history ?? []).slice(0, 3);
@@ -1038,36 +847,43 @@ export default function AgentPayPage() {
       <AppSidebar collapsed={isCollapsed} onToggleCollapse={toggleSidebar} />
 
       <div className="flex-1 flex flex-col overflow-hidden">
-        <ChatTopNavbar
-          actions={(
+        {/* Top bar */}
+        <header className="flex-shrink-0 h-20 flex items-center justify-between px-10 border-b border-white/5 bg-[#050505]/90 backdrop-blur-md">
+          <div className="flex items-center gap-2">
+            <span className="text-lg font-headline italic text-white/70 tracking-tighter">AgentPay</span>
+          </div>
+          <div className="flex items-center gap-6">
+            <div className="hidden lg:flex items-center bg-[#020202] px-4 py-2 border border-white/10 focus-within:border-[#f2ca50]/40 transition-all">
+              <span className="material-symbols-outlined icon-standard text-white/30 mr-2 text-sm">search</span>
+              <input className="bg-transparent border-none focus:ring-0 focus:outline-none text-[10px] w-40 text-white/80 uppercase tracking-[0.15em]" placeholder="Search payments..." type="text"/>
+            </div>
             <SessionStatusChip
-              address={uiAddress}
-              isAuthenticated={uiIsAuthenticated}
-              isLoading={uiAuthLoading}
+              address={address}
+              isAuthenticated={isAuthenticated}
+              isLoading={authLoading}
+              error={authError}
               onAction={() => {
                 if (!address) { openConnectModal?.(); return; }
                 if (!isAuthenticated) { void signIn().catch(() => {}); }
               }}
               compact
             />
-          )}
-        />
+          </div>
+        </header>
 
         <main className="flex-1 overflow-y-auto pb-16 px-10 pt-12">
           <div className="mx-auto max-w-[1240px]">
             {/* Page header */}
             <header className="mb-14 flex flex-col md:flex-row md:items-end justify-between gap-10">
               <div>
-                <h2 className="mb-4 font-headline text-5xl tracking-tight text-white">
-                  Agent<span className="text-[#f2ca50]">Pay</span>
-                </h2>
+                <h2 className="text-5xl font-headline text-white mb-4 tracking-tight">AgentPay</h2>
                 <div className="flex items-center gap-5">
-                  <span className="border border-[#f2ca50]/25 bg-[#f2ca50]/6 px-2.5 py-1 font-label text-[9px] uppercase tracking-[0.28em] text-[#f2ca50]">
-                    {uiIsAuthenticated ? "Authorized Session" : uiAddress ? "Sign Session" : "Connect Wallet"}
+                  <span className="px-2.5 py-1 bg-[#f2ca50]/5 text-[#f2ca50] border border-[#f2ca50]/20 font-label text-[8px] uppercase tracking-[0.3em]">
+                    {isAuthenticated ? "Authorized Session" : address ? "Sign Session" : "Connect Wallet"}
                   </span>
                   <div className="flex items-center gap-2.5">
                     <span className="w-1.5 h-1.5 rounded-full bg-[#f2ca50]/80 shadow-[0_0_8px_rgba(212,175,55,0.4)]" />
-                    <span className="text-white/55 text-[10px] uppercase tracking-[0.25em]">Arc live</span>
+                    <span className="text-white/30 text-[9px] uppercase tracking-widest">Arc live</span>
                   </div>
                 </div>
               </div>
@@ -1089,11 +905,11 @@ export default function AgentPayPage() {
               </div>
             </header>
 
-            {!uiAddress ? (
+            {!address ? (
               <div className="border border-white/10 bg-[#0a0a0a] p-6 text-sm text-white/40">
                 Connect your wallet to use AgentPay.
               </div>
-            ) : !uiIsAuthenticated ? (
+            ) : !isAuthenticated ? (
               <div className="border border-[rgba(242,202,80,0.35)] bg-[#0a0a0a] p-6">
                 <div className="text-sm text-white/90">Sign your AgentFlow session to continue.</div>
                 <button
@@ -1101,10 +917,10 @@ export default function AgentPayPage() {
                   onClick={() => {
                     void signIn().catch(() => {});
                   }}
-                  disabled={uiAuthLoading}
+                  disabled={authLoading}
                   className="transition-all burnished-gold mt-4 px-4 py-2 text-sm font-bold disabled:opacity-60"
                 >
-                  {uiAuthLoading ? "Signing..." : "Sign session"}
+                  {authLoading ? "Signing..." : "Sign session"}
                 </button>
                 {authError ? (
                   <div className="mt-3 text-sm text-[#ffa8a3]">{authError}</div>
@@ -1112,16 +928,16 @@ export default function AgentPayPage() {
               </div>
             ) : (
               <>
-                <nav className="mb-12 flex flex-wrap gap-3 border-b border-white/5 pb-5">
+                <nav className="flex gap-10 border-b border-white/5 mb-12">
                   {tabs.map((t) => (
                     <button
                       key={t.id}
                       type="button"
                       onClick={() => goTab(t.id)}
-                      className={`rounded-full border px-4 py-2 font-label text-[11px] uppercase tracking-[0.22em] transition-all ${
+                      className={`pb-5 border-b-2 font-label text-[10px] uppercase tracking-[0.4em] transition-all ${
                         tab === t.id
-                          ? "border-[#f2ca50]/60 bg-[#f2ca50]/10 text-[#f2ca50] shadow-[0_0_0_1px_rgba(242,202,80,0.08)]"
-                          : "border-white/10 text-white/60 hover:border-white/25 hover:text-white/90"
+                          ? "border-[#f2ca50] text-[#f2ca50]"
+                          : "border-transparent text-white/20 hover:text-white/80"
                       }`}
                     >
                       {t.label}
@@ -1137,11 +953,6 @@ export default function AgentPayPage() {
                 {(tab === "requests" || tab === "history" || tab === "scheduled") && operationsError ? (
                   <div className="mb-4 rounded-xl border border-[#ff716c]/30 bg-[#9f0519]/10 px-4 py-3 text-sm text-[#ffa8a3]">
                     {operationsError}
-                  </div>
-                ) : null}
-                {tab === "contacts" && contactsError ? (
-                  <div className="mb-4 rounded-xl border border-[#ff716c]/30 bg-[#9f0519]/10 px-4 py-3 text-sm text-[#ffa8a3]">
-                    {contactsError}
                   </div>
                 ) : null}
                 {tab === "scheduled" && scheduledToast ? (
@@ -1336,27 +1147,8 @@ export default function AgentPayPage() {
                         <div className="flex justify-center rounded-2xl bg-white p-4">
                           {dcwExecutionAddress ? (
                             <QRCodeSVG value={dcwExecutionAddress} size={200} level="M" />
-                          ) : authLoading || balanceLoading ? (
-                            <div className="flex h-[200px] w-[200px] flex-col items-center justify-center rounded-xl bg-[#d6d9de] text-center text-xs text-black/55">
-                              <div className="h-10 w-10 animate-spin rounded-full border-4 border-black/15 border-t-black/45" />
-                              <span className="mt-4 max-w-[140px] font-medium">Loading execution wallet QR...</span>
-                            </div>
                           ) : (
-                            <div className="flex h-[200px] w-[200px] flex-col items-center justify-center rounded-xl bg-[#d6d9de] px-4 text-center text-xs text-black/60">
-                              <span className="max-w-[150px] font-medium">
-                                Execution wallet address is unavailable right now.
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  void loadContext();
-                                  void loadBalance();
-                                }}
-                                className="mt-4 rounded-full border border-black/15 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-black/75 transition hover:border-black/30 hover:text-black"
-                              >
-                                Reload address
-                              </button>
-                            </div>
+                            <div className="h-[200px] w-[200px] animate-pulse bg-[#d6d9de]" />
                           )}
                         </div>
                         <div className="break-all font-mono text-xs text-white/90">
@@ -2089,126 +1881,6 @@ export default function AgentPayPage() {
                         &quot;create invoice for alice.arc 50 USDC for design&quot;
                       </div>
                     </div>
-                  </div>
-                ) : null}
-
-                {tab === "contacts" ? (
-                  <div className="space-y-6">
-                    <div className="text-sm text-[#d0c5af]/70">
-                      Save names for people and businesses you pay often. Use them in chat or prefill Send.
-                    </div>
-                    <div className="rounded-2xl border border-white/10 bg-[#111318] p-6 space-y-4">
-                      <div className="text-xs font-medium text-[#aaabb0] uppercase tracking-wider">
-                        Add contact
-                      </div>
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <div>
-                          <label className="block text-[11px] uppercase tracking-[0.18em] text-white/40 mb-1.5">
-                            Name
-                          </label>
-                          <input
-                            value={contactName}
-                            onChange={(e) => setContactName(e.target.value)}
-                            placeholder="alice"
-                            autoComplete="off"
-                            className="w-full bg-[#0a0b0f] border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-[#f2ca50]/50"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] uppercase tracking-[0.18em] text-white/40 mb-1.5">
-                            Address (.arc or 0x)
-                          </label>
-                          <input
-                            value={contactAddress}
-                            onChange={(e) => setContactAddress(e.target.value)}
-                            placeholder="vendor.arc or 0x…"
-                            autoComplete="off"
-                            className="w-full bg-[#0a0b0f] border border-white/10 rounded-xl px-4 py-3 text-sm text-white font-mono focus:outline-none focus:border-[#f2ca50]/50"
-                          />
-                        </div>
-                        <div className="sm:col-span-2">
-                          <label className="block text-[11px] uppercase tracking-[0.18em] text-white/40 mb-1.5">
-                            Label (optional)
-                          </label>
-                          <input
-                            value={contactLabel}
-                            onChange={(e) => setContactLabel(e.target.value)}
-                            placeholder="Freelance vendor"
-                            autoComplete="off"
-                            className="w-full bg-[#0a0b0f] border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-[#f2ca50]/50"
-                          />
-                        </div>
-                        <div className="sm:col-span-2">
-                          <label className="block text-[11px] uppercase tracking-[0.18em] text-white/40 mb-1.5">
-                            Notes (optional)
-                          </label>
-                          <textarea
-                            value={contactNotes}
-                            onChange={(e) => setContactNotes(e.target.value)}
-                            placeholder="Invoice ref, Telegram, …"
-                            rows={2}
-                            className="w-full bg-[#0a0b0f] border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-[#f2ca50]/50 resize-none"
-                          />
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => void handleAddContact()}
-                        disabled={addingContact || !contactName.trim() || !contactAddress.trim()}
-                        className="burnished-gold btn-hover-effect px-6 py-2.5 rounded-xl text-sm font-semibold text-[#1a1200] disabled:opacity-50"
-                      >
-                        {addingContact ? "Saving…" : "Save contact"}
-                      </button>
-                    </div>
-                    {contactsLoading ? (
-                      <div className="text-sm text-[#aaabb0]">Loading contacts…</div>
-                    ) : contacts.length === 0 ? (
-                      <div className="rounded-2xl border border-white/10 bg-[#111318] p-8 text-center text-sm text-[#aaabb0]">
-                        No saved contacts yet. Add one above or say in chat: &quot;save contact alice as vendor.arc&quot;.
-                      </div>
-                    ) : (
-                      <div className="space-y-3">
-                        <div className="text-xs font-medium text-[#aaabb0] uppercase tracking-wider">
-                          Your contacts
-                        </div>
-                        {contacts.map((c) => (
-                          <div
-                            key={c.id}
-                            className="rounded-2xl border border-white/10 bg-[#111318] p-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
-                          >
-                            <div className="min-w-0 space-y-1">
-                              <div className="text-sm font-medium text-white">{c.name}</div>
-                              <div className="text-xs font-mono text-[#aaabb0] break-all">
-                                {c.address}
-                              </div>
-                              {c.label ? (
-                                <div className="text-xs text-[#d0c5af]/80">{c.label}</div>
-                              ) : null}
-                              {c.notes ? (
-                                <div className="text-[11px] text-white/40 line-clamp-2">{c.notes}</div>
-                              ) : null}
-                            </div>
-                            <div className="flex flex-wrap gap-2 shrink-0">
-                              <button
-                                type="button"
-                                onClick={() => payFromContact(c.address)}
-                                className="rounded-lg border border-[#f2ca50]/40 px-4 py-2 text-sm font-semibold text-[#f2ca50] hover:bg-[#f2ca50]/10 transition"
-                              >
-                                Pay
-                              </button>
-                              <button
-                                type="button"
-                                disabled={deletingContactId === c.id}
-                                onClick={() => void handleDeleteContact(c.id)}
-                                className="rounded-lg border border-[#ff716c]/40 px-4 py-2 text-sm font-semibold text-[#ff716c] disabled:opacity-50"
-                              >
-                                {deletingContactId === c.id ? "Removing…" : "Remove"}
-                              </button>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
                   </div>
                 ) : null}
 

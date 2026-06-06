@@ -300,6 +300,96 @@ assert.doesNotMatch(
   'Writer markdown must not be replaced by claim fallback when research lacks structured JSON.',
 );
 
+const writerWithNestedDuplicateSources = `## Summary
+
+Bitcoin has live market data available.
+
+- **Sources:**
+  - coingecko.com (2026-06-01, via API)
+  - defillama.com (2026-06-01, via API and BTC page)
+
+- **Takeaway:**
+
+Keep the report source list clean.`;
+
+const normalizedNestedSources = finalizeReportMarkdown({
+  task: 'Bitcoin fast report',
+  writerMarkdown: writerWithNestedDuplicateSources,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-01T00:00:00.000Z',
+    coingecko: {
+      assets: [{ coinId: 'bitcoin', last_updated_at: '2026-06-01T00:00:00.000Z' }],
+    },
+    defillama: {
+      chains: [{ chain: 'Bitcoin' }],
+    },
+  },
+});
+assert.equal(
+  normalizedNestedSources.markdown.match(/^## Sources$/gm)?.length,
+  1,
+  'Expected one normalized Sources section for nested bold source headings.',
+);
+assert.doesNotMatch(normalizedNestedSources.markdown, /\bvia API\b/i);
+assert.match(normalizedNestedSources.markdown, /https:\/\/www\.coingecko\.com\/en\/coins\/bitcoin/);
+assert.match(normalizedNestedSources.markdown, /https:\/\/defillama\.com\/chain\/Bitcoin/);
+assert.match(
+  normalizedNestedSources.markdown,
+  /- \[CoinGecko\]\(https:\/\/www\.coingecko\.com\/en\/coins\/bitcoin\) - live market data/,
+);
+assert.doesNotMatch(normalizedNestedSources.markdown, /CoinGecko: https:\/\//);
+assert.match(normalizedNestedSources.markdown, /Keep the report source list clean\./);
+
+const bitcoinWithIrrelevantDynamicSources = finalizeReportMarkdown({
+  task: 'make a research report on bitcoin',
+  writerMarkdown: '## Summary\n\nBitcoin report.',
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-01T00:00:00.000Z',
+    coingecko: {
+      assets: [{ coinId: 'bitcoin', last_updated_at: '2026-06-01T00:00:00.000Z' }],
+    },
+    dynamic_sources: {
+      articles: [
+        { title: 'Unrelated key page', url: 'https://key.com/example', summary: 'Unrelated.' },
+        { title: 'Unrelated app page', url: 'https://play.google.com/store/apps/example', summary: 'Unrelated.' },
+        { title: 'Unrelated music page', url: 'https://tunebat.com/example', summary: 'Unrelated.' },
+        { title: 'Unrelated dictionary page', url: 'https://dict.leo.org/example', summary: 'Unrelated.' },
+      ],
+    },
+  },
+});
+assert.match(bitcoinWithIrrelevantDynamicSources.markdown, /CoinGecko/);
+assert.doesNotMatch(
+  bitcoinWithIrrelevantDynamicSources.markdown,
+  /\b(?:key\.com|play\.google\.com|tunebat\.com|dict\.leo\.org)\b/i,
+);
+
+const bitcoinTransactionsWithOnchainSource = finalizeReportMarkdown({
+  task: "Make research report on the bitcoin's last 24h transactions",
+  writerMarkdown: '## Summary\n\nBitcoin network transaction report.',
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-01T00:00:00.000Z',
+    bitcoin_onchain: {
+      source: 'Mempool.space blocks API',
+      chain: 'Bitcoin',
+      window: 'last_24h_from_tip',
+      latest_block_height: 951982,
+      latest_block_time: '2026-06-01T12:00:00.000Z',
+      window_start_time: '2026-05-31T12:00:00.000Z',
+      confirmed_transaction_count_24h: 612345,
+      block_count_24h: 144,
+    },
+  },
+});
+assert.match(bitcoinTransactionsWithOnchainSource.markdown, /Mempool\.space/);
+assert.match(bitcoinTransactionsWithOnchainSource.markdown, /https:\/\/mempool\.space\/blocks/);
+
 console.log('Before example:');
 console.log(badWriterMarkdown.split('\n').slice(0, 12).join('\n'));
 console.log('\nAfter example:');

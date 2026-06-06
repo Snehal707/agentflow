@@ -1,0 +1,172 @@
+import { getAddress } from 'viem';
+import { swaparcProvider } from './providers/swaparc';
+import { achswapProvider } from './providers/achswap';
+import { lunexProvider, LunexRateLimitError } from './providers/lunex';
+import { resolveArcTokenSymbol } from '../swap-symbols';
+import type { DexProvider, QuoteParams, QuoteResult, SwapParams, SwapResult } from './types';
+
+const providers: DexProvider[] = [swaparcProvider, achswapProvider, lunexProvider];
+
+export function getDexProviderNames(): string[] {
+  return providers.map((provider) => provider.name);
+}
+
+function sanitizeErrorReason(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const apiKey = process.env.LUNEX_API_KEY?.trim();
+  if (!apiKey) {
+    return raw;
+  }
+  return raw.split(apiKey).join('[REDACTED]');
+}
+
+function isPlausibleQuote(
+  quote: QuoteResult,
+  tokenIn: `0x${string}`,
+  tokenOut: `0x${string}`,
+  amountInRaw: bigint,
+  tokenInDecimals: number,
+  tokenOutDecimals: number,
+): boolean {
+  const normalizedTokenInDecimals = getLogicalStableDecimals(tokenIn) ?? tokenInDecimals;
+  const normalizedTokenOutDecimals = getLogicalStableDecimals(tokenOut) ?? tokenOutDecimals;
+  const amountIn = Number(amountInRaw) / 10 ** normalizedTokenInDecimals;
+  const amountOut = Number(quote.expectedOutRaw) / 10 ** normalizedTokenOutDecimals;
+
+  if (!Number.isFinite(amountIn) || !Number.isFinite(amountOut) || amountIn <= 0 || amountOut <= 0) {
+    return false;
+  }
+
+  const impliedRate = amountOut / amountIn;
+  return impliedRate >= 0.5 && impliedRate <= 2.0;
+}
+
+function getLogicalStableDecimals(token: `0x${string}`): number | null {
+  const normalized = getAddress(token);
+  const usdc = resolveArcTokenSymbol('USDC');
+  const eurc = resolveArcTokenSymbol('EURC');
+  if (usdc && normalized === getAddress(usdc)) return 6;
+  if (eurc && normalized === getAddress(eurc)) return 6;
+  return null;
+}
+
+export async function getBestQuote(params: QuoteParams): Promise<QuoteResult> {
+  const attempts = await Promise.allSettled(
+    providers.map(async (provider) => {
+      const quote = await provider.quote(params);
+      return { provider: provider.name, quote };
+    }),
+  );
+
+  const successful: QuoteResult[] = [];
+
+  for (let index = 0; index < attempts.length; index++) {
+    const providerName = providers[index]?.name ?? 'unknown';
+    const attempt = attempts[index];
+
+    if (attempt.status === 'fulfilled') {
+      const { provider, quote } = attempt.value;
+      console.info(
+        '[DEX_ROUTER_QUOTE]',
+        JSON.stringify({
+          provider,
+          tokenIn: params.tokenIn,
+          tokenOut: params.tokenOut,
+          amountInRaw: params.amountInRaw.toString(),
+          success: true,
+          expectedOutRaw: quote.expectedOutRaw.toString(),
+          latencyMs: quote.latencyMs,
+          errorReason: null,
+        }),
+      );
+      successful.push(quote);
+    } else {
+      if (attempt.reason instanceof LunexRateLimitError) {
+        console.warn(
+          '[DEX_ROUTER_RATE_LIMITED]',
+          JSON.stringify({
+            provider: providerName,
+            window: '60_per_min',
+          }),
+        );
+      }
+
+      const message = sanitizeErrorReason(attempt.reason);
+      console.info(
+        '[DEX_ROUTER_QUOTE]',
+        JSON.stringify({
+          provider: providerName,
+          tokenIn: params.tokenIn,
+          tokenOut: params.tokenOut,
+          amountInRaw: params.amountInRaw.toString(),
+          success: false,
+          expectedOutRaw: null,
+          latencyMs: null,
+          errorReason: message,
+        }),
+      );
+    }
+  }
+
+  if (!successful.length) {
+    throw new Error('no swap route available for this pair on any configured DEX provider');
+  }
+
+  const plausible = successful.filter((quote) => {
+    const ok = isPlausibleQuote(
+      quote,
+      params.tokenIn,
+      params.tokenOut,
+      params.amountInRaw,
+      quote.tokenInDecimals,
+      quote.tokenOutDecimals,
+    );
+
+    if (!ok) {
+      const normalizedTokenInDecimals =
+        getLogicalStableDecimals(params.tokenIn) ?? quote.tokenInDecimals;
+      const normalizedTokenOutDecimals =
+        getLogicalStableDecimals(params.tokenOut) ?? quote.tokenOutDecimals;
+      const amountIn = Number(params.amountInRaw) / 10 ** normalizedTokenInDecimals;
+      const amountOut = Number(quote.expectedOutRaw) / 10 ** normalizedTokenOutDecimals;
+      const impliedRate = amountOut / amountIn;
+      console.warn(
+        '[DEX_ROUTER_IMPLAUSIBLE_QUOTE]',
+        JSON.stringify({
+          provider: quote.provider,
+          tokenIn: params.tokenIn,
+          tokenOut: params.tokenOut,
+          amountInRaw: params.amountInRaw.toString(),
+          expectedOutRaw: quote.expectedOutRaw.toString(),
+          tokenInDecimals: normalizedTokenInDecimals,
+          tokenOutDecimals: normalizedTokenOutDecimals,
+          impliedRate,
+        }),
+      );
+    }
+
+    return ok;
+  });
+
+  if (!plausible.length) {
+    throw new Error('No valid quotes available for this swap');
+  }
+
+  plausible.sort((left, right) => {
+    if (left.expectedOutRaw === right.expectedOutRaw) return 0;
+    return left.expectedOutRaw > right.expectedOutRaw ? -1 : 1;
+  });
+
+  return plausible[0];
+}
+
+export async function executeSwap(
+  providerName: string,
+  params: SwapParams,
+): Promise<SwapResult> {
+  const provider = providers.find((entry) => entry.name === providerName);
+  if (!provider) {
+    throw new Error(`[dex/router] unknown provider: ${providerName}`);
+  }
+  return provider.swap(params);
+}

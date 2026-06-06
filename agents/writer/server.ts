@@ -2,12 +2,13 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import dotenv from 'dotenv';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
-import { callHermesDeep } from '../../lib/hermes';
+import { callHermesFast } from '../../lib/hermes';
 import { WRITER_SYSTEM_PROMPT } from '../../lib/agentPrompts';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
 import { resolveAgentSellerAddress } from '../../lib/agentSellerAddress';
 import { buildWriterModelInput } from '../../lib/reportInputs';
 import { getFacilitatorBaseUrl } from '../../lib/facilitator-url';
+import { inferResearchReasoningMode } from '../../lib/researchMode';
 
 dotenv.config();
 
@@ -31,8 +32,6 @@ const price =
 const facilitatorUrl = getFacilitatorBaseUrl();
 const internalBrainKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
 let gateway: ReturnType<typeof createGatewayMiddleware>;
-
-type InternalRequest = Request & { _internalAuth?: boolean };
 
 app.get('/health', (_req, res) => {
   res.status(200).json({ status: 'ok', agent: 'writer' });
@@ -63,36 +62,24 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
-const internalKeyMiddleware = (req: Request, _res: Response, next: NextFunction) => {
+const internalKeyMiddleware = (req: Request, res: Response, next: NextFunction) => {
   const reqKey =
     typeof req.headers['x-agentflow-brain-internal'] === 'string'
       ? req.headers['x-agentflow-brain-internal'].trim()
       : '';
   if (internalBrainKey && reqKey === internalBrainKey) {
-    (req as InternalRequest)._internalAuth = true;
-  }
-  next();
-};
-
-const maybeRequirePayment = (req: Request, res: Response, next: NextFunction) => {
-  if ((req as InternalRequest)._internalAuth) {
     next();
     return;
   }
+  res.status(404).json({ error: 'Not found' });
+};
+
+const requirePayment = (req: Request, res: Response, next: NextFunction) => {
   return gateway.require(price)(req, res, next);
 };
 
 const runHandler = async (req: Request, res: Response) => {
   try {
-    if (req.body?.benchmark === true || req.query?.benchmark === 'true') {
-      console.log('[benchmark] writer short-circuit');
-      return res.json({
-        ok: true,
-        benchmark: true,
-        agent: 'writer',
-        result: 'Benchmark mode - payment logged',
-      });
-    }
     const research =
       (req.body?.research as string) ?? (req.query.research as string) ?? '';
     const analysis =
@@ -106,6 +93,16 @@ const runHandler = async (req: Request, res: Response) => {
       safeParseObject(analysis);
     const liveData =
       (req.body?.liveData as Record<string, unknown> | undefined) ?? null;
+    const portfolioImpact =
+      req.body?.portfolioImpact === true ||
+      req.query.portfolioImpact === 'true' ||
+      liveData?.portfolio_impact === true;
+    const reasoningMode = inferResearchReasoningMode({
+      task,
+      explicitMode: req.body?.reasoningMode ?? req.query.reasoningMode,
+      deepResearch: req.body?.deepResearch ?? req.query.deepResearch,
+      defaultMode: 'fast',
+    });
     const combinedInput = buildWriterModelInput({
       task,
       researchText: research,
@@ -113,10 +110,12 @@ const runHandler = async (req: Request, res: Response) => {
       research: researchJson,
       analysis: analysisJson,
       liveData,
+      portfolioImpact,
     });
+    console.log('[writer] using Hermes fast model');
 
     const result = await withTimeout(
-      callHermesDeep(WRITER_SYSTEM_PROMPT, combinedInput),
+      callHermesFast(WRITER_SYSTEM_PROMPT, combinedInput),
       HERMES_TIMEOUT_MS,
       `Writer Hermes timed out after ${HERMES_TIMEOUT_MS / 1000}s`,
     );
@@ -129,8 +128,8 @@ const runHandler = async (req: Request, res: Response) => {
   }
 };
 
-app.get('/run', internalKeyMiddleware, maybeRequirePayment, runHandler);
-app.post('/run', internalKeyMiddleware, maybeRequirePayment, runHandler);
+app.get('/run', internalKeyMiddleware, requirePayment, runHandler);
+app.post('/run', internalKeyMiddleware, requirePayment, runHandler);
 
 async function start(): Promise<void> {
   const sellerAddress = await resolveAgentSellerAddress({

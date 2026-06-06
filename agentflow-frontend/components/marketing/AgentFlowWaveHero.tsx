@@ -20,9 +20,16 @@ type WaveConfig = {
 };
 
 const HERO_METRICS = [
-  { label: "Hackathon proof", value: "50+ tx" },
-  { label: "Per-action demo", value: "< $0.01" },
-  { label: "Agent payment loop", value: "A2A live" },
+  { label: "Live agents", value: "12", note: "core workflows" },
+  { label: "Avg task price", value: "~$0.009", note: "current default pricing" },
+  { label: "Settlement rail", value: "Arc + USDC", note: "wallet-aware execution" },
+  { label: "Channels", value: "Web + Telegram", note: "one flow across both" },
+] as const;
+
+const HERO_PROOF_POINTS = [
+  "Hermes reasoning",
+  "Wallet-aware execution",
+  "Web + Telegram",
 ] as const;
 
 const WAVE_CONFIG: WaveConfig[] = [
@@ -282,7 +289,6 @@ export function AgentFlowWaveHero() {
     <section
       ref={sectionRef}
       className="relative isolate overflow-hidden border-b border-[#2b2418] bg-[#090909]"
-      id="features"
     >
       <canvas
         ref={canvasRef}
@@ -294,53 +300,66 @@ export function AgentFlowWaveHero() {
 
       <div className="relative z-10 mx-auto flex min-h-[calc(100svh-74px)] max-w-7xl flex-col justify-center px-6 pb-16 pt-32 text-center md:px-12 md:pb-20">
         <div className="mx-auto max-w-4xl">
-          <p className="font-label text-[10px] font-bold uppercase tracking-[0.34em] text-[#f2ca50]/78">
-            Arc-native agentic economy
-          </p>
-
-          <h1 className="mt-6 font-headline text-5xl font-black leading-[0.94] text-white md:text-7xl lg:text-[6.6rem]">
+          <h1 className="font-headline text-5xl font-black leading-[0.94] text-white md:text-7xl lg:text-[6.6rem]">
             AgentFlow
             <span className="mt-3 block gold-gradient-text font-medium italic">
-              A brain for paid, onchain work.
+              Run onchain work from one wallet-aware workspace.
             </span>
           </h1>
 
           <p className="mx-auto mt-8 max-w-3xl text-base leading-7 text-[#d0c5af]/88 md:text-xl md:leading-8">
-            Not another chat wrapper. AgentFlow is a wallet-aware agentic app with
-            persistent memory, live portfolio context, and 14 specialized agents that
-            research, pay, swap, bridge, vault, invoice, schedule, and settle work in
-            USDC on Arc from web chat or Telegram.
+            AgentFlow combines Hermes-powered chat, dedicated agent services, AgentPay,
+            funding controls, portfolio views, and execution proof in one product.
+            Start from web or Telegram, confirm wallet actions when needed, and settle work in USDC on Arc.
           </p>
+
+          <div className="mx-auto mt-8 flex max-w-3xl flex-wrap items-center justify-center gap-3 text-left">
+            {HERO_PROOF_POINTS.map((point) => (
+              <div
+                key={point}
+                className="inline-flex items-center gap-2 rounded-full border border-[#4d4635]/35 bg-[rgba(19,19,19,0.42)] px-4 py-2 text-[11px] uppercase tracking-[0.16em] text-[#d0c5af]/82 backdrop-blur-sm"
+              >
+                <span className="h-1.5 w-1.5 rounded-full bg-[#f2ca50]" />
+                {point}
+              </div>
+            ))}
+          </div>
 
           <div className="mt-10 flex flex-col items-center justify-center gap-4 sm:flex-row">
             <Link
               href="/chat"
               className="af-btn-primary af-focusable af-transition inline-flex min-h-12 items-center justify-center px-6 py-3 text-sm font-bold uppercase tracking-[0.18em]"
             >
-              Open workspace
+              Open chat
             </Link>
             <Link
-              href="/economy"
+              href="/agents"
               className="af-btn-ghost af-focusable af-transition inline-flex min-h-12 items-center justify-center px-6 py-3 text-sm font-bold uppercase tracking-[0.18em]"
             >
-              View economy
+              Browse agents
             </Link>
           </div>
 
           <p className="mt-7 text-[11px] uppercase tracking-[0.22em] text-[#d0c5af]/64">
-            Pay per task | AgentPay commerce | Telegram access | x402 settlement
+            {"Pay per task \u00b7 Hermes reasoning \u00b7 Wallet confirmation \u00b7 Onchain settlement"}
           </p>
         </div>
 
-        <dl className="mx-auto mt-14 grid w-full max-w-4xl gap-y-6 border-t border-[#4d4635]/28 pt-8 text-left sm:grid-cols-3 sm:gap-x-8">
+        <dl className="mx-auto mt-14 grid w-full max-w-5xl gap-5 border-t border-[#4d4635]/28 pt-8 text-left sm:grid-cols-2 lg:grid-cols-4">
           {HERO_METRICS.map((metric) => (
-            <div key={metric.label} className="space-y-1">
+            <div
+              key={metric.label}
+              className="rounded-[22px] border border-[#4d4635]/18 bg-[rgba(13,13,13,0.36)] px-5 py-5 backdrop-blur-sm"
+            >
               <dt className="font-label text-[10px] uppercase tracking-[0.22em] text-[#d0c5af]/48">
                 {metric.label}
               </dt>
-              <dd className="font-headline text-3xl font-bold text-[#f2ca50] md:text-4xl">
+              <dd className="mt-3 font-headline text-[2.35rem] font-bold leading-[0.92] text-[#f2ca50] md:text-[2.75rem]">
                 {metric.value}
               </dd>
+              <div className="mt-2 text-xs text-[#d0c5af]/62">
+                {metric.note}
+              </div>
             </div>
           ))}
         </dl>

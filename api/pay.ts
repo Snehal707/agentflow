@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from 'express';
-import { createPublicClient, decodeFunctionData, defineChain, getAddress, http, parseUnits } from 'viem';
+import ExcelJS from 'exceljs';
+import { createPublicClient, decodeFunctionData, defineChain, getAddress, http, isAddress, parseUnits } from 'viem';
 import { ARC } from '../lib/arc-config';
 import { authMiddleware, type JWTPayload } from '../lib/auth';
 import { adminDb, getRedis } from '../db/client';
@@ -23,6 +24,7 @@ import { incrementTxCount } from '../lib/tx-counter';
 import { looksLikeAddress, resolvePayee } from '../lib/agentpay-payee';
 import {
   executeTransaction,
+  findPersistedUserAgentWallet,
   getOrCreateUserAgentWallet,
   waitForTransaction,
 } from '../lib/dcw';
@@ -35,6 +37,12 @@ import {
 } from '../lib/scheduled-payments';
 import { canonicalRedisSessionId, pendingRedisKeyCandidates } from '../lib/chatSessionRedis';
 import { markInvoicePaidFromRequest } from '../lib/invoice-agentpay';
+import {
+  executeGuardCheck,
+  executionGuardMiddleware,
+  type GuardLock,
+} from '../lib/execution-guard';
+import { userDataDbForRequest } from '../lib/user-scoped-db';
 
 const ARC_USDC = '0x3600000000000000000000000000000000000000' as const;
 
@@ -97,14 +105,29 @@ function agentPayDirection(
   return 'out';
 }
 
-function workbookToXlsxBuffer(XLSX: typeof import('xlsx'), wb: import('xlsx').WorkBook): Buffer {
-  const raw = XLSX.write(wb, {
-    type: 'buffer',
-    bookType: 'xlsx',
-    compression: true,
-  } as Parameters<typeof XLSX.write>[1]);
-  if (Buffer.isBuffer(raw)) return raw;
-  return Buffer.from(raw as Uint8Array);
+type ExportWorkbookRow = Record<string, string | number | boolean | null | undefined>;
+
+async function rowsToXlsxBuffer(rows: ExportWorkbookRow[], sheetName = 'Transactions'): Promise<Buffer> {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'AgentFlow';
+  wb.created = new Date();
+
+  const ws = wb.addWorksheet(sheetName);
+  const columns = Array.from(rows.reduce((keys, row) => {
+    Object.keys(row).forEach((key) => keys.add(key));
+    return keys;
+  }, new Set<string>()));
+
+  ws.columns = columns.map((key) => ({
+    header: key,
+    key,
+    width: Math.min(Math.max(key.length + 2, 12), 48),
+  }));
+  ws.addRows(rows);
+  ws.getRow(1).font = { bold: true };
+
+  const raw = await wb.xlsx.writeBuffer();
+  return Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
 }
 
 /** Binary .xlsx: set headers once, then end with buffer (avoid res.send encoding issues). */
@@ -119,11 +142,7 @@ function sendBinaryXlsxResponse(res: Response, buf: Buffer): void {
 }
 
 async function sendAgentPayEmptyExportWorkbook(res: Response): Promise<void> {
-  const XLSX = await import('xlsx');
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet([{ Date: '', Note: 'No agent wallet' }]);
-  XLSX.utils.book_append_sheet(wb, ws, 'Transactions');
-  const buf = workbookToXlsxBuffer(XLSX, wb);
+  const buf = await rowsToXlsxBuffer([{ Date: '', Note: 'No agent wallet' }]);
   sendBinaryXlsxResponse(res, buf);
 }
 
@@ -387,7 +406,7 @@ router.get('/context', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/send', authMiddleware, async (req, res) => {
+router.post('/send', authMiddleware, executionGuardMiddleware, async (req, res) => {
   try {
     const authAddr = getAddress(normalizeWallet(req));
     const rawTo = String(req.body?.toAddress ?? '').trim();
@@ -457,7 +476,7 @@ router.post('/brain/preview', async (req, res) => {
   }
 });
 
-router.post('/brain/execute', authMiddleware, async (req, res) => {
+router.post('/brain/execute', authMiddleware, executionGuardMiddleware, async (req, res) => {
   const sessionId = String(req.body?.sessionId ?? '').trim();
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required' });
@@ -479,19 +498,42 @@ router.post('/brain/execute', authMiddleware, async (req, res) => {
 
     const pending = JSON.parse(raw) as AgentPayPendingPayload;
     const userAddress = getAddress(normalizeWallet(req));
+    if (getAddress(pending.walletAddress).toLowerCase() !== userAddress.toLowerCase()) {
+      return res.status(403).json({ error: 'Wallet does not match pending payment' });
+    }
     const toResolved = await resolvePayee(pending.resolvedAddress || pending.to, userAddress);
     const amountNumber = Number(pending.amount);
     if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
       return res.status(400).json({ error: 'Invalid pending payment amount' });
     }
 
-    const { txHash } = await executeUsdcTransfer({
-      payerEoa: userAddress,
-      toAddress: toResolved,
-      amountUsdc: amountNumber,
-      remark: pending.remark ? String(pending.remark).slice(0, 100) : null,
-      actionType: 'agentpay_send',
+    const guard = await executeGuardCheck({
+      walletAddress: userAddress,
+      amount: amountNumber,
+      recipients: [toResolved],
+      idempotencyKey:
+        String(req.headers['idempotency-key'] || req.body?.idempotencyKey || '').trim()
+          ? `${String(req.headers['idempotency-key'] || req.body?.idempotencyKey).trim()}:pending:${pendingKeyUsed}`
+          : `agentpay-brain:${pendingKeyUsed}`,
+      route: 'POST /api/pay/brain/execute:resolved',
+      requireConfirmation: true,
     });
+    if (!guard.allowed) {
+      return res.status(guard.status).json({ error: guard.message, reason: guard.reason });
+    }
+
+    let txHash: string;
+    try {
+      ({ txHash } = await executeUsdcTransfer({
+        payerEoa: userAddress,
+        toAddress: toResolved,
+        amountUsdc: amountNumber,
+        remark: pending.remark ? String(pending.remark).slice(0, 100) : null,
+        actionType: 'agentpay_send',
+      }));
+    } finally {
+      await guard.release();
+    }
 
     await incrementTxCount('agentpay');
 
@@ -501,6 +543,9 @@ router.post('/brain/execute', authMiddleware, async (req, res) => {
       ok: true,
       txHash,
       explorerLink: explorerLinkTx(txHash),
+      to: pending.to,
+      amount: pending.amount,
+      remark: pending.remark || undefined,
     });
   } catch (e: any) {
     return res.status(500).json({
@@ -925,7 +970,7 @@ router.get('/requests', authMiddleware, async (req, res) => {
     // Requests tab (same class of bug that broke the Invoices tab).
     let dcwAddr: string | null = null;
     try {
-      const ua = await getOrCreateUserAgentWallet(authAddr);
+      const ua = await findPersistedUserAgentWallet(authAddr);
       if (ua?.address?.trim()) {
         dcwAddr = getAddress(ua.address as `0x${string}`);
       }
@@ -983,6 +1028,65 @@ router.get('/requests', authMiddleware, async (req, res) => {
   }
 });
 
+async function finalizePaymentRequestApproval(params: {
+  requestId: string;
+  payerEoa: string;
+  toAddr: `0x${string}`;
+  amount: number;
+  remark: string | null;
+  guard: GuardLock;
+}): Promise<void> {
+  const { requestId, payerEoa, toAddr, amount, remark, guard } = params;
+  try {
+    const { txHash } = await executeUsdcTransfer({
+      payerEoa,
+      toAddress: toAddr,
+      amountUsdc: amount,
+      remark,
+      actionType: 'agentpay_request',
+      idempotencyKey: `agentpay-request:${requestId}`,
+    });
+
+    await incrementTxCount('agentpay');
+
+    const paidAt = new Date().toISOString();
+    const { error: upErr } = await adminDb
+      .from('payment_requests')
+      .update({
+        status: 'paid',
+        paid_at: paidAt,
+        arc_tx_id: txHash,
+      })
+      .eq('id', requestId);
+
+    if (upErr) {
+      throw new Error(upErr.message);
+    }
+
+    try {
+      await markInvoicePaidFromRequest(requestId, txHash);
+    } catch (e) {
+      console.warn('[pay/approve] markInvoicePaidFromRequest failed (non-fatal):', e);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn('[pay/approve] background approval failed:', {
+      requestId,
+      payerEoa,
+      error: message,
+    });
+    await adminDb
+      .from('payment_requests')
+      .update({
+        status: 'pending',
+      })
+      .eq('id', requestId)
+      .eq('status', 'processing');
+  } finally {
+    await guard.release();
+  }
+}
+
 router.post('/approve/:requestId', authMiddleware, async (req, res) => {
   try {
     const authAddr = getAddress(normalizeWallet(req));
@@ -1013,7 +1117,7 @@ router.post('/approve/:requestId', authMiddleware, async (req, res) => {
       // hit on the common path.
       let payerDcw: string | null = null;
       try {
-        const ua = await getOrCreateUserAgentWallet(authAddr);
+        const ua = await findPersistedUserAgentWallet(authAddr);
         if (ua?.address?.trim()) {
           payerDcw = getAddress(ua.address as `0x${string}`).toLowerCase();
         }
@@ -1029,38 +1133,44 @@ router.post('/approve/:requestId', authMiddleware, async (req, res) => {
     const remark = row.remark ? String(row.remark).slice(0, 500) : null;
     const toAddr = getAddress(String(row.to_wallet));
 
-    const { txHash } = await executeUsdcTransfer({
-      payerEoa: authAddr,
-      toAddress: toAddr,
-      amountUsdc: amount,
-      remark,
-      actionType: 'agentpay_request',
+    const guard = await executeGuardCheck({
+      walletAddress: authAddr,
+      amount,
+      recipients: [toAddr],
+      idempotencyKey:
+        String(req.headers['idempotency-key'] || req.body?.idempotencyKey || '').trim() ||
+        `agentpay-request:${requestId}`,
+      route: 'POST /api/pay/approve/:requestId',
+      requireConfirmation:
+        req.body?.confirmed === true || String(req.headers['x-agentflow-confirmed'] || '') === 'true',
     });
+    if (!guard.allowed) {
+      return res.status(guard.status).json({ error: guard.message, reason: guard.reason });
+    }
 
-    await incrementTxCount('agentpay');
-
-    const paidAt = new Date().toISOString();
     const { error: upErr } = await adminDb
       .from('payment_requests')
       .update({
-        status: 'paid',
-        paid_at: paidAt,
-        arc_tx_id: txHash,
+        status: 'processing',
       })
-      .eq('id', requestId);
+      .eq('id', requestId)
+      .eq('status', 'pending');
 
     if (upErr) {
+      await guard.release();
       return res.status(500).json({ error: upErr.message });
     }
 
-    // If this request was linked to an invoice, mark the invoice paid too.
-    try {
-      await markInvoicePaidFromRequest(requestId, txHash);
-    } catch (e) {
-      console.warn('[pay/approve] markInvoicePaidFromRequest failed (non-fatal):', e);
-    }
+    void finalizePaymentRequestApproval({
+      requestId,
+      payerEoa: authAddr,
+      toAddr,
+      amount,
+      remark,
+      guard,
+    });
 
-    return res.json({ txHash, explorerLink: explorerLinkTx(txHash) });
+    return res.json({ accepted: true, status: 'processing' });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message ?? 'approve failed' });
   }
@@ -1092,7 +1202,7 @@ router.post('/decline/:requestId', authMiddleware, async (req, res) => {
     if (fromLower !== authLower) {
       let payerDcw: string | null = null;
       try {
-        const ua = await getOrCreateUserAgentWallet(authAddr);
+        const ua = await findPersistedUserAgentWallet(authAddr);
         if (ua?.address?.trim()) {
           payerDcw = getAddress(ua.address as `0x${string}`).toLowerCase();
         }
@@ -1218,11 +1328,7 @@ router.post('/export', authMiddleware, async (req, res) => {
       };
     });
 
-    const XLSX = await import('xlsx');
-    const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ Date: '', Note: 'No rows' }]);
-    XLSX.utils.book_append_sheet(wb, ws, 'Transactions');
-    const buf = workbookToXlsxBuffer(XLSX, wb);
+    const buf = await rowsToXlsxBuffer(rows.length ? rows : [{ Date: '', Note: 'No rows' }]);
     sendBinaryXlsxResponse(res, buf);
   } catch (e: any) {
     return res.status(500).json({ error: e?.message ?? 'export failed' });
@@ -1342,7 +1448,8 @@ router.get('/contacts/resolve/:name', authMiddleware, async (req, res) => {
     if (!raw) {
       return res.status(400).json({ error: 'name is required' });
     }
-    const { data, error } = await adminDb
+    const db = userDataDbForRequest(req);
+    const { data, error } = await db
       .from('contacts')
       .select('name, address, label')
       .eq('wallet_address', authAddr)
@@ -1367,7 +1474,8 @@ router.get('/contacts/resolve/:name', authMiddleware, async (req, res) => {
 router.get('/contacts', authMiddleware, async (req, res) => {
   try {
     const authAddr = getAddress(normalizeWallet(req));
-    const { data, error } = await adminDb
+    const db = userDataDbForRequest(req);
+    const { data, error } = await db
       .from('contacts')
       .select('*')
       .eq('wallet_address', authAddr)
@@ -1407,7 +1515,8 @@ router.post('/contacts', authMiddleware, async (req, res) => {
       ...(notes ? { notes } : {}),
     };
 
-    const { data, error } = await adminDb.from('contacts').insert(row).select().single();
+    const db = userDataDbForRequest(req);
+    const { data, error } = await db.from('contacts').insert(row).select().single();
     if (error) {
       if (/duplicate|unique/i.test(error.message)) {
         return res.status(409).json({ error: 'A contact with this name already exists' });
@@ -1428,7 +1537,8 @@ router.put('/contacts/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'id is required' });
     }
 
-    const { data: existing, error: exErr } = await adminDb
+    const db = userDataDbForRequest(req);
+    const { data: existing, error: exErr } = await db
       .from('contacts')
       .select('id')
       .eq('id', id)
@@ -1468,7 +1578,7 @@ router.put('/contacts/:id', authMiddleware, async (req, res) => {
     }
     patch.updated_at = new Date().toISOString();
 
-    const { data, error } = await adminDb
+    const { data, error } = await db
       .from('contacts')
       .update(patch)
       .eq('id', id)
@@ -1491,7 +1601,8 @@ router.delete('/contacts/:id', authMiddleware, async (req, res) => {
     if (!id) {
       return res.status(400).json({ error: 'id is required' });
     }
-    const { data: deletedRows, error } = await adminDb
+    const db = userDataDbForRequest(req);
+    const { data: deletedRows, error } = await db
       .from('contacts')
       .delete()
       .eq('id', id)
@@ -1681,6 +1792,10 @@ router.get('/:handle', async (req, res) => {
   try {
     const raw = String(req.params.handle ?? '').trim().toLowerCase().replace(/\.arc$/i, '');
     if (!raw) return res.status(404).json({ error: 'Not found' });
+    if (isAddress(raw)) {
+      const address = getAddress(raw);
+      return res.json({ handle: address, walletAddress: address, business: null });
+    }
     const address = await resolveRegistryName(raw);
     if (!address) return res.status(404).json({ error: 'Not found' });
     return res.json({ handle: `${raw}.arc`, walletAddress: address, business: null });
