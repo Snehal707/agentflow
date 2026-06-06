@@ -1,13 +1,14 @@
 ﻿import * as dotenv from "dotenv";
-import { HardhatUserConfig } from "hardhat/config";
-import "@nomicfoundation/hardhat-toolbox";
+import { defineConfig } from "hardhat/config";
+import hardhatEthers from "@nomicfoundation/hardhat-ethers";
 
 dotenv.config();
 
 const arcRpc = process.env.ARC_RPC?.trim() || "https://rpc.testnet.arc.network";
 const deployerKey = process.env.DEPLOYER_PRIVATE_KEY?.trim();
 
-const config: HardhatUserConfig = {
+const config = defineConfig({
+  plugins: [hardhatEthers],
   solidity: {
     version: "0.8.24",
     settings: { optimizer: { enabled: true, runs: 200 } },
@@ -20,8 +21,9 @@ const config: HardhatUserConfig = {
     scripts: "./hardhat-scripts",
   },
   networks: {
-    hardhat: { chainId: 5042002 },
+    hardhat: { type: "edr-simulated", chainId: 5042002 },
     arcTestnet: {
+      type: "http",
       url: arcRpc,
       chainId: 5042002,
       accounts: deployerKey
@@ -42,6 +44,6 @@ const config: HardhatUserConfig = {
       },
     ],
   },
-};
+});
 
 export default config;

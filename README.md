@@ -22,7 +22,8 @@ AgentFlow is a demo **AI agent economy** on **Arc Testnet**, with **Circle x402*
    ```
 
    This starts the **public API** (default **:4000**), **Hermes** (**:8000**), **facilitator** (see `FACILITATOR_PORT`, often **:3010**), **dedicated agents** (swap, vault, bridge, schedule, split, research, …), and the **Next.js** app on **:3005** when a production build exists (otherwise `next dev` on **:3005**).  
-   **Health checks:** `http://localhost:4000/health`, `http://localhost:3005/api/health`, `http://localhost:8000/health`.
+   **Health checks:** `http://localhost:4000/health`, `http://localhost:3005/api/health`, `http://localhost:8000/health`.  
+   **Windows:** from the repo root, `npm run stack:detach` opens a new PowerShell window that runs `npm run dev:stack` and stays open (handy when an IDE-integrated terminal closes the orchestrator).
 
 5. **Frontend only (hot reload):** `npm run dev:frontend:hot` from root, or `cd agentflow-frontend && npm run dev`.
 
@@ -79,13 +80,16 @@ See [.env.example](.env.example) for the full list. Commonly needed:
 - **Wallet / chain:** `PRIVATE_KEY` or deployer keys as documented in `.env.example`
 - **Registry:** `CLOUDSMITH_TOKEN`
 - **Hermes:** `HERMES_API_KEY`, `HERMES_BASE_URL`, `HERMES_MODEL`
+- **Execution safety:** `MAINNET_KILL_SWITCH=true` blocks money execution paths with 503. `EXECUTION_INFLIGHT_TTL_SEC` controls Redis `money:inflight:*` idempotency lock TTL.
+- **Feature flags:** backend `AGENTFLOW_FEATURE_FUNDS`; frontend `NEXT_PUBLIC_FEATURE_FUNDS`.
+- **Supabase RLS:** backend uses service-role `adminDb` by default. Set `SUPABASE_RLS_USER_CLIENT=true` only after app JWTs are accepted by Supabase PostgREST; see [docs/db-access-security.md](docs/db-access-security.md).
 - **Circle DCW:** `CIRCLE_API_KEY`, `CIRCLE_ENTITY_SECRET`, optional `CIRCLE_WALLET_SET_ID` — `npm run script:setup-circle` can bootstrap some of this
 
 ## Running pieces separately
 
 - **API only (agents external):** `npx cross-env EMBEDDED_AGENT_SERVERS=false tsx server.ts` (or `npm run start:api` for production-style).
 - **Individual agents:** `npm run dev:swap`, `npm run dev:vault`, `npm run dev:bridge`, etc.
-- **Stack cleanup (Windows):** `node scripts/stack-cleanup.js` frees ports before a clean restart.
+- **Stack cleanup (Windows):** `node scripts/stack-cleanup.cjs` frees ports before a clean restart.
 
 Embedded vs standalone facilitator/agent ports are described in comments inside `server.ts` and your `.env`; prefer **`FACILITATOR_PORT=3010`** locally to avoid clashing with other tools on **:3000**.
 
