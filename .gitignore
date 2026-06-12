@@ -66,3 +66,7 @@ foundry/lib/openzeppelin-contracts/
 /.stack-logs-op/
 /.logs/
 /.verify-research-logs/
+
+# stray tsx temp dir (unset TMPDIR) and debug artifacts
+undefined/
+agentflow-frontend/debug-chat.png
