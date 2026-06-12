@@ -10,6 +10,7 @@ import { transcribeAudioForChat, validateAudioPayloadForTranscription } from '..
 import { getOrCreateAgentWallets } from '../../lib/dcw';
 import { recordReputationSafe } from '../../lib/reputation';
 import { incrementDailyUsageCap, readDailyUsageCap } from '../../lib/usageCaps';
+import { TRANSCRIBE_DAILY_LIMIT_DEFAULT } from '../../lib/usageLimits';
 
 dotenv.config();
 
@@ -17,7 +18,7 @@ const app = express();
 app.use(express.json({ limit: process.env.AGENT_JSON_LIMIT?.trim() || '20mb' }));
 
 const port = Number(process.env.TRANSCRIBE_AGENT_PORT || 3017);
-const dailyLimit = Number(process.env.TRANSCRIBE_DAILY_LIMIT || 5);
+const dailyLimit = Number(process.env.TRANSCRIBE_DAILY_LIMIT || TRANSCRIBE_DAILY_LIMIT_DEFAULT);
 
 privateKeyToAccount(resolveAgentPrivateKey());
 

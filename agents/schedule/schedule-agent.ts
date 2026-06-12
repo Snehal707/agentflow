@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getRedis } from '../../db/client';
 import { callHermesFast } from '../../lib/hermes';
+import { extractAgentpayRemark } from '../../lib/agentpay-remark';
 import {
   getScheduledPayments,
   createScheduledPayment,
@@ -106,6 +107,7 @@ export async function parseScheduleTask(
       recipient: extractRecipientFallback(task),
       amount: extractAmountFallback(task),
       schedule: extractScheduleFallback(task),
+      remark: extractAgentpayRemark(task) ?? null,
     };
   }
 }
@@ -430,10 +432,25 @@ export async function handleListIntent(
     return `${i + 1}. ${label}${nextRun}`;
   });
 
+  const choices: ScheduleAgentResponse['choices'] = [];
+  for (const row of rows) {
+    const choiceConfirmId = await storeConfirm({
+      type: 'cancel',
+      walletAddress,
+      id: String(row.id),
+    });
+    choices.push({
+      id: String(row.id),
+      label: `Cancel ${formatPaymentLabel(row)}`,
+      confirmId: choiceConfirmId,
+    });
+  }
+
   return {
     action: 'list',
     message: `Active scheduled payments:\n\n${lines.join('\n')}`,
     payments: rows,
+    choices,
   };
 }
 

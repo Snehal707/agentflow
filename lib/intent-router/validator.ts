@@ -630,11 +630,15 @@ function validateScheduleCreate(slots: ScheduleCreateSlots): ValidatorDecision {
 
 function validateScheduleCancel(slots: ScheduleCancelSlots): ValidatorDecision {
   const hasPaymentId = hasNonEmptyString(slots.payment_id);
-  const hasRecipientFilter = hasRecipient(slots.recipient_filter);
+  const hasRecipientFilter = hasRecipient(slots.recipient_filter) || hasRecipient(slots.recipient);
   const hasAmount = hasPositiveAmount(slots.amount);
   const hasCadence = hasNonEmptyString(slots.schedule?.cadence);
 
-  if (hasPaymentId || (hasRecipientFilter && hasAmount && hasCadence)) {
+  if (
+    hasPaymentId ||
+    hasRecipientFilter ||
+    (hasAmount && hasCadence)
+  ) {
     return passDecision();
   }
 

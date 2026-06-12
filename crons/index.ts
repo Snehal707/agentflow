@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import { runMonthlyDigest } from './monthly-digest';
 import { runTrainingExport } from './training-export';
 import { runYieldMonitor } from './yield-monitor';
-import { generateDailyReport, sendDailyReportsToPlanUsers } from '../lib/daily-report';
+import { generateDailyReport } from '../lib/daily-report';
 import { processDuePayments } from '../lib/scheduled-payments';
 import { runTreasuryTopUp } from '../lib/agent-treasury';
 import { runSemanticMemoryConsolidationJob } from '../lib/semantic-memory-cron';
@@ -80,7 +80,6 @@ cron.schedule(
       'circle_arc',
     ] as const;
     await Promise.allSettled(dailyTopics.map((topic) => generateDailyReport(topic)));
-    await sendDailyReportsToPlanUsers();
     await processDuePayments().catch((e) => console.error('[cron] scheduled-payments', e));
     console.log('[cron] daily reports + scheduled payments done');
   },

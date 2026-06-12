@@ -1,1 +1,1 @@
-export { default } from "../funds/page";
+export { default } from "../funding/page";

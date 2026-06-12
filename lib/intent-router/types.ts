@@ -319,6 +319,7 @@ export interface ScheduleCancelSlots
   extends WalletScopedSlot,
     RecipientFilterSlot,
     PaymentIdSlot {
+  recipient?: RecipientSlot;
   schedule?: ScheduleSlot;
   amount?: AmountSlot;
 }

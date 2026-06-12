@@ -543,6 +543,38 @@ function parseSwapTokenPair(message: string): { token_in?: string; token_out?: s
   return null;
 }
 
+const RESERVED_BARE_RECIPIENT_WORDS = new Set([
+  'agentflow',
+  'amount',
+  'arc',
+  'bill',
+  'bridge',
+  'dollars',
+  'eurc',
+  'for',
+  'from',
+  'funds',
+  'invoice',
+  'me',
+  'money',
+  'pay',
+  'payment',
+  'request',
+  'send',
+  'snd',
+  'to',
+  'transfer',
+  'usd',
+  'usdc',
+]);
+
+function sanitizeBareRecipientHandle(candidate: string | undefined): string | undefined {
+  const normalized = String(candidate ?? '').trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (RESERVED_BARE_RECIPIENT_WORDS.has(normalized)) return undefined;
+  return normalized;
+}
+
 function parseRecipient(message: string): Record<string, unknown> | undefined {
   const address = message.match(/\b0x[a-fA-F0-9]{40}\b/)?.[0];
   if (address) return { address };
@@ -550,9 +582,13 @@ function parseRecipient(message: string): Record<string, unknown> | undefined {
   const handle = message.match(/\b([a-z0-9][a-z0-9-]*\.arc)\b/i)?.[1];
   if (handle) return { handle };
 
-  const namedTarget = message.match(
-    /\b(?:to|from|for|pay|request|ask|invoice|bill)\s+([a-z][a-z0-9_-]{1,31})\b/i,
-  )?.[1];
+  if (/\bhow\s+(?:do\s+i|to|can\s+i|should\s+i)\s+(?:send|pay|transfer|request)\b/i.test(message)) {
+    return undefined;
+  }
+
+  const namedTarget = sanitizeBareRecipientHandle(
+    message.match(/\b(?:to|from|for|pay|request|ask|invoice|bill)\s+([a-z][a-z0-9_-]{1,31})\b/i)?.[1],
+  );
   if (namedTarget) return { handle: namedTarget.toLowerCase() };
 
   return undefined;
@@ -744,7 +780,7 @@ function buildHeuristicIntent(
 }
 
 function hasExplicitNumericAmount(message: string): boolean {
-  return parseFirstAmount(message) !== null;
+  return parseFirstAmount(message) !== undefined;
 }
 
 function stripHallucinatedAmountSlot(intent: AgentFlowIntent): AgentFlowIntent {
@@ -822,6 +858,14 @@ function hasConcreteHeuristicAnchor(intent: AgentFlowIntent): boolean {
     default:
       return false;
   }
+}
+
+function hasHardEvidenceAnchor(message: string): boolean {
+  if (parseEvmAddress(message)) return true;
+  if (/\b[a-z0-9][a-z0-9-]*\.arc\b/i.test(message)) return true;
+  const amount = parseFirstAmount(message);
+  if (amount !== undefined && /\b(?:usdc|eurc)\b/i.test(message)) return true;
+  return false;
 }
 
 function canUseActionHeuristic(intent: AgentFlowIntent | null): intent is AgentFlowIntent {
@@ -1155,7 +1199,8 @@ function reconcileRouterResult(
 
   if (
     intent.intent === AgentFlowIntentName.GeneralChat &&
-    canUseActionHeuristic(heuristic)
+    canUseActionHeuristic(heuristic) &&
+    hasHardEvidenceAnchor(message)
   ) {
     console.warn('[INTENT_ROUTER_HEURISTIC_OVERRIDE]', {
       raw_message: truncateForLog(message),
@@ -1194,10 +1239,8 @@ function classifyIntentHeuristically(
   conversationHistory?: IntentRouterHistoryMessage[],
 ): HeuristicIntentResult {
   const trimmed = message.trim();
-  const lowered = trimmed.toLowerCase();
   const capabilityRouting = analyzeCapabilityAwareRouting(trimmed);
   const explicitResearchRequest = hasExplicitResearchRequest(trimmed);
-  const history = (conversationHistory ?? []).map((entry) => entry.content.toLowerCase()).join(' \n ');
   const amount = parseFirstAmount(trimmed);
   const currency = parseCurrencyHint(trimmed);
   const recipient = parseRecipient(trimmed);
@@ -1291,66 +1334,6 @@ function classifyIntentHeuristically(
       0.42,
       { topic_hint: 'capability_ambiguity' },
     );
-  }
-
-  if (/^(?:yeah go|go ahead|continue|do it|yeah make that)$/i.test(trimmed)) {
-    if (/\bresearch\b|report|look into|dig into|investigate/.test(history)) {
-      const priorUser = conversationHistory
-        ?.filter((entry) => entry.role === 'user')
-        .at(-1)?.content;
-      return buildHeuristicIntent(
-        AgentFlowDomain.Research,
-        AgentFlowIntentName.ResearchReport,
-        message,
-        0.88,
-        priorUser ? { task: priorUser } : {},
-      );
-    }
-    if (/\bbridge\b|base sepolia|arc\b/.test(history)) {
-      const priorUser = conversationHistory
-        ?.filter((entry) => entry.role === 'user')
-        .at(-1)?.content ?? '';
-      const priorAmount = parseFirstAmount(priorUser);
-      const priorCurrency = parseCurrencyHint(priorUser);
-      const priorSource = parseSourceChain(priorUser);
-      return buildHeuristicIntent(
-        AgentFlowDomain.Bridge,
-        AgentFlowIntentName.BridgeExecute,
-        message,
-        0.86,
-        {
-          confirmed: false,
-          ...(priorAmount
-            ? { amount: { value: priorAmount, ...(priorCurrency ? { currency: priorCurrency } : {}) } }
-            : {}),
-          ...(priorSource ? { chain: { source: priorSource, target: 'arc' } } : {}),
-        },
-      );
-    }
-    if (/\bpayment link\b|\bpay link\b|\bqr\b|\bscan\b/.test(history)) {
-      const priorUser = conversationHistory
-        ?.filter((entry) => entry.role === 'user')
-        .at(-1)?.content ?? '';
-      return buildHeuristicIntent(
-        AgentFlowDomain.AgentPay,
-        AgentFlowIntentName.AgentpayPaymentLink,
-        message,
-        0.84,
-        {
-          ...(parseRecipient(priorUser) ? { recipient: parseRecipient(priorUser) } : {}),
-          ...(parseFirstAmount(priorUser)
-            ? {
-                amount: {
-                  value: parseFirstAmount(priorUser),
-                  ...(parseCurrencyHint(priorUser)
-                    ? { currency: parseCurrencyHint(priorUser) }
-                    : {}),
-                },
-              }
-            : {}),
-        },
-      );
-    }
   }
 
   if (looksLikeTranscribeCapabilityQuestion(trimmed)) {
@@ -1481,13 +1464,7 @@ function classifyIntentHeuristically(
     );
   }
 
-  if (/\b(set up|make|do)\b.*\b(payment)\b.*\b(every|weekly|monthly|daily)\b/i.test(trimmed) || (/^(?:set up that payment every|make that payment every|do that every)\b/i.test(lowered) && /\bpayment\b/.test(history))) {
-    const priorUser = conversationHistory
-      ?.filter((entry) => entry.role === 'user')
-      .at(-1)?.content ?? '';
-    const priorRecipient = parseRecipient(priorUser);
-    const priorAmount = parseFirstAmount(priorUser);
-    const priorCurrency = parseCurrencyHint(priorUser);
+  if (/\b(set up|make|do)\b.*\b(payment)\b.*\b(every|weekly|monthly|daily)\b/i.test(trimmed)) {
     const cadence = trimmed.match(/\b(every [a-z]+(?: [a-z]+)?|weekly|monthly|daily|every month|every week)\b/i)?.[1] ?? trimmed;
     return buildHeuristicIntent(
       AgentFlowDomain.Schedule,
@@ -1495,20 +1472,10 @@ function classifyIntentHeuristically(
       message,
       0.84,
       {
-        ...(priorRecipient ? { recipient: priorRecipient } : {}),
-        ...(priorAmount ? { amount: { value: priorAmount, ...(priorCurrency ? { currency: priorCurrency } : {}) } } : {}),
+        ...(recipient ? { recipient } : {}),
+        ...(amount ? { amount: { value: amount, ...(currency ? { currency } : {}) } } : {}),
         schedule: { cadence: cadence.toLowerCase() },
       },
-    );
-  }
-
-  if (/^(?:what about the rest|and the rest)\b/i.test(trimmed) && /\bbalance\b|\bholdings\b|\bportfolio\b/.test(history)) {
-    return buildHeuristicIntent(
-      AgentFlowDomain.Portfolio,
-      AgentFlowIntentName.PortfolioReport,
-      message,
-      0.8,
-      {},
     );
   }
 
@@ -1637,12 +1604,19 @@ function classifyIntentHeuristically(
   }
 
   if (
-    /\b(?:show|list|view|check|pull|get|see|display|tell me|what|which|where)\b[\s\S]{0,80}\b(?:agentpay|payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions|activity|records?)\b/i.test(trimmed) ||
+    !(
+      /\b(?:how|explain|about|format|example|examples)\b/i.test(trimmed) &&
+      /\b(?:split|batch|scheduled?|recurring|payment\s+link|pay\s+link|invoice|request)\b/i.test(trimmed) &&
+      !/\b(?:history|recent|latest|last|previous|earlier|records?|activity|transactions?)\b/i.test(trimmed)
+    ) &&
+    (
+    /\b(?:show|list|view|check|pull|get|see|display)\b[\s\S]{0,80}\b(?:agentpay|payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions|activity|records?)\b/i.test(trimmed) ||
     /\b(?:agentpay|payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions|activity|records?)\b[\s\S]{0,80}\b(?:show|list|view|check|pull|get|see|display|history|records?|activity)\b/i.test(trimmed) ||
     /\b(recent payments|payment history|transfers have i sent|payment activity)\b/i.test(trimmed) ||
     /\bwhat\s+(?:payments|transfers|transactions)\s+have\s+i\s+(?:sent|made|received)\b/i.test(trimmed) ||
     /\b(?:payments|transfers|transactions)\s+(?:i\s+)?(?:sent|made|received)\b/i.test(trimmed) ||
     /\bwhat\s+have\s+i\s+(?:sent|paid|received)\b/i.test(trimmed)
+    )
   ) {
     return buildHeuristicIntent(
       AgentFlowDomain.AgentPay,
@@ -1668,6 +1642,16 @@ function classifyIntentHeuristically(
         ...(amount ? { amount: { value: amount, ...(currency ? { currency } : {}) } } : {}),
         ...(remark ? { remark } : {}),
       },
+    );
+  }
+
+  if (/\bhow\s+(?:do\s+i|to|can\s+i|should\s+i)\s+(?:send|pay|transfer|request)\b/i.test(trimmed)) {
+    return buildHeuristicIntent(
+      AgentFlowDomain.General,
+      AgentFlowIntentName.GeneralChat,
+      message,
+      0.84,
+      { topic_hint: 'agentpay_howto' },
     );
   }
 
@@ -1699,6 +1683,7 @@ function classifyIntentHeuristically(
 
   if (/\b(every|weekly|monthly|daily|friday|monday|tuesday|wednesday|thursday|saturday|sunday)\b/i.test(trimmed) && /\bpay\b|\bsend\b|\bsnd\b/.test(trimmed)) {
     const cadence = trimmed.match(/\b(every [a-z]+|weekly|monthly|daily|every month|every week|every friday morning)\b/i)?.[1] ?? trimmed;
+    const remark = extractAgentpayRemark(trimmed);
     return buildHeuristicIntent(
       AgentFlowDomain.Schedule,
       AgentFlowIntentName.ScheduleCreate,
@@ -1708,17 +1693,22 @@ function classifyIntentHeuristically(
         ...(recipient ? { recipient } : {}),
         ...(amount ? { amount: { value: amount, ...(currency ? { currency } : {}) } } : {}),
         schedule: { cadence: cadence.toLowerCase() },
+        ...(remark ? { remark } : {}),
       },
     );
   }
 
   if (/\b(split|divide)\b/i.test(trimmed)) {
+    const remark = extractAgentpayRemark(trimmed);
     return buildHeuristicIntent(
       AgentFlowDomain.Split,
       AgentFlowIntentName.SplitExecute,
       message,
       0.78,
-      amount ? { total_amount: { value: amount, ...(currency ? { currency } : {}) } } : {},
+      {
+        ...(amount ? { total_amount: { value: amount, ...(currency ? { currency } : {}) } } : {}),
+        ...(remark ? { remark } : {}),
+      },
     );
   }
 
@@ -1755,9 +1745,12 @@ export async function classifyIntent(
       ? (earlyHeuristic.slots as Record<string, unknown>)
       : null;
   const earlyTopicHint = typeof earlySlots?.topic_hint === 'string' ? earlySlots.topic_hint : null;
+  const TRIVIAL_CHAT_FASTPATH_HINTS = new Set(['greeting', 'thanks', 'unclear', 'profile_memory']);
   if (
     earlyHeuristic?.intent === AgentFlowIntentName.PredmarketDetail ||
-    earlyHeuristic?.intent === AgentFlowIntentName.GeneralChat
+    (earlyHeuristic?.intent === AgentFlowIntentName.GeneralChat &&
+      earlyTopicHint !== null &&
+      TRIVIAL_CHAT_FASTPATH_HINTS.has(earlyTopicHint))
   ) {
     const latency_ms = Date.now() - startedAt;
     console.info('[INTENT_ROUTER_FASTPATH]', {

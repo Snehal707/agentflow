@@ -89,6 +89,15 @@ export type LiveChatMessage = {
       label: string;
       prompt: string;
       actionId?: string;
+      routeIntent?:
+        | "Research"
+        | "AgentPay"
+        | "Swap"
+        | "Vault"
+        | "Bridge"
+        | "Portfolio"
+        | "Conversation"
+        | "Vision";
       tone?: "primary" | "secondary";
     }>;
   }>;

@@ -1,6 +1,8 @@
 import { Router, type Request, type Response } from 'express';
 import ExcelJS from 'exceljs';
 import { createPublicClient, decodeFunctionData, defineChain, getAddress, http, isAddress, parseUnits } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { ARC } from '../lib/arc-config';
 import { authMiddleware, type JWTPayload } from '../lib/auth';
 import { adminDb, getRedis } from '../db/client';
@@ -42,6 +44,8 @@ import {
   executionGuardMiddleware,
   type GuardLock,
 } from '../lib/execution-guard';
+import { getFacilitatorBaseUrl } from '../lib/facilitator-url';
+import { resolveAgentPrivateKey } from '../lib/agentPrivateKey';
 import { userDataDbForRequest } from '../lib/user-scoped-db';
 
 const ARC_USDC = '0x3600000000000000000000000000000000000000' as const;
@@ -58,6 +62,14 @@ function normalizeWallet(req: unknown): string {
 const AGENTPAY_SLUG = 'agentpay';
 const AGENTPAY_PENDING_PREFIX = 'agentpay:pending:';
 const SCHEDULE_PENDING_PREFIX = 'scheduled_payment:pending:';
+const facilitatorUrl = getFacilitatorBaseUrl();
+const gatewaySellerAccount = privateKeyToAccount(resolveAgentPrivateKey());
+const gatewaySellerAddress =
+  (process.env.SELLER_ADDRESS?.trim() as `0x${string}` | undefined) || gatewaySellerAccount.address;
+const gateway = createGatewayMiddleware({
+  sellerAddress: gatewaySellerAddress,
+  facilitatorUrl,
+});
 
 type AgentPayPendingPayload = {
   tool: 'agentpay_send';
@@ -1045,6 +1057,7 @@ async function finalizePaymentRequestApproval(params: {
       remark,
       actionType: 'agentpay_request',
       idempotencyKey: `agentpay-request:${requestId}`,
+      existingGuard: guard,
     });
 
     await incrementTxCount('agentpay');

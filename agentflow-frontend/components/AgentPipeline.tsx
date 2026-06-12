@@ -88,9 +88,26 @@ export function AgentPipeline({ steps }: { steps: AgentStep[] }) {
             key={key}
             className="flex flex-1 flex-col transition-all duration-500"
           >
-            <div
-              className={`mb-6 h-[1px] w-full transition-colors duration-500 ${meta.indicatorClass}`}
-            />
+            <div className="relative mb-6 h-1 w-full overflow-hidden rounded-full">
+              <svg className="absolute inset-0 h-full w-full" fill="none">
+                <line x1="0" y1="2" x2="100%" y2="2" stroke="rgba(255, 255, 255, 0.08)" strokeWidth="4" strokeLinecap="round" />
+                {step.status === "complete" && (
+                  <line x1="0" y1="2" x2="100%" y2="2" stroke="#f2ca50" strokeWidth="4" strokeLinecap="round" />
+                )}
+                {step.status === "running" && (
+                  <line
+                    x1="0"
+                    y1="2"
+                    x2="100%"
+                    y2="2"
+                    stroke="#f2ca50"
+                    strokeWidth="4"
+                    strokeLinecap="round"
+                    className="animate-path-flow"
+                  />
+                )}
+              </svg>
+            </div>
 
             <div className="mb-2 flex items-baseline justify-between">
               <span className="font-mono text-[10px] tracking-widest text-gold/42">

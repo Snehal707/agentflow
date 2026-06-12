@@ -46,6 +46,14 @@ function generateShortId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
+function normalizeBatchPreviewError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/command timed out|timed out/i.test(message)) {
+    return 'Batch preview storage timed out before AgentFlow could save the confirmation step. Please try again.';
+  }
+  return message;
+}
+
 export interface BatchAgentResponse {
   action: 'preview' | 'success' | 'error';
   message: string;
@@ -159,12 +167,16 @@ export async function previewBatch(params: {
     shortId,
   };
 
-  await getRedis().set(
-    `${BATCH_PENDING_PREFIX}${confirmId}`,
-    JSON.stringify(payload),
-    'EX',
-    BATCH_TTL_SECONDS,
-  );
+  try {
+    await getRedis().set(
+      `${BATCH_PENDING_PREFIX}${confirmId}`,
+      JSON.stringify(payload),
+      'EX',
+      BATCH_TTL_SECONDS,
+    );
+  } catch (error) {
+    throw new Error(normalizeBatchPreviewError(error));
+  }
 
   // Build preview message
   const lines: string[] = [

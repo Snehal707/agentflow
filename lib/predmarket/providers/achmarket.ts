@@ -340,10 +340,16 @@ export const achmarketProvider: PredictionMarketProvider = {
         hasRefunded: position.hasRefunded,
         stage: stageFromContract(Number(position.stage)),
       }))
-      .filter(
-        (position) =>
-          position.canRefund || position.outcomes.some((outcome) => BigInt(outcome.sharesRaw) > 0n),
-      );
+      .filter((position) => {
+        // Hide settled positions: refund() returns the deposit and redeem() pays
+        // out winnings, but neither burns the outcome shares on-chain, so a
+        // shares>0 check alone keeps already-claimed positions lingering.
+        if (position.hasRefunded || position.hasRedeemed) return false;
+        return (
+          position.canRefund ||
+          position.outcomes.some((outcome) => BigInt(outcome.sharesRaw) > 0n)
+        );
+      });
   },
 
   async previewBuy(
@@ -586,6 +592,19 @@ export const achmarketProvider: PredictionMarketProvider = {
   },
 
   async redeem(params: RedeemParams): Promise<RedeemResult> {
+    // Capture the expected payout before executing: redeem() zeroes the winning
+    // position, so the pro-rata payout (resolvedPool * userWinningShares /
+    // totalWinningShares) must be read pre-tx. Reuse previewRedeem for the math.
+    let payoutReceivedRaw = 0n;
+    try {
+      const preview = await this.previewRedeem(params.marketAddress, params.walletAddress);
+      if (preview.canRedeem) {
+        payoutReceivedRaw = BigInt(preview.expectedPayoutRaw);
+      }
+    } catch (error) {
+      console.warn('[predmarket/achmarket] redeem: failed to read expected payout pre-tx:', error);
+    }
+
     const tx = await executeTransaction({
       walletId: params.walletId,
       contractAddress: getAddress(params.marketAddress),
@@ -606,11 +625,28 @@ export const achmarketProvider: PredictionMarketProvider = {
       provider: this.name,
       txId,
       txHash: receipt.txHash as `0x${string}`,
-      payoutReceivedRaw: 0n,
+      payoutReceivedRaw,
     };
   },
 
   async refund(params: RefundParams): Promise<RefundResult> {
+    // Capture the refundable amount before executing: the AchMarket refund()
+    // returns the caller's full net deposit, so getUserInfo.netDeposited is the
+    // exact amount that will be transferred back. Read it pre-tx because the
+    // position is zeroed out once the refund settles.
+    let refundReceivedRaw = 0n;
+    try {
+      const userInfo = (await publicClient.readContract({
+        address: getAddress(params.marketAddress) as `0x${string}`,
+        abi: MARKET_ABI,
+        functionName: 'getUserInfo',
+        args: [getAddress(params.walletAddress) as `0x${string}`],
+      })) as readonly [bigint[], bigint, boolean, boolean, boolean, boolean];
+      refundReceivedRaw = userInfo[1];
+    } catch (error) {
+      console.warn('[predmarket/achmarket] refund: failed to read net deposit pre-tx:', error);
+    }
+
     const tx = await executeTransaction({
       walletId: params.walletId,
       contractAddress: getAddress(params.marketAddress),
@@ -631,7 +667,7 @@ export const achmarketProvider: PredictionMarketProvider = {
       provider: this.name,
       txId,
       txHash: receipt.txHash as `0x${string}`,
-      refundReceivedRaw: 0n,
+      refundReceivedRaw,
     };
   },
 };

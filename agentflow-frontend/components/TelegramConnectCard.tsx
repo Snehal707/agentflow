@@ -9,6 +9,9 @@ const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000";
 
 const POLL_MS = 3000;
 const POLL_MAX_MS = 5 * 60 * 1000;
+const TELEGRAM_STATUS_PATHS = ["/api/telegram/status", "/api/settings/telegram/status"] as const;
+const TELEGRAM_GENERATE_CODE_PATHS = ["/api/telegram/generate-code", "/api/settings/telegram/generate-code"] as const;
+const TELEGRAM_UNLINK_PATHS = ["/api/telegram/unlink", "/api/settings/telegram/unlink"] as const;
 
 type TelegramStatus = {
   linked: boolean;
@@ -17,6 +20,40 @@ type TelegramStatus = {
   telegramDisplayName?: string;
   botUsername?: string;
 };
+
+async function fetchTelegramJson<T>(
+  paths: readonly string[],
+  init?: RequestInit,
+): Promise<T> {
+  let lastError: Error | null = null;
+
+  for (const path of paths) {
+    try {
+      const res = await fetch(`${BACKEND}${path}`, init);
+      const contentType = res.headers.get("content-type") || "";
+      const raw = await res.text();
+      const isJson = contentType.includes("application/json");
+
+      if (!isJson) {
+        if (res.status === 404) {
+          lastError = new Error(`Route not found for ${path}`);
+          continue;
+        }
+        throw new Error("Telegram API returned HTML instead of JSON.");
+      }
+
+      const json = JSON.parse(raw) as T & { error?: string };
+      if (!res.ok) {
+        throw new Error(json.error || `Telegram API request failed (${res.status})`);
+      }
+      return json;
+    } catch (cause) {
+      lastError = cause instanceof Error ? cause : new Error(String(cause));
+    }
+  }
+
+  throw lastError ?? new Error("Telegram API request failed.");
+}
 
 export function TelegramConnectCard() {
   const { address } = useAccount();
@@ -34,14 +71,10 @@ export function TelegramConnectCard() {
   const fetchStatus = useCallback(async () => {
     const headers = getAuthHeaders();
     if (!headers) return null;
-    const res = await fetch(`${BACKEND}/api/telegram/link-status`, {
+    const json = await fetchTelegramJson<TelegramStatus & { error?: string }>(TELEGRAM_STATUS_PATHS, {
       headers,
       cache: "no-store",
     });
-    const json = (await res.json()) as TelegramStatus & { error?: string };
-    if (!res.ok) {
-      throw new Error(json.error || "status failed");
-    }
     setStatus(json);
     setError(null);
     if (json.botUsername) {
@@ -136,16 +169,15 @@ export function TelegramConnectCard() {
     }
     setLoading(true);
     try {
-      const res = await fetch(`${BACKEND}/api/telegram/generate-code`, {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-      });
-      const json = (await res.json()) as {
+      const json = await fetchTelegramJson<{
         code?: string;
         botUsername?: string;
         error?: string;
-      };
-      if (!res.ok || !json.code) {
+      }>(TELEGRAM_GENERATE_CODE_PATHS, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+      });
+      if (!json.code) {
         throw new Error(json.error || "Could not generate code");
       }
       setCode(json.code);
@@ -167,12 +199,11 @@ export function TelegramConnectCard() {
     if (!headers) return;
     setLoading(true);
     try {
-      const res = await fetch(`${BACKEND}/api/settings/telegram/unlink`, {
+      const json = await fetchTelegramJson<{ success?: boolean; error?: string }>(TELEGRAM_UNLINK_PATHS, {
         method: "POST",
         headers: { ...headers, "Content-Type": "application/json" },
       });
-      const json = (await res.json()) as { success?: boolean; error?: string };
-      if (!res.ok || !json.success) {
+      if (!json.success) {
         throw new Error(json.error || "Unlink failed");
       }
       await fetchStatus();
@@ -234,10 +265,12 @@ export function TelegramConnectCard() {
           ? "Wallet-linked Telegram chat"
           : "Wallet-linked Telegram account";
 
+  const cardEyebrow = status?.linked ? "Linked account" : "Telegram access";
+
   if (!address) {
     return (
-      <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
-        <div className="text-[11px] uppercase tracking-[0.24em] text-white/28">Telegram</div>
+      <div className="rounded-[28px] border border-white/8 bg-[linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.015))] p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+        <div className="text-[10px] uppercase tracking-[0.24em] text-[#f2ca50]/70">{cardEyebrow}</div>
         <p className="mt-2 text-sm text-white/55">
           Connect your wallet first, then sign your AgentFlow session to link Telegram.
         </p>
@@ -254,8 +287,8 @@ export function TelegramConnectCard() {
 
   if (!isAuthenticated) {
     return (
-      <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
-        <div className="text-[11px] uppercase tracking-[0.24em] text-white/28">Telegram</div>
+      <div className="rounded-[28px] border border-white/8 bg-[linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.015))] p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+        <div className="text-[10px] uppercase tracking-[0.24em] text-[#f2ca50]/70">{cardEyebrow}</div>
         <p className="mt-2 text-sm text-white/55">Sign a message to link Telegram.</p>
         <button
           type="button"
@@ -269,24 +302,24 @@ export function TelegramConnectCard() {
   }
 
   return (
-    <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
-      <div className="text-[11px] uppercase tracking-[0.24em] text-white/28">Telegram</div>
+    <div className="rounded-[28px] border border-white/8 bg-[linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.015))] p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+      <div className="text-[10px] uppercase tracking-[0.24em] text-[#f2ca50]/70">{cardEyebrow}</div>
       {error ? <p className="mt-2 text-xs text-rose-300/90">{error}</p> : null}
 
       {status?.linked ? (
-        <div className="mt-3 space-y-3">
-          <div className="rounded-2xl border border-emerald-400/15 bg-emerald-400/5 p-4">
+        <div className="mt-4 space-y-4">
+          <div className="rounded-[24px] border border-[#f2ca50]/22 bg-[radial-gradient(circle_at_top_right,rgba(242,202,80,0.1),transparent_38%),linear-gradient(180deg,rgba(242,202,80,0.1),rgba(242,202,80,0.04))] p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="flex items-center gap-2">
-                  <span className="inline-flex items-center rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.22em] text-emerald-300">
+                  <span className="inline-flex items-center rounded-full border border-[#f2ca50]/24 bg-[#f2ca50]/12 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.22em] text-[#f2ca50]">
                     Linked
                   </span>
                 </div>
-                <div className="mt-3 text-base font-semibold text-white">{linkedPrimaryLabel}</div>
-                <div className="mt-1 text-sm text-white/55">{linkedSecondaryLabel}</div>
+                <div className="mt-4 text-[1.65rem] font-headline font-bold leading-none tracking-[-0.03em] text-white">{linkedPrimaryLabel}</div>
+                <div className="mt-2 text-sm text-white/52">{linkedSecondaryLabel}</div>
               </div>
-              <span className="material-symbols-outlined text-[20px] text-emerald-300">
+              <span className="material-symbols-outlined rounded-full border border-[#f2ca50]/18 bg-[#f2ca50]/10 p-2 text-[18px] text-[#f2ca50]">
                 verified
               </span>
             </div>
@@ -295,7 +328,7 @@ export function TelegramConnectCard() {
             type="button"
             disabled={loading}
             onClick={() => void unlink()}
-            className="w-full rounded-xl border border-white/12 px-4 py-2 text-sm text-white/80 transition hover:bg-white/[0.06]"
+            className="w-full rounded-[18px] border border-white/12 bg-black/20 px-4 py-3 text-sm font-semibold text-white/78 transition hover:border-[#f2ca50]/22 hover:text-[#f2ca50]"
           >
             Unlink
           </button>

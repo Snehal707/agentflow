@@ -45,6 +45,7 @@ import { redisPendingExists } from './chatSessionRedis';
 import telegramLinkCode from './telegram-link-code';
 import { clearPendingAction, executeTool, loadPendingAction } from './tool-executor';
 import { extractAgentpayRemark } from './agentpay-remark';
+import { generateInvoiceNumber } from './invoice-number';
 import { getPreferredAgentpayPaymentLinkHandle } from './agentpay-registry';
 import {
   formatNanopaymentRequestLine,
@@ -1595,7 +1596,7 @@ async function runTelegramInvoicePreviewFromPrompt(input: {
       responseText: 'I read the invoice CSV, but could not prepare an invoice preview.',
     };
   }
-  const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+  const invoiceNumber = generateInvoiceNumber();
   await getRedis().set(`invoice:pending:${input.sessionId}`, JSON.stringify({
     tool: 'create_invoice',
     walletAddress: input.walletAddress,
@@ -2135,7 +2136,7 @@ async function tryRunSharedTelegramIntentRouter(
             toolCalled: null,
           };
         }
-        const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+        const invoiceNumber = generateInvoiceNumber();
         await getRedis().set(`invoice:pending:${sessionId}`, JSON.stringify({
           tool: 'create_invoice',
           walletAddress,

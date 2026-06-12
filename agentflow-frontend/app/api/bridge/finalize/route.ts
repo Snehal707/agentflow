@@ -17,20 +17,23 @@ function getBridgeAgentUrl(): string {
 
 export async function POST(request: Request) {
   const headers = new Headers();
+  const authorization = request.headers.get("authorization");
+  const paymentSignature = request.headers.get("payment-signature");
+  const contentType = request.headers.get("content-type");
+  const requestId = request.headers.get("x-agentflow-request-id");
 
-  request.headers.forEach((value, key) => {
-    const lower = key.toLowerCase();
-    if (
-      lower === "content-type" ||
-      lower === "authorization" ||
-      lower === "x-payment" ||
-      lower === "x-payment-response" ||
-      lower === "payment" ||
-      lower.startsWith("x-")
-    ) {
-      headers.set(key, value);
-    }
-  });
+  if (authorization) {
+    headers.set("authorization", authorization);
+  }
+  if (paymentSignature) {
+    headers.set("payment-signature", paymentSignature);
+  }
+  if (contentType) {
+    headers.set("content-type", contentType);
+  }
+  if (requestId) {
+    headers.set("x-agentflow-request-id", requestId);
+  }
 
   const upstream = await fetch(`${getBridgeAgentUrl()}/bridge/finalize`, {
     method: "POST",
@@ -40,16 +43,16 @@ export async function POST(request: Request) {
   });
 
   const responseHeaders = new Headers();
-  const contentType = upstream.headers.get("content-type");
+  const upstreamContentType = upstream.headers.get("content-type");
   const paymentRequired = upstream.headers.get("PAYMENT-REQUIRED");
   const paymentResponse = upstream.headers.get("PAYMENT-RESPONSE");
 
-  if (contentType) responseHeaders.set("Content-Type", contentType);
+  if (upstreamContentType) responseHeaders.set("Content-Type", upstreamContentType);
   if (paymentRequired) responseHeaders.set("PAYMENT-REQUIRED", paymentRequired);
   if (paymentResponse) responseHeaders.set("PAYMENT-RESPONSE", paymentResponse);
   responseHeaders.set("Cache-Control", "no-store");
 
-  return new NextResponse(await upstream.arrayBuffer(), {
+  return new NextResponse(upstream.body, {
     status: upstream.status,
     headers: responseHeaders,
   });

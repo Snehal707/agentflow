@@ -11,6 +11,7 @@ import { analyzeAttachmentForChat } from '../../lib/mediaAgentUtils';
 import { getOrCreateAgentWallets } from '../../lib/dcw';
 import { recordReputationSafe } from '../../lib/reputation';
 import { incrementDailyUsageCap, readDailyUsageCap } from '../../lib/usageCaps';
+import { VISION_DAILY_LIMIT_DEFAULT } from '../../lib/usageLimits';
 import { resolveAgentRunUrl, runResearchFollowupAfterRichContent } from '../../lib/a2a-followups';
 import { getFacilitatorBaseUrl } from '../../lib/facilitator-url';
 
@@ -22,7 +23,7 @@ app.use(express.json({ limit: process.env.AGENT_JSON_LIMIT?.trim() || '20mb' }))
 const port = Number(process.env.VISION_AGENT_PORT || 3016);
 const facilitatorUrl = getFacilitatorBaseUrl();
 const price = process.env.VISION_AGENT_PRICE ? `$${process.env.VISION_AGENT_PRICE}` : '$0.004';
-const dailyLimit = Number(process.env.VISION_DAILY_LIMIT || 5);
+const dailyLimit = Number(process.env.VISION_DAILY_LIMIT || VISION_DAILY_LIMIT_DEFAULT);
 const researchPort = Number(process.env.RESEARCH_AGENT_PORT || 3001);
 const researchRunUrl = resolveAgentRunUrl(
   process.env.RESEARCH_AGENT_URL?.trim(),

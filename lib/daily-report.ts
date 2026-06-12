@@ -1,8 +1,5 @@
-import { adminDb } from '../db/client';
 import { callHermesFast } from './hermes';
-import { getFundPlansTableName } from './fund-plans';
 import { fetchLiveData } from './live-data';
-import { sendTelegramText } from './telegram-notify';
 
 type DailyTopic = {
   key:
@@ -181,59 +178,4 @@ export async function generateDailyReport(topicKey = 'defi_daily'): Promise<stri
 
   generatedReports.set(topic.key, reportEnvelope.body);
   return reportEnvelope.body;
-}
-
-export async function sendDailyReportsToPlanUsers(): Promise<void> {
-  const defaultTopic = getTopicOrDefault('defi_daily');
-  const defaultReport =
-    generatedReports.get(defaultTopic.key) ?? (await generateDailyReport(defaultTopic.key));
-  if (!defaultReport) {
-    console.warn('[daily-report] no default report text generated; skipping send.');
-    return;
-  }
-  const message = `${formatHeader(defaultTopic.label)}\n\n${defaultReport}`.slice(0, 3900);
-
-  const fundPlansTable = await getFundPlansTableName();
-  const { data: rows, error } = await adminDb
-    .from(fundPlansTable)
-    .select('user_wallet, funds!inner(strategy_type)')
-    .eq('status', 'active')
-    .eq('funds.strategy_type', 'research_monitor');
-
-  if (error) {
-    throw new Error(`[daily-report] fund plan query failed: ${error.message}`);
-  }
-
-  const wallets = [...new Set((rows ?? []).map((row) => String(row.user_wallet ?? '').trim()).filter(Boolean))];
-  if (wallets.length === 0) {
-    console.log('[daily-report] no active research_monitor plan users.');
-    return;
-  }
-
-  const { data: users, error: usersError } = await adminDb
-    .from('users')
-    .select('wallet_address, telegram_id')
-    .in('wallet_address', wallets);
-
-  if (usersError) {
-    throw new Error(`[daily-report] users lookup failed: ${usersError.message}`);
-  }
-
-  const chatIds = new Set<string>();
-  for (const user of users ?? []) {
-    const chatId = String(user.telegram_id ?? '').trim();
-    if (chatId) {
-      chatIds.add(chatId);
-    }
-  }
-
-  for (const chatId of chatIds) {
-    try {
-      await sendTelegramText(chatId, message);
-    } catch (error) {
-      console.warn(`[daily-report] telegram send failed (${chatId}):`, error);
-    }
-  }
-
-  console.log(`[daily-report] sent default report to ${chatIds.size} plan users.`);
 }

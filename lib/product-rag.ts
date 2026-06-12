@@ -108,17 +108,33 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
     keywords: ['agentpay', 'payment', 'payments', 'send', 'request', 'invoice', 'split', 'batch', 'schedule', 'link', 'qr'],
   },
   {
+    id: 'payment-requests',
+    title: 'Payment requests',
+    summary:
+      'AgentPay can request USDC from a person, .arc handle, or wallet address without moving funds immediately.',
+    facts: [
+      'Say "request 10 USDC from alice.arc" to create a payment request.',
+      'Payment requests notify the payer and let them approve or decline later.',
+      'Payment requests do not move funds immediately and do not need YES confirmation.',
+      'If you want a shareable request flow, ask for a payment link or QR code instead.',
+      'Payment requests can include a remark or note for context.',
+    ],
+    keywords: ['payment request', 'payment requests', 'request money', 'request usdc', 'collect money', 'bill', 'ask to pay'],
+  },
+  {
     id: 'schedule-payments',
     title: 'Scheduled payments',
     summary: 'AgentFlow can create recurring USDC payments on a schedule.',
     facts: [
       'Schedule daily, weekly, or monthly USDC payments to any .arc handle or address.',
+      'You can create a scheduled payment directly from chat; CSV is optional on web, not required.',
       'Say "pay jack.arc 10 USDC every monday" to create a schedule.',
+      'Example schedule payment chat command: "pay jack.arc 10 USDC every friday" or "send 25 USDC to alice.arc every month".',
       'Say "show my scheduled payments" to see active schedules.',
       'Say "cancel my weekly payment to jack.arc" to cancel.',
       'Scheduled payments run automatically from your execution wallet when the cron worker processes due payments.',
       'Due scheduled payments are processed by the cron worker at 09:00 UTC daily; schedules are date-based, not exact user-selected hour based.',
-      'Schedule CSV uploads are supported on web for a single schedule row with columns such as recipient, amount, currency, frequency, day, remark.',
+      'Schedule CSV uploads are also supported on web for a single schedule row with columns such as recipient, amount, currency, frequency, day, remark.',
       'Example schedule CSV: recipient,amount,currency,frequency,day,remark then jack.arc,10,USDC,weekly,Monday,cleaning.',
       'Schedule CSV may include schedule_name as an optional first column; it is not BatchPay CSV.',
     ],
@@ -131,25 +147,29 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
     facts: [
       'Split payments across 2 to 10 recipients.',
       'Say "split 30 USDC between alice.arc and bob.arc" to split equally.',
-      'For split CSV uploads, provide one total amount to divide, e.g. first line "split,30,dinner", then a recipient header and recipient rows.',
-      'Do not put per-recipient amounts in split CSV; use BatchPay when each row has its own amount.',
-      'Telegram and web both recognize split CSV files named like split_payment_30_dinner.csv or starting with split,30,dinner.',
+      'You can run a split directly from chat; CSV is optional when you prefer uploading a recipient list.',
+      'Example chat command: "split 90 USDC between alice.arc, bob.arc, and charlie.arc".',
       'Each recipient gets an equal share by default.',
       'Split payments preview first and require YES confirmation.',
+      'For split CSV uploads, provide one total amount to divide, e.g. first line "split,30,dinner", then a recipient header and recipient rows.',
+      'Do not put per-recipient amounts in split CSV; use BatchPay when each row has its own amount.',
+      'Telegram and web detect Split CSV when the filename contains "split" or the first row starts with "split,...". The total amount and optional remark come from the first row, not from the filename.',
     ],
     keywords: ['split', 'divide', 'share', 'recipients', 'equally', 'between'],
   },
   {
     id: 'batch-payments',
     title: 'Batch payments',
-    summary: 'AgentFlow supports bulk USDC payouts from CSV for payroll and DAO payments.',
+    summary: 'AgentFlow supports bulk USDC payouts to multiple recipients in one run.',
     facts: [
-      'Upload a CSV with recipient addresses and amounts for bulk payments.',
+      'You can start a batch directly from chat by naming multiple recipients and amounts in one message.',
+      'Example chat command: "batch pay alice.arc 10, bob.arc 20, and charlie.arc 30".',
+      'CSV upload is optional on web when you already have a payroll or payout sheet.',
       'BatchPay CSV format is recipient,amount,remark with one payment amount per recipient row.',
       'Do not use BatchPay CSV for schedule creation or equal split totals; use Schedule CSV or Split CSV for those workflows.',
       'Supports up to 500 recipients in one batch.',
       'Used for DAO payroll, team salaries, and contractor payouts.',
-      'Say "batch pay" or upload a CSV file to start.',
+      'Say "batch pay alice.arc 10 and bob.arc 20" to start from chat, or upload a CSV file.',
       'Batch payments preview total and recipient count before execution.',
     ],
     keywords: ['batch', 'bulk', 'payroll', 'csv', 'dao', 'salary', 'contractors', 'mass payment'],
@@ -241,9 +261,24 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
       'The AgentFlow execution wallet / DCW is the default wallet for in-chat execution.',
       'Gateway reserve is USDC liquidity used for x402 and agent-to-agent payments.',
       'Portfolio is for live holdings, vault shares, recent activity, and wallet-level PnL context.',
-      'Funding moves Arc USDC between the execution wallet and Gateway reserve.',
+      'The Funding page moves USDC directly between your connected wallet (EOA) and your execution wallet (DCW) on Arc.',
     ],
     keywords: ['portfolio', 'funds', 'balance', 'balances', 'gateway', 'reserve', 'wallet', 'dcw', 'execution wallet', 'pnl'],
+  },
+  {
+    id: 'funding',
+    title: 'Funding (deposit and withdraw)',
+    summary:
+      'The Funding page moves USDC directly between your connected wallet (EOA) and your AgentFlow execution wallet (DCW) on Arc, and links the testnet faucet.',
+    facts: [
+      'Deposit sends USDC from your connected wallet (EOA) straight to your execution wallet (DCW) as a normal Arc USDC transfer.',
+      'Withdraw sends USDC from your execution wallet (DCW) back to your connected wallet (EOA).',
+      'Both wallets must be on Arc; the page prompts you to switch your wallet to Arc Testnet if needed.',
+      'Use the Circle testnet faucet to get Arc test USDC into your EOA, then deposit it to the DCW.',
+      'Funding moves your own USDC between EOA and DCW; it is separate from Bridge, which brings USDC in from another source chain.',
+      'The Funding page no longer routes through the Gateway reserve; deposits and withdrawals are direct EOA-to-DCW transfers.',
+    ],
+    keywords: ['funding', 'fund', 'deposit', 'withdraw', 'eoa', 'dcw', 'execution wallet', 'faucet', 'top up', 'move usdc', 'add funds'],
   },
   {
     id: 'gateway-dcw',
@@ -253,10 +288,12 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
       'Connected wallet (EOA): your browser wallet used for login/session signing and Bridge to Arc source-chain signing.',
       'Gateway reserve: USDC staging area for funding agent execution.',
       'Execution wallet (DCW): the wallet agents use to execute swaps, payments, and trades.',
-      'Move USDC from Gateway to execution wallet to fund onchain actions.',
+      'Fund the execution wallet (DCW) by depositing USDC from your connected wallet (EOA) on the Funding page; the Gateway reserve is used for x402 and agent-to-agent payments, not for the EOA-to-DCW funding flow.',
       'Your connected wallet is not the default automated execution wallet; chat execution normally uses the DCW.',
+      'Gateway auto top-up: when you run a paid agent and your Gateway reserve is too low to cover the x402 payment, AgentFlow automatically moves USDC from your execution wallet (DCW) into the Gateway to cover it.',
+      'The Gateway auto top-up refills to a small target balance (about 10 USDC by default, configurable) so you do not have to fund the Gateway manually before each paid action.',
     ],
-    keywords: ['gateway', 'dcw', 'execution wallet', 'connected wallet', 'eoa', 'fund', 'funding', 'reserve'],
+    keywords: ['gateway', 'dcw', 'execution wallet', 'connected wallet', 'eoa', 'fund', 'funding', 'reserve', 'auto top-up', 'auto topup', 'top up', 'refill'],
   },
   {
     id: 'getting-started',
@@ -264,7 +301,7 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
     summary: 'How to start using AgentFlow.',
     facts: [
       'Connect your wallet to sign in.',
-      'Fund your execution wallet by bridging USDC from a supported source chain to Arc.',
+      'Fund your execution wallet (DCW) on the Funding page by depositing USDC directly from your connected wallet (EOA), grabbing Arc test USDC from the Circle faucet, or bridging USDC in from another source chain.',
       'Start chatting -- just type what you want to do.',
       'AgentFlow is available at agentflow.one on web and via Telegram.',
       'No subscriptions -- you pay per task in USDC.',
@@ -334,6 +371,35 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
     keywords: ['agentflow', 'about', 'built', 'founder', 'snehal', 'hermes', 'agents', 'os', 'operating system'],
   },
   {
+    id: 'hermes',
+    title: 'Hermes Agent (the AI runtime)',
+    summary:
+      'Hermes Agent is the AI reasoning runtime that powers AgentFlow — it understands your message, plans the action, and writes the reply.',
+    facts: [
+      'Hermes Agent is the AI brain behind AgentFlow; every core agent (swap, research, portfolio, and the rest) runs its reasoning through Hermes.',
+      'Hermes reads your message together with your saved context and the product knowledge base, decides what to do, and generates the response.',
+      'Hermes uses a fast mode for quick chat replies and a deeper mode for harder reasoning such as research and analysis.',
+      'Hermes handles the natural-language understanding and planning; the actual onchain actions still execute through your execution wallet (DCW), with explicit confirmation for anything that moves funds.',
+    ],
+    keywords: ['hermes', 'hermes agent', 'ai', 'model', 'reasoning', 'runtime', 'brain', 'llm', 'nous', 'which ai'],
+  },
+  {
+    id: 'multilingual',
+    title: 'Languages and multilingual support',
+    summary:
+      'You can chat with AgentFlow and run actions in your own language. Conversational replies and research reports come back in your language; transaction receipts and the app interface are currently English.',
+    facts: [
+      'You can type requests in your own language — for example "1 USDC को EURC में स्वैप करें" — and AgentFlow understands and executes the action (swap, pay, bridge, research, and more).',
+      'Conversational chat replies are written in the same language you wrote in.',
+      'Research reports are translated into the language you asked in.',
+      'Deterministic transaction receipts and action confirmations — for example swap quote and swap receipt cards — currently display in English.',
+      'The app interface (buttons, page labels, and card headers such as "SETTLED ON ARC") is currently English only.',
+      'Language coverage is reliable for widely-spoken languages and best-effort beyond them. The underlying Hermes model officially supports 8 languages: English, German, French, Italian, Portuguese, Hindi, Spanish, and Thai.',
+      'To confirm a previewed money-moving action, reply with the literal word YES even when the rest of the conversation is in another language.',
+    ],
+    keywords: ['language', 'languages', 'multilingual', 'translation', 'translate', 'hindi', 'spanish', 'french', 'german', 'thai', 'portuguese', 'italian', 'native language', 'local language', 'i18n', 'localization', 'how many languages'],
+  },
+  {
     id: 'research',
     title: 'Research',
     summary:
@@ -343,7 +409,7 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
       'Research usually takes 1-2 minutes and uses live retrieval with source checks.',
       'External research uses live retrieval, source checks, and dated evidence before writing the final report.',
       'For private AgentFlow data such as portfolio, invoices, contacts, and payments, AgentFlow should use internal context first.',
-      'Research reports do not use a fake YES confirmation unless the backend created a real pending confirmation.',
+      'Research answers are informational by default and do not ask you to confirm anything unless you later start a real action.',
     ],
     keywords: ['research', 'report', 'analysis', 'analyst', 'writer', 'sources', 'portfolio impact'],
   },
@@ -382,7 +448,7 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
       'Connect the same wallet on the web app first so AgentFlow can carry your profile into Telegram.',
       'Then open AgentFlow in Telegram and continue using the same linked account.',
       'Swaps, research, and AgentPay features work in Telegram.',
-      'Telegram supports BatchPay CSV and Split CSV uploads. Split CSV is detected by a split filename or a first row like split,30,dinner.',
+      'Telegram supports BatchPay CSV and Split CSV uploads. Split CSV is detected when the filename contains "split" or the first row starts like split,30,dinner. The amount and optional remark are read from the first row.',
       'Telegram payment confirmations preserve the original recipient, amount, and remark when formatting receipts.',
       'If Telegram is linked, AgentFlow can notify you there when longer research finishes.',
     ],
@@ -422,9 +488,27 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
       'Core system agents include Research, Swap, Vault, Prediction Markets, Bridge, Portfolio, Invoice, Vision, Voice Input, Schedule, Split, and Batch.',
       'The Agent Store merges built-in system agents with active or pending published agents.',
       'Each agent can show availability, category, USDC price, reputation score, owner wallet, token id, and agent card metadata.',
+      'Every agent has its own on-chain identity on Arc: a dedicated agent wallet address and a unique ERC-8004 agent ID (token id), shown on its agent card.',
+      'The agent wallet address is where that agent receives x402 payments; the ERC-8004 agent ID is what its on-chain reputation and ratings are recorded against.',
       'Voice Input appears as a free perception agent with guarded daily caps.',
     ],
-    keywords: ['agent store', 'store', 'agents', 'published agents', 'reputation', 'agent card', 'leaderboard'],
+    keywords: ['agent store', 'store', 'agents', 'published agents', 'reputation', 'agent card', 'leaderboard', 'agent address', 'agent wallet', 'agent id', 'token id', 'erc-8004 id'],
+  },
+  {
+    id: 'reputation',
+    title: 'Reputation and ratings (ERC-8004)',
+    summary:
+      'AgentFlow records agent reputation on-chain through the ERC-8004 Reputation Registry on Arc, built from real buyer ratings of paid tasks.',
+    facts: [
+      'After a paid task, you can rate the agent from 1 to 5 stars; each star maps to a score out of 100 (5 stars = 100).',
+      'Ratings are written on-chain as ERC-8004 feedback, so every rating is a verifiable on-chain trace, not just a database row.',
+      'Each paid task can be rated once, and a rating is tied to the real settlement of that task — you can only rate paid work that belongs to your wallet.',
+      'Ratings are web-chat only for now; internal research pipeline sub-agents (analyst and writer) are not separately user-rated.',
+      'An agent only accepts ratings once it is ERC-8004 registered (it has an on-chain agent id).',
+      'The reputation score shown in the Agent Store is the true on-chain ERC-8004 aggregate of all buyer feedback for that agent; agents with no on-chain feedback show 0.',
+      'Reputation is buyer-and-seller verifiable: every paid run, agent-to-agent payment, and rating settles in USDC and leaves an on-chain trace.',
+    ],
+    keywords: ['reputation', 'rating', 'ratings', 'rate', 'stars', 'erc-8004', 'erc8004', '8004', 'feedback', 'score', 'trust', 'review', 'reputation registry'],
   },
   {
     id: 'wallet-roles',
@@ -461,7 +545,7 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
       'A maximum transaction size limit can be configured with PAY_PER_TASK_MAX_TX_USDC.',
       'Vision defaults to 5 attachment analyses per wallet per day unless VISION_DAILY_LIMIT is changed.',
       'Voice input defaults to 5 transcriptions per wallet per day unless TRANSCRIBE_DAILY_LIMIT is changed.',
-      'Never-limited safety actions include withdraw, gateway withdraw, gateway-to-execution, emergency withdraw, vault withdraw, cancel DCA, and emergency stop.',
+      'Never-limited safety actions include withdraw, gateway withdraw, gateway-to-execution, emergency withdraw, vault withdraw, and emergency stop.',
     ],
     keywords: ['limit', 'limits', 'cap', 'caps', 'daily limit', 'rate limit', 'quota', 'too many', '429'],
   },
@@ -534,12 +618,26 @@ function scoreDoc(doc: ProductKnowledgeDoc, query: string): number {
   if (/portfolio|fund|balance|gateway|wallet/.test(normalizedQuery) && doc.id === 'portfolio-funds') {
     score += 12;
   }
-  if (/schedule|recurr|weekly|monthly|daily|frequency|cadence/.test(normalizedQuery) && doc.id === 'schedule-payments') score += 14;
+  if (/deposit|withdraw|top up|add funds|move usdc|faucet|fund (?:my |the )?(?:dcw|execution|wallet)/.test(normalizedQuery) && doc.id === 'funding') {
+    score += 16;
+  }
+  if (/hermes|which ai|what ai|ai model|reasoning|\bllm\b|ai brain|nous/.test(normalizedQuery) && doc.id === 'hermes') {
+    score += 16;
+  }
+  if (/language|languages|multiling|translat|hindi|spanish|french|german|thai|portuguese|italian|my own language|local language|how many languages/.test(normalizedQuery) && doc.id === 'multilingual') {
+    score += 16;
+  }
+  if (/auto top.?up|auto.?topup|gateway.*(refill|top.?up)|(refill|top.?up).*gateway/.test(normalizedQuery) && doc.id === 'gateway-dcw') {
+    score += 14;
+  }
+  if (/schedule|recurr|weekly|monthly|daily|frequency|cadence|schedulepayments?/.test(normalizedQuery) && doc.id === 'schedule-payments') score += 14;
   if (/schedule.*csv|csv.*schedule|scheduled.*csv/.test(normalizedQuery) && doc.id === 'schedule-payments') score += 18;
-  if (/split|divide|between|equally/.test(normalizedQuery) && doc.id === 'split-payments') score += 14;
+  if (/split|divide|between|equally|splitpayments?/.test(normalizedQuery) && doc.id === 'split-payments') score += 14;
   if (/split.*csv|csv.*split/.test(normalizedQuery) && doc.id === 'split-payments') score += 18;
-  if (/batch|bulk|payroll/.test(normalizedQuery) && doc.id === 'batch-payments') score += 14;
+  if (/batch|bulk|payroll|batchpayments?/.test(normalizedQuery) && doc.id === 'batch-payments') score += 14;
   if (/\bcsv\b/.test(normalizedQuery) && !/schedule|scheduled|split/.test(normalizedQuery) && doc.id === 'batch-payments') score += 14;
+  if (/payment request|payment requests|request money|request usdc|collect money|\bbill\b|ask .* to pay/.test(normalizedQuery) && doc.id === 'payment-requests') score += 18;
+  if (/\brequest\b/.test(normalizedQuery) && doc.id === 'payment-requests') score += 10;
   if (/invoice|bill|receipt/.test(normalizedQuery) && doc.id === 'invoices') score += 14;
   if (/contact|address book|alias|save .* as/.test(normalizedQuery) && doc.id === 'contacts') score += 14;
   if (/\.arc|arc handle|handle|username/.test(normalizedQuery) && doc.id === 'arc-handles') score += 14;
@@ -555,8 +653,9 @@ function scoreDoc(doc: ProductKnowledgeDoc, query: string): number {
   if (/telegram|bot|notification/.test(normalizedQuery) && doc.id === 'telegram') score += 14;
   if (/source chain|supported chain|bridge chain|cctp|codex|ink|fuji|amoy/.test(normalizedQuery) && doc.id === 'bridge-source-chains') score += 16;
   if (/payment link|pay link|qr|receive|scan/.test(normalizedQuery) && doc.id === 'payment-links-qr') score += 16;
-  if (/agent store|leaderboard|published agent|reputation|agent card/.test(normalizedQuery) && doc.id === 'agent-store') score += 16;
-  if (/wallet mode|eoa|dcw|execution wallet|gateway/.test(normalizedQuery) && doc.id === 'wallet-modes') score += 14;
+  if (/agent store|leaderboard|published agent|agent card/.test(normalizedQuery) && doc.id === 'agent-store') score += 16;
+  if (/reputation|rating|ratings|\brate\b|stars|erc.?8004|\b8004\b|feedback|review|trust score/.test(normalizedQuery) && doc.id === 'reputation') score += 18;
+  if (/wallet mode|wallet role|eoa|dcw|execution wallet|gateway/.test(normalizedQuery) && doc.id === 'wallet-roles') score += 14;
   if (/confirm|confirmation|yes|preview|security|cancel/.test(normalizedQuery) && doc.id === 'security-confirmations') score += 14;
   if (/limit|cap|quota|rate limit|too many|429/.test(normalizedQuery) && doc.id === 'limits-and-caps') score += 16;
   if (/troubleshoot|error|not working|404|lunex|didn.t catch|gas/.test(normalizedQuery) && doc.id === 'troubleshooting') score += 16;
@@ -579,6 +678,78 @@ export function retrieveProductKnowledge(
 
 function isCapabilityQuestion(query: string): boolean {
   return /\b(?:what\s+can\s+(?:you|agentflow)\s+do|what\s+do\s+you\s+do|help\s+with|capabilit)/i.test(query);
+}
+
+const GENERIC_PRODUCT_DOC_IDS = new Set(['agentpay', 'capabilities', 'about', 'getting-started']);
+
+const SPECIFIC_DOC_PRIORITY: Array<{ id: string; pattern: RegExp }> = [
+  { id: 'schedule-payments', pattern: /\b(?:schedule|scheduled|recurring|weekly|monthly|daily|cadence|schedulepayments?)\b/ },
+  { id: 'batch-payments', pattern: /\b(?:batch|bulk|payroll|batchpayments?)\b/ },
+  { id: 'split-payments', pattern: /\b(?:split|divide|splitpayments?)\b/ },
+  { id: 'payment-links-qr', pattern: /\b(?:payment link|pay link|qr|scan to pay)\b/ },
+  { id: 'payment-requests', pattern: /\b(?:payment request|payment requests|request money|request usdc|collect money|\bbill\b|ask\b.+\bpay)\b/ },
+  { id: 'invoices', pattern: /\b(?:invoice|invoices|billing)\b/ },
+  { id: 'contacts', pattern: /\bcontacts?\b/ },
+  { id: 'arc-handles', pattern: /\b(?:\.arc|arc handle|arc handles|handle|handles)\b/ },
+  { id: 'telegram', pattern: /\btelegram\b/ },
+  { id: 'voice-to-text', pattern: /\b(?:voice|mic|microphone|dictat|transcrib|speech)\b/ },
+  { id: 'semantic-memory', pattern: /\b(?:remember|memory|preferences|past chats|history)\b/ },
+  { id: 'prediction-markets', pattern: /\b(?:prediction|market|markets|bet|betting)\b/ },
+  { id: 'research', pattern: /\bresearch\b/ },
+];
+
+function choosePrimaryDoc(
+  query: string,
+  rankedDocs: Array<ProductKnowledgeDoc & { score: number }>,
+): (ProductKnowledgeDoc & { score: number }) | null {
+  if (!rankedDocs.length) return null;
+  const normalizedQuery = normalize(query);
+  for (const candidate of SPECIFIC_DOC_PRIORITY) {
+    if (!candidate.pattern.test(normalizedQuery)) continue;
+    const match = rankedDocs.find((doc) => doc.id === candidate.id);
+    if (match) return match;
+  }
+  return rankedDocs[0] ?? null;
+}
+
+function selectSupportingDocs(
+  rankedDocs: Array<ProductKnowledgeDoc & { score: number }>,
+  primaryDoc: ProductKnowledgeDoc & { score: number },
+): Array<ProductKnowledgeDoc & { score: number }> {
+  const strictSingleDoc = new Set([
+    'schedule-payments',
+    'split-payments',
+    'batch-payments',
+    'payment-requests',
+    'payment-links-qr',
+    'invoices',
+    'telegram',
+    'voice-to-text',
+    'semantic-memory',
+    'prediction-markets',
+    'research',
+  ]);
+  if (strictSingleDoc.has(primaryDoc.id)) {
+    return [primaryDoc];
+  }
+
+  const relatedDocAllowlist: Partial<Record<string, string[]>> = {
+    contacts: ['contacts', 'arc-handles'],
+    'arc-handles': ['arc-handles', 'contacts'],
+  };
+  const allowed = relatedDocAllowlist[primaryDoc.id];
+  if (allowed?.length) {
+    return rankedDocs.filter((doc) => allowed.includes(doc.id));
+  }
+
+  const nearPrimary = rankedDocs.filter(
+    (doc) => doc.id === primaryDoc.id || doc.score >= primaryDoc.score - 8,
+  );
+  if (GENERIC_PRODUCT_DOC_IDS.has(primaryDoc.id)) {
+    return nearPrimary;
+  }
+  const specificOnly = nearPrimary.filter((doc) => !GENERIC_PRODUCT_DOC_IDS.has(doc.id));
+  return specificOnly.length ? specificOnly : [primaryDoc];
 }
 
 function selectFacts(query: string, docs: ProductKnowledgeDoc[]): string[] {
@@ -611,14 +782,16 @@ export function answerProductQuestion(query: string): ProductRagAnswer | null {
   const rankedDocs = retrieveProductKnowledge(query, { limit: isCapabilityQuestion(query) ? 1 : 3 });
   if (!rankedDocs.length) return null;
 
-  const topScore = rankedDocs[0]?.score ?? 0;
-  const docs = rankedDocs.filter((doc, index) => index === 0 || doc.score >= topScore - 8);
+  const primaryDoc = choosePrimaryDoc(query, rankedDocs);
+  if (!primaryDoc) return null;
+
+  const docs = selectSupportingDocs(rankedDocs, primaryDoc);
   if (!docs.length) return null;
 
   const facts = selectFacts(query, docs);
   if (!facts.length) return null;
 
-  const confidence = Math.max(0, Math.min(1, topScore / 28));
+  const confidence = Math.max(0, Math.min(1, primaryDoc.score / 28));
   const sources = docs.map((doc) => `Product KB: ${doc.title}`);
 
   if (isCapabilityQuestion(query)) {
@@ -630,10 +803,9 @@ export function answerProductQuestion(query: string): ProductRagAnswer | null {
     };
   }
 
-  const top = docs[0];
   return {
     answer: [
-      top.summary,
+      primaryDoc.summary,
       '',
       ...facts.map((fact) => `- ${fact}`),
     ].join('\n'),

@@ -1,4 +1,8 @@
 import { getRedis } from '../db/client';
+import {
+  PAY_PER_TASK_DAILY_LIMIT_DEFAULT,
+  PAY_PER_TASK_MINUTE_LIMIT_DEFAULT,
+} from './usageLimits';
 
 function readPositiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name]?.trim();
@@ -19,11 +23,11 @@ function readPositiveNullableNumberEnv(name: string): number | null {
 }
 
 export function getDailyLimit(): number {
-  return readPositiveIntEnv('PAY_PER_TASK_DAILY_LIMIT', 200);
+  return readPositiveIntEnv('PAY_PER_TASK_DAILY_LIMIT', PAY_PER_TASK_DAILY_LIMIT_DEFAULT);
 }
 
 export function getMinuteLimit(): number {
-  return readPositiveIntEnv('PAY_PER_TASK_MINUTE_LIMIT', 10);
+  return readPositiveIntEnv('PAY_PER_TASK_MINUTE_LIMIT', PAY_PER_TASK_MINUTE_LIMIT_DEFAULT);
 }
 
 export function getTransactionSizeLimitUsd(): number | null {
@@ -116,59 +120,76 @@ export async function checkRateLimit(input: RateLimitInput): Promise<RateLimitRe
     };
   }
 
-  const redis = getRedis();
   const date = formatDateUTC(now);
   const minuteStamp = formatMinuteKeyUTC(now);
   const dailyKey = getDailyRateKey(walletAddress, date, agentSlug);
   const minuteKey = getMinuteRateKey(walletAddress, minuteStamp);
 
-  const [dailyUsedRaw, minuteUsedRaw] = await Promise.all([
-    redis.get(dailyKey),
-    redis.get(minuteKey),
-  ]);
+  try {
+    const redis = getRedis();
+    const [dailyUsedRaw, minuteUsedRaw] = await Promise.all([
+      redis.get(dailyKey),
+      redis.get(minuteKey),
+    ]);
 
-  const dailyUsed = Number(dailyUsedRaw ?? '0');
-  const minuteUsed = Number(minuteUsedRaw ?? '0');
+    const dailyUsed = Number(dailyUsedRaw ?? '0');
+    const minuteUsed = Number(minuteUsedRaw ?? '0');
 
-  if (dailyUsed >= dailyLimit) {
+    if (dailyUsed >= dailyLimit) {
+      return {
+        allowed: false,
+        reason: 'DAILY_LIMIT',
+        dailyUsed,
+        dailyLimit,
+        minuteUsed,
+        minuteLimit,
+      };
+    }
+
+    if (minuteUsed >= minuteLimit) {
+      return {
+        allowed: false,
+        reason: 'MINUTE_LIMIT',
+        dailyUsed,
+        dailyLimit,
+        minuteUsed,
+        minuteLimit,
+      };
+    }
+
+    const tx = redis.multi();
+    tx.incr(dailyKey);
+    tx.expire(dailyKey, DAILY_TTL_SECONDS);
+    tx.incr(minuteKey);
+    tx.expire(minuteKey, MINUTE_TTL_SECONDS);
+    const results = await tx.exec();
+
+    const nextDaily = Number(results?.[0]?.[1] ?? dailyUsed + 1);
+    const nextMinute = Number(results?.[2]?.[1] ?? minuteUsed + 1);
+
     return {
-      allowed: false,
-      reason: 'DAILY_LIMIT',
-      dailyUsed,
+      allowed: true,
+      dailyUsed: nextDaily,
       dailyLimit,
-      minuteUsed,
+      minuteUsed: nextMinute,
+      minuteLimit,
+    };
+  } catch (error) {
+    // Fail open: if Redis is unreachable, do not block (or hang) the user. A
+    // brief lapse in rate limiting is far better than stalling every action for
+    // ~6-7s per call. The commandTimeout on the client bounds this to ~1s.
+    console.warn(
+      '[ratelimit] Redis unavailable, allowing request (fail-open):',
+      error instanceof Error ? error.message : String(error),
+    );
+    return {
+      allowed: true,
+      dailyUsed: 0,
+      dailyLimit,
+      minuteUsed: 0,
       minuteLimit,
     };
   }
-
-  if (minuteUsed >= minuteLimit) {
-    return {
-      allowed: false,
-      reason: 'MINUTE_LIMIT',
-      dailyUsed,
-      dailyLimit,
-      minuteUsed,
-      minuteLimit,
-    };
-  }
-
-  const tx = redis.multi();
-  tx.incr(dailyKey);
-  tx.expire(dailyKey, DAILY_TTL_SECONDS);
-  tx.incr(minuteKey);
-  tx.expire(minuteKey, MINUTE_TTL_SECONDS);
-  const results = await tx.exec();
-
-  const nextDaily = Number(results?.[0]?.[1] ?? dailyUsed + 1);
-  const nextMinute = Number(results?.[2]?.[1] ?? minuteUsed + 1);
-
-  return {
-    allowed: true,
-    dailyUsed: nextDaily,
-    dailyLimit,
-    minuteUsed: nextMinute,
-    minuteLimit,
-  };
 }
 
 export const RATE_LIMITS = {

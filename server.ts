@@ -13,6 +13,8 @@ import {
 import {
   callHermesFast,
 } from './lib/hermes';
+import { resolveReportLanguage } from './lib/reportLanguage';
+import { translateReportMarkdown } from './lib/reportTranslate';
 import {
   buildBrainConfirmationMeta,
   buildBrainMetaFromToolResults,
@@ -52,6 +54,7 @@ import { detectForecastingIntent, fetchLiveData, shouldGatherCurrentEvents } fro
 import { detectPortfolioImpactIntent, stripPortfolioImpactPhrasing } from './lib/portfolio-impact-intent';
 import { classifyPortfolioRequestMode } from './lib/portfolio-request-intent';
 import { extractAgentpayRemark } from './lib/agentpay-remark';
+import { generateInvoiceNumber } from './lib/invoice-number';
 import {
   isAmbiguousPredictionMarketIntent,
   isPredictionMarketBrowseIntent,
@@ -117,6 +120,7 @@ import {
   buildConversationReviewDataset,
   saveConversationReviewLabel,
 } from './lib/conversation-review';
+import { loadChatFeedbackEntries } from './lib/chat-feedback-review';
 import { getFacilitatorBaseUrl } from './lib/facilitator-url';
 import { scheduleChatToolPostA2a } from './lib/a2a-chat-scheduler';
 import { runInvoiceVendorResearchFollowup, runPortfolioFollowupAfterToolWithPayment } from './lib/a2a-followups';
@@ -136,11 +140,12 @@ import walletApiRouter from './api/wallet';
 import extensionApiRouter from './api/extension';
 import businessApiRouter from './api/business';
 import payApiRouter, { fetchPayHistoryForBrain } from './api/pay';
-import agentStoreApiRouter from './api/agent-store';
+import agentStoreApiRouter, { CORE_AGENT_SPECS } from './api/agent-store';
+import agentRatingsApiRouter from './api/agent-ratings';
 import agentEconomyLedgerApiRouter from './api/agent-economy-ledger';
 import portfolioApiRouter from './api/portfolio';
-import fundsApiRouter from './api/funds';
 import settingsApiRouter from './api/settings';
+import telegramApiRouter from './api/telegram';
 import emailWebhookRouter from './api/webhooks/email';
 import { authMiddleware, generateJWT, verifyJWT, type JWTPayload } from './lib/auth';
 import { getOrCreateUserAgentWallet } from './lib/dcw';
@@ -170,7 +175,8 @@ import {
   formatAgentFlowHowItWorksReply as formatSharedAgentFlowHowItWorksReply,
   isExplicitFullCapabilityRequest,
 } from './lib/agentflowProduct';
-import { answerProductQuestion } from './lib/product-rag';
+import { answerProductQuestion, PRODUCT_KNOWLEDGE } from './lib/product-rag';
+import { VISION_DAILY_LIMIT_DEFAULT, TRANSCRIBE_DAILY_LIMIT_DEFAULT } from './lib/usageLimits';
 import { searchRag } from './lib/rag/search';
 import {
   canonicalRedisSessionId,
@@ -178,8 +184,11 @@ import {
   getFirstPendingRedisValue,
   redisPendingExists,
 } from './lib/chatSessionRedis';
-import { CANONICAL_FUND_IDS } from './lib/funds-defaults';
-import { parseBatchPaymentsFromMessage, parseCSVBatch } from './lib/csv-batch-parser';
+import {
+  parseBatchPaymentsFromMessage,
+  parseCSVBatch,
+  type BatchPaymentRow,
+} from './lib/csv-batch-parser';
 import {
   ensureUserPaidAgentLedger,
   executeDcwPaidAgentViaX402,
@@ -259,7 +268,8 @@ function buildBridgeChoiceQuickActionGroups() {
       actions: [
         {
           label: 'Show my funded chains',
-          prompt: 'which bridge source chains have USDC and gas',
+          prompt: 'show the supported source chains where this wallet already has USDC and gas for bridge',
+          actionId: 'bridge.funded_chains',
         },
       ],
     },
@@ -335,7 +345,6 @@ const RESEARCH_TIMING_TRACE = /^(1|true|yes|on)$/i.test(
 );
 const isFeatureEnabled = (name: string): boolean =>
   /^(1|true|yes|on)$/i.test(String(process.env[name] ?? '').trim());
-const fundsFeatureEnabled = () => isFeatureEnabled('AGENTFLOW_FEATURE_FUNDS');
 const ARC_TESTNET_DOMAIN = Number(process.env.GATEWAY_DOMAIN || 26);
 const GATEWAY_API_BASE_URL =
   process.env.GATEWAY_API_BASE_URL || 'https://gateway-api-testnet.circle.com/v1';
@@ -1440,6 +1449,12 @@ function isLikelyNoiseWord(token: string): boolean {
     return false;
   }
   if (!/^\p{L}+$/u.test(normalized)) {
+    return false;
+  }
+  // The vowel/consonant heuristics below are only meaningful for Latin-script
+  // tokens. Applying them to Cyrillic, Arabic, CJK, Thai, etc. causes valid
+  // multilingual input to be mislabeled as noise.
+  if (!/^\p{Script=Latin}+$/u.test(normalized)) {
     return false;
   }
 
@@ -3093,6 +3108,20 @@ function shouldClarifyPortfolioRequest(message: string): boolean {
   return classifyPortfolioRequestMode(message) === 'clarify';
 }
 
+function isPortfolioReferentialFollowup(message: string): boolean {
+  const normalized = message.trim();
+  if (!normalized) {
+    return false;
+  }
+  return (
+    /^(?:is|are|was|were)\b/i.test(normalized) ||
+    /\b(?:that|this|it|the report above|above report|previous report)\b/i.test(normalized) ||
+    /^(?:where\s+can\s+i\s+(?:see|view|find|open|check)\s+it|where\s+is\s+it|how\s+do\s+i\s+(?:see|view|find|open|check)\s+it)\??$/i.test(
+      normalized,
+    )
+  );
+}
+
 function buildPortfolioCheckClarificationReply(): string {
   return [
     'I can check your current AgentFlow portfolio here.',
@@ -3988,8 +4017,15 @@ function shouldHandleAsScheduleRequest(message: string): boolean {
 function shouldHandleAsAgentPayHistoryRequest(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return false;
+  if (
+    /\b(?:how|explain|about|format|example|examples)\b/i.test(normalized) &&
+    /\b(?:split|batch|scheduled?|recurring|payment\s+link|pay\s+link|invoice|request)\b/i.test(normalized) &&
+    !/\b(?:history|recent|latest|last|previous|earlier|records?|activity|transactions?)\b/i.test(normalized)
+  ) {
+    return false;
+  }
   return (
-    /\b(?:show|list|view|check|pull|get|see|display|tell me|what|which|where)\b[\s\S]{0,80}\b(?:agentpay|payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions|activity|records?)\b/i.test(normalized) ||
+    /\b(?:show|list|view|check|pull|get|see|display)\b[\s\S]{0,80}\b(?:agentpay|payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions|activity|records?)\b/i.test(normalized) ||
     /\b(?:agentpay|payment|payments|pay|paid|sent|received|transfer|transfers|transaction|transactions|activity|records?)\b[\s\S]{0,80}\b(?:show|list|view|check|pull|get|see|display|history|records?|activity)\b/i.test(normalized) ||
     /\bwhat\s+(?:payments|transfers|transactions)\s+have\s+i\s+(?:sent|made|received)\b/i.test(normalized) ||
     /\bwhat\s+(?:payments|transfers|transactions)\s+did\s+i\s+(?:send|make|receive)\b/i.test(normalized) ||
@@ -4443,6 +4479,62 @@ function shouldOfferPostRouterProductFallback(intent: AgentFlowIntent): boolean 
     'predmarket_redeem_help',
     'capability_ambiguity',
   ].includes(topicHint);
+}
+
+/**
+ * Strictly-informational product question that should bypass the non-deterministic
+ * LLM intent router and be answered from product knowledge directly.
+ *
+ * Intentionally narrow: only messages that OPEN with "explain ...". Users virtually
+ * never use "explain" to trigger an execution, and `buildAgentFlowProductReply`
+ * still self-guards against every action intent (swap/vault/portfolio/research/
+ * bridge/history all return null), so a stray "explain my portfolio" simply falls
+ * through to normal routing unchanged. This exists because the intent router
+ * intermittently misroutes clear FAQ prompts to the brain, which then trips the
+ * stale-state guard ("I can't verify live balances..."), making starter-prompt
+ * answers flaky across runs.
+ */
+function isExplicitProductExplainQuestion(message: string): boolean {
+  return /^\s*explain\b/i.test(message);
+}
+
+/**
+ * Payload-free product/how-to question that should be answered from product
+ * knowledge (RAG) instead of being grabbed by a pre-router action matcher
+ * (schedule/split/contacts/batch) that fires on bare keyword overlap.
+ *
+ * Intent-first, not a canned answer: this only widens WHICH messages reach
+ * `buildAgentFlowProductReply` (-> `answerProductQuestion` RAG). It stays safe in
+ * a natural-language app by keying off the absence of an action payload, not
+ * phrasing alone:
+ *  - must OPEN as an informational question (how to / what is / explain / ...);
+ *  - excludes anything carrying a payload (number/amount, .arc handle, 0x
+ *    address, @handle) so a real "send 10 to jack.arc" routes to the action;
+ *  - excludes possessive/live-state probes ("my", "mine") so "what is my
+ *    balance" still hits the real handler, not a generic explanation.
+ * Anything that slips through still falls back to normal routing because
+ * `buildAgentFlowProductReply` self-guards every action intent and returns null.
+ */
+function isPayloadFreeProductQuestion(message: string): boolean {
+  const m = message.trim();
+  if (!m || m.length > 160) return false;
+
+  const infoOpener =
+    /^\s*(?:explain\b|how\s+(?:to|do\s+i|does|can\s+i)\b|what\s+(?:is|are|can|does)\b|which\b|where\s+do\s+i\b|do\s+you\s+support\b|tell\s+me\s+about\b)/i.test(
+      m,
+    );
+  if (!infoOpener) return false;
+
+  // Possessive / live-state queries are not product FAQs — route them normally.
+  if (/\b(?:my|mine|our)\b/i.test(m)) return false;
+
+  // Action payloads mean this is an execution, not a question.
+  if (/\d/.test(m)) return false;
+  if (/\b[a-z0-9_.-]+\.arc\b/i.test(m)) return false;
+  if (/0x[a-fA-F0-9]{6,}/.test(m)) return false;
+  if (/@[a-z0-9_]+/i.test(m)) return false;
+
+  return true;
 }
 
 function isPendingActionFollowup(message: string): boolean {
@@ -5543,6 +5635,40 @@ function buildPredmarketDetailQuickActionGroups(
   ];
 }
 
+function buildPredmarketSellAction(
+  positionStr: string,
+  address: `0x${string}`,
+): { label: string; prompt: string; tone: 'primary' } | null {
+  // Parse the first "<shares> <label> shares" entry. The label may carry an emoji
+  // prefix and/or multiple words (e.g. "🌍 Others"), so capture everything up to
+  // " shares" and then strip non-word symbols to get a usable outcome token.
+  const match = positionStr.match(/([0-9]+(?:\.[0-9]+)?)\s+(.+?)\s+shares?\b/u);
+  if (!match) return null;
+  const rawShares = Number(match[1]);
+  if (!Number.isFinite(rawShares) || rawShares <= 0) return null;
+  // Floor to 6 decimals so the one-tap sell never exceeds the on-chain balance.
+  const shares = (Math.floor(rawShares * 1e6) / 1e6).toString();
+  if (shares === '0') return null;
+  const label = (match[2] || '')
+    .replace(/\[\[AFMETA:[^\]]*\]\]/g, '')
+    .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Prefer the explicit outcome index (from the hidden AFMETA marker) so the sell
+  // resolves unambiguously for any market, incl. multi-outcome ones. Fall back to
+  // the cleaned label (works for Yes/No) when no marker is present.
+  const indexMatch = positionStr.match(/\[\[AFMETA:po=(\d+)\]\]/);
+  const outcomeRef = indexMatch
+    ? `outcome ${indexMatch[1]}${label ? ` (${label})` : ''}`
+    : label;
+  if (!outcomeRef) return null;
+  return {
+    label: 'Sell',
+    prompt: `sell ${shares} shares ${outcomeRef} for ${address}`,
+    tone: 'primary',
+  };
+}
+
 function buildPredmarketPositionQuickActionGroups(
   result: string,
 ): Array<{
@@ -5555,18 +5681,20 @@ function buildPredmarketPositionQuickActionGroups(
   }> = [];
   const matches = Array.from(
     result.matchAll(
-      /###\s+[^\n]*?\s(.+?)\n[\s\S]*?- \*\*Status:\*\* ([^\n]+)\n[\s\S]*?- \*\*Address:\*\* `?(0x[a-fA-F0-9]{40})`?/g,
+      /###\s+[^\n]*?\s(.+?)\n[\s\S]*?- \*\*Position:\*\* ([^\n]+)\n[\s\S]*?- \*\*Status:\*\* ([^\n]+)\n[\s\S]*?- \*\*Address:\*\* `?(0x[a-fA-F0-9]{40})`?/g,
     ),
   );
 
   for (const match of matches) {
     const title = match[1]?.trim() || 'Market';
-    const status = (match[2] || '').trim().toLowerCase();
-    const address = match[3] as `0x${string}`;
+    const positionStr = (match[2] || '').trim();
+    const status = (match[3] || '').trim().toLowerCase();
+    const address = match[4] as `0x${string}`;
+    const shortTitle = title.length > 52 ? `${title.slice(0, 49)}...` : title;
 
     if (status.includes('redeemable now')) {
       groups.push({
-        title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
+        title: shortTitle,
         actions: [
           { label: 'Redeem', prompt: `redeem ${address}` },
           { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
@@ -5578,7 +5706,7 @@ function buildPredmarketPositionQuickActionGroups(
 
     if (status.includes('refundable now')) {
       groups.push({
-        title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
+        title: shortTitle,
         actions: [
           { label: 'Refund', prompt: `refund ${address}` },
           { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
@@ -5588,13 +5716,19 @@ function buildPredmarketPositionQuickActionGroups(
       continue;
     }
 
-    groups.push({
-      title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
-      actions: [
-        { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
-        { label: 'Details', prompt: `tell me about ${address}` },
-      ],
+    // Active/open position: offer a one-tap Sell to exit early.
+    const sellAction = status.includes('active')
+      ? buildPredmarketSellAction(positionStr, address)
+      : null;
+    const actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }> = [];
+    if (sellAction) actions.push(sellAction);
+    actions.push({ label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) });
+    actions.push({
+      label: 'Details',
+      prompt: `tell me about ${address}`,
+      ...(sellAction ? { tone: 'secondary' as const } : {}),
     });
+    groups.push({ title: shortTitle, actions });
   }
 
   const inlineMatches = Array.from(
@@ -5956,6 +6090,9 @@ type BrainResearchPipelineChatOpts = {
   memorySessionId: string;
   persistUserTurn: string;
   researchTask: string;
+  /** The raw user message. Used for report-language detection, because
+   * researchTask may be a Hermes-normalized (English) query, not what the user typed. */
+  originalUserMessage?: string;
   reasoningMode?: 'fast' | 'deep';
   portfolioImpact?: boolean;
   walletAddress: string;
@@ -5974,6 +6111,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
     memorySessionId,
     persistUserTurn,
     researchTask,
+    originalUserMessage,
     reasoningMode: requestedReasoningMode,
     portfolioImpact = false,
     walletAddress,
@@ -6219,6 +6357,27 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
         : 0;
     const totalCost = pipelineReceipt?.total ? Number(pipelineReceipt.total) : null;
 
+    // If the user wrote the request in / asked for a non-English language,
+    // translate the finished report into that language. Done here (after /run
+    // returns the English report) so the SSE pipeline is never blocked; uses the
+    // fast model (~6s) and falls back to English on any error.
+    // Detect from the raw user message (researchTask may be a Hermes-normalized
+    // English query, which would hide the user's actual language).
+    const reportLanguage = report
+      ? resolveReportLanguage(originalUserMessage || researchTask)
+      : null;
+    if (reportLanguage && report) {
+      try {
+        console.log(`[research-chat] translating report into ${reportLanguage.name}`);
+        report = await translateReportMarkdown(report, reportLanguage.name);
+      } catch (translateErr) {
+        console.warn(
+          '[research-chat] report translation failed, keeping English:',
+          getErrorMessage(translateErr),
+        );
+      }
+    }
+
     const finalText = `\n\n---\n\n${report}`;
     await appendBrainConversationTurn(
       memorySessionId,
@@ -6226,9 +6385,13 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
       `${intermediate.join('')}${finalText}`,
       redisActionScopeKey,
     );
+    // Only surface "Trade / prediction market" quick actions when the research
+    // was actually launched from a prediction-market context. Plain research
+    // (e.g. "BTC report") should NOT auto-attach trade buttons just because it
+    // mentions a tradeable asset.
     const researchQuickActionGroups = predmarketResearchContext
       ? await buildPredmarketResearchQuickActionGroupsFromContext(predmarketResearchContext)
-      : await buildPredmarketResearchQuickActionGroups(researchTask);
+      : undefined;
     res.write(
       `data: ${JSON.stringify({
         meta: {
@@ -6501,6 +6664,151 @@ function parseInvoiceRequest(
   return null;
 }
 
+function extractRecipientTextFromSlot(recipient: unknown): string | null {
+  if (!recipient || typeof recipient !== 'object') {
+    return null;
+  }
+  const candidate = recipient as { handle?: unknown; address?: unknown };
+  if (typeof candidate.handle === 'string' && candidate.handle.trim()) {
+    return candidate.handle.trim();
+  }
+  if (typeof candidate.address === 'string' && candidate.address.trim()) {
+    return candidate.address.trim();
+  }
+  return null;
+}
+
+function extractAmountStringFromSlot(amount: unknown): string | null {
+  if (!amount || typeof amount !== 'object') {
+    return null;
+  }
+  const candidate = amount as { value?: unknown };
+  if (typeof candidate.value === 'number' && Number.isFinite(candidate.value) && candidate.value > 0) {
+    return String(candidate.value);
+  }
+  return null;
+}
+
+function extractBatchPaymentsFromIntent(
+  intent: AgentFlowIntent | null | undefined,
+  rawMessage?: string,
+): BatchPaymentRow[] | null {
+  const slots =
+    intent?.slots && typeof intent.slots === 'object'
+      ? (intent.slots as { payments?: unknown })
+      : null;
+  if (!Array.isArray(slots?.payments) || slots.payments.length === 0) {
+    return null;
+  }
+
+  const payments: BatchPaymentRow[] = [];
+  for (const payment of slots.payments) {
+    if (!payment || typeof payment !== 'object') {
+      return null;
+    }
+    const candidate = payment as { recipient?: unknown; amount?: unknown; remark?: unknown };
+    const to = extractRecipientTextFromSlot(candidate.recipient);
+    const amount = extractAmountStringFromSlot(candidate.amount);
+    if (!to || !amount) {
+      return null;
+    }
+    payments.push({
+      to,
+      amount,
+      ...(typeof candidate.remark === 'string' && candidate.remark.trim()
+        ? { remark: candidate.remark.trim() }
+        : {}),
+    });
+  }
+
+  const parsedFallback = rawMessage ? parseBatchMessage(rawMessage) : null;
+  if (Array.isArray(parsedFallback) && parsedFallback.length === payments.length) {
+    return payments.map((payment, index) => ({
+      ...payment,
+      ...(payment.remark
+        ? {}
+        : parsedFallback[index]?.remark
+          ? { remark: parsedFallback[index].remark }
+          : {}),
+    }));
+  }
+
+  return payments.length > 0 ? payments : null;
+}
+
+function extractSplitRequestFromIntent(
+  intent: AgentFlowIntent | null | undefined,
+  rawMessage?: string,
+): { recipients: string[]; totalAmount: string; remark?: string } | null {
+  const slots =
+    intent?.slots && typeof intent.slots === 'object'
+      ? (intent.slots as { recipients?: unknown; total_amount?: unknown; remark?: unknown })
+      : null;
+  const totalAmount = extractAmountStringFromSlot(slots?.total_amount);
+  if (!totalAmount || !Array.isArray(slots?.recipients) || slots.recipients.length < 2) {
+    return null;
+  }
+
+  const recipients = slots.recipients
+    .map((recipient) => extractRecipientTextFromSlot(recipient))
+    .filter((recipient): recipient is string => Boolean(recipient));
+  if (recipients.length < 2) {
+    return null;
+  }
+
+  const fallbackRemark =
+    rawMessage ? (parseSplitRequest(rawMessage)?.remark ?? undefined) : undefined;
+  const slotRemark =
+    typeof slots.remark === 'string' && slots.remark.trim() ? slots.remark.trim() : undefined;
+
+  return {
+    recipients,
+    totalAmount,
+    ...((slotRemark || fallbackRemark) ? { remark: slotRemark || fallbackRemark } : {}),
+  };
+}
+
+function extractPaymentLinkRequestFromIntent(
+  intent: AgentFlowIntent | null | undefined,
+): { handle: string; amount?: string; remark?: string } | null {
+  const slots =
+    intent?.slots && typeof intent.slots === 'object'
+      ? (intent.slots as { recipient?: unknown; amount?: unknown; remark?: unknown })
+      : null;
+  const rawHandle = extractRecipientTextFromSlot(slots?.recipient);
+  if (!rawHandle) {
+    return null;
+  }
+  const normalizedHandle = rawHandle.startsWith('0x')
+    ? rawHandle
+    : rawHandle.replace(/\.arc$/i, '').toLowerCase();
+  const amount = extractAmountStringFromSlot(slots?.amount);
+  return {
+    handle: normalizedHandle,
+    ...(amount ? { amount } : {}),
+    ...(typeof slots?.remark === 'string' && slots.remark.trim() ? { remark: slots.remark.trim() } : {}),
+  };
+}
+
+function extractInvoiceRequestFromIntent(
+  intent: AgentFlowIntent | null | undefined,
+): { vendorHandle: string; amount: string; description: string } | null {
+  const slots =
+    intent?.slots && typeof intent.slots === 'object'
+      ? (intent.slots as { recipient?: unknown; amount?: unknown; description?: unknown })
+      : null;
+  const vendorHandle = extractRecipientTextFromSlot(slots?.recipient);
+  const amount = extractAmountStringFromSlot(slots?.amount);
+  const description =
+    typeof slots?.description === 'string' && slots.description.trim()
+      ? slots.description.trim()
+      : null;
+  if (!vendorHandle || !amount || !description) {
+    return null;
+  }
+  return { vendorHandle, amount, description };
+}
+
 function isPredictionMarketLiveIntent(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return false;
@@ -6629,7 +6937,8 @@ function parseDirectAgentFlowRoute(
 
   if (
     shouldClarifyPortfolioRequest(normalized) &&
-    recentPortfolioSnapshot
+    recentPortfolioSnapshot &&
+    isPortfolioReferentialFollowup(normalized)
   ) {
     return {
       type: 'reply',
@@ -8798,29 +9107,29 @@ function createPublicApp(): express.Express {
   app.use(corsMiddleware);
   app.use('/api/auth', authApiRouter);
   app.use('/api/wallet', walletApiRouter);
+  app.use('/api/telegram', telegramApiRouter);
   app.use('/api/settings', settingsApiRouter);
   app.use('/api/extension', extensionApiRouter);
   app.use('/api/business', businessApiRouter);
   app.use('/api/pay', payApiRouter);
   // Agent Store API
   app.use('/api/agent-store', agentStoreApiRouter);
+  app.use('/api/agent-ratings', agentRatingsApiRouter);
   app.use('/api/agent-economy-ledger', agentEconomyLedgerApiRouter);
   app.use('/api/portfolio', portfolioApiRouter);
-  app.use('/api/funds', (req: Request, res: Response, next: NextFunction) => {
-    if (!fundsFeatureEnabled()) {
-      return res.status(404).json({ error: 'Not found' });
-    }
-    return fundsApiRouter(req, res, next);
-  });
 
   app.get('/api/stats', async (_req: Request, res: Response) => {
     try {
       const stats = await getTxStats();
 
+      // Only count rows that carry an Arc on-chain tx id — the strip labels these
+      // "Onchain transactions" with "a real on-chain trace, settled in USDC", so
+      // completed-but-unsettled rows (no arc_tx_id) must be excluded.
       const { count, error } = await adminDb
         .from('transactions')
         .select('*', { count: 'exact', head: true })
-        .eq('status', 'complete');
+        .eq('status', 'complete')
+        .not('arc_tx_id', 'is', null);
 
       if (error) {
         throw new Error(error.message);
@@ -8830,16 +9139,19 @@ function createPublicApp(): express.Express {
         .from('transactions')
         .select('*', { count: 'exact', head: true })
         .eq('action_type', 'agent_to_agent_payment')
-        .eq('status', 'complete');
+        .eq('status', 'complete')
+        .not('arc_tx_id', 'is', null);
 
       if (a2aErr) {
         throw new Error(a2aErr.message);
       }
 
       return res.json({
-        total_transactions: stats.total,
+        total_transactions: count ?? 0,
         onchain_transactions: count ?? 0,
         agent_to_agent_payments: a2aCount ?? 0,
+        core_agents: CORE_AGENT_SPECS.length,
+        tracked_task_runs: stats.total,
         by_agent: stats.byAgent,
         powered_by: 'Arc Network + Circle Nanopayments',
         settlement: 'USDC on Arc Testnet',
@@ -8847,6 +9159,20 @@ function createPublicApp(): express.Express {
     } catch (e: unknown) {
       return res.status(500).json({ error: 'Failed to fetch stats' });
     }
+  });
+
+  // Public docs content — the same product knowledge the in-chat assistant
+  // answers from, so the marketing /docs page stays in sync automatically.
+  app.get('/api/docs', (_req: Request, res: Response) => {
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    return res.json({
+      topics: PRODUCT_KNOWLEDGE.map((doc) => ({
+        id: doc.id,
+        title: doc.title,
+        summary: doc.summary,
+        facts: doc.facts,
+      })),
+    });
   });
 
 
@@ -9364,8 +9690,8 @@ function createPublicApp(): express.Express {
 
     try {
       const walletAddress = getAddress(auth.walletAddress);
-      const visionLimit = Number(process.env.VISION_DAILY_LIMIT || 5);
-      const transcribeLimit = Number(process.env.TRANSCRIBE_DAILY_LIMIT || 5);
+      const visionLimit = Number(process.env.VISION_DAILY_LIMIT || VISION_DAILY_LIMIT_DEFAULT);
+      const transcribeLimit = Number(process.env.TRANSCRIBE_DAILY_LIMIT || TRANSCRIBE_DAILY_LIMIT_DEFAULT);
 
       const [vision, transcribe] = await Promise.all([
         readDailyUsageCap({
@@ -9548,6 +9874,33 @@ function createPublicApp(): express.Express {
         `attachment; filename="conversation-review-dataset-${labeledOnly ? 'labeled' : 'all'}.json"`,
       );
       return res.status(200).send(JSON.stringify(dataset, null, 2));
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/internal/feedback/messages', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : Number.NaN;
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 80;
+      const entries = await loadChatFeedbackEntries(limit);
+      return res.json({ entries });
+    } catch (err) {
+      return res.status(500).json({ error: getErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/internal/feedback/messages/export', adminAuthMiddleware, async (req: Request, res: Response) => {
+    try {
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : Number.NaN;
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 400;
+      const entries = await loadChatFeedbackEntries(limit);
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="chat-feedback-events.json"',
+      );
+      return res.status(200).send(JSON.stringify(entries, null, 2));
     } catch (err) {
       return res.status(500).json({ error: getErrorMessage(err) });
     }
@@ -9956,7 +10309,7 @@ function createPublicApp(): express.Express {
     const earlyPortfolioSnapshot = findRecentPortfolioSnapshotMessage(earlyPortfolioHistory);
     const earlyPortfolioClarificationReply =
       shouldClarifyPortfolioRequest(message)
-        ? earlyPortfolioSnapshot
+        ? earlyPortfolioSnapshot && isPortfolioReferentialFollowup(message)
           ? buildPortfolioContextualFollowupReply(message)
           : buildPortfolioCheckClarificationReply()
         : /^(?:where\s+can\s+i\s+(?:see|view|find|open|check)\s+it|where\s+is\s+it|how\s+do\s+i\s+(?:see|view|find|open|check)\s+it)\??$/i.test(
@@ -10049,6 +10402,40 @@ function createPublicApp(): express.Express {
       }
     } catch (error) {
       console.warn('[chat/respond] early pending follow-up check failed:', getErrorMessage(error));
+    }
+
+    // Pre-router product FAQ fast-path. Explicit "Explain ..." product questions are
+    // informational and must not depend on the non-deterministic intent router (which
+    // intermittently sends them to the brain, tripping the stale-state guard). Runs
+    // AFTER the pending-action guard so it never hijacks a confirm flow, and reuses
+    // buildAgentFlowProductReply's self-guards — so it only ever serves a genuine
+    // product answer; anything action-shaped returns null and falls through unchanged.
+    if (
+      !reserveForReportContext &&
+      (isExplicitProductExplainQuestion(message) || isPayloadFreeProductQuestion(message))
+    ) {
+      const earlyProductReply = await buildAgentFlowProductReply(
+        capabilityProbe,
+        capabilityThreadCtx,
+      );
+      if (earlyProductReply) {
+        await appendBrainConversationTurn(memorySessionId, message, earlyProductReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'product_reply',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('product_reply'),
+          final_response_summary: earlyProductReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        streamStaticSseReply(res, earlyProductReply, { eventId: brainEventId });
+        return;
+      }
     }
 
     const walletIntentReply = await tryBuildWalletIntentReply({
@@ -10839,6 +11226,7 @@ function createPublicApp(): express.Express {
               return;
             }
 
+            const pendingSend = await loadPendingAction(actionSessionId).catch(() => null);
             const executeResp = await fetch('http://localhost:4000/api/pay/brain/execute', {
               method: 'POST',
               headers: {
@@ -10852,6 +11240,9 @@ function createPublicApp(): express.Express {
               txHash?: string;
               explorerLink?: string;
               error?: string;
+              to?: string;
+              amount?: string;
+              remark?: string;
             };
             if (!executeResp.ok || !executeJson.ok || !executeJson.txHash) {
               const responseText = `Payment failed: ${executeJson.error || 'unknown error'}`;
@@ -10865,7 +11256,44 @@ function createPublicApp(): express.Express {
             const txHash = executeJson.txHash;
             const txShort = txHash.length > 12 ? `${txHash.slice(0, 10)}...` : txHash;
             const explorerUrl = executeJson.explorerLink || `https://testnet.arcscan.app/tx/${txHash}`;
-            const responseText = `Sent payment successfully on Arc.\n\nTx: \`${txShort}\`\n[View on Arc Explorer](${explorerUrl})`;
+            const pendingSendPayload =
+              pendingSend && typeof pendingSend === 'object'
+                ? (pendingSend as { tool?: string; args?: unknown })
+                : null;
+            const pendingArgs =
+              pendingSendPayload?.tool === 'agentpay_send' &&
+              pendingSendPayload.args &&
+              typeof pendingSendPayload.args === 'object'
+                ? (pendingSendPayload.args as Record<string, unknown>)
+                : null;
+            const recipient =
+              (typeof pendingArgs?.to === 'string' && pendingArgs.to.trim()
+                ? pendingArgs.to.trim()
+                : typeof executeJson.to === 'string' && executeJson.to.trim()
+                  ? executeJson.to.trim()
+                  : null);
+            const amount =
+              (typeof pendingArgs?.amount === 'string' && pendingArgs.amount.trim()
+                ? pendingArgs.amount.trim()
+                : typeof executeJson.amount === 'string' && executeJson.amount.trim()
+                  ? executeJson.amount.trim()
+                  : null);
+            const remark =
+              (typeof pendingArgs?.remark === 'string' && pendingArgs.remark.trim()
+                ? pendingArgs.remark.trim()
+                : typeof executeJson.remark === 'string' && executeJson.remark.trim()
+                  ? executeJson.remark.trim()
+                  : null);
+            const receiptLines = [
+              'Sent payment successfully on Arc.',
+              recipient ? `Recipient: ${recipient}` : null,
+              amount ? `Amount: ${amount} USDC` : null,
+              remark ? `Note: ${remark}` : null,
+              `Tx: \`${txShort}\``,
+              `[View on Arc Explorer](${explorerUrl})`,
+            ].filter(Boolean);
+            const responseText = receiptLines.join('\n\n');
+            const paymentMeta = takeRecentExecutionMeta(actionSessionId);
             if (brainEventId) {
               await adminDb
                 .from('brain_events')
@@ -10876,6 +11304,15 @@ function createPublicApp(): express.Express {
                 .eq('id', brainEventId);
             }
             await appendBrainConversationTurn(memorySessionId, message, responseText);
+            if (paymentMeta) {
+              res.write(
+                `data: ${JSON.stringify({
+                  meta: {
+                    paymentMeta,
+                  } satisfies BrainMessageMeta,
+                })}\n\n`,
+              );
+            }
             res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
             res.write('data: [DONE]\n\n');
             res.end();
@@ -10991,6 +11428,7 @@ function createPublicApp(): express.Express {
                 memorySessionId,
                 persistUserTurn: message,
                 researchTask: deferredResearchTask,
+                originalUserMessage: message,
                 walletAddress: walletCtx.walletAddress,
                 brainEventId,
                 redisActionScopeKey: memorySessionId,
@@ -11109,6 +11547,19 @@ function createPublicApp(): express.Express {
           routerValidationResult = validation;
 
           if (validation.severity === 'hard' && validation.clarification) {
+            // Predmarket buy/sell explicit commands and quick-action prompts (e.g.
+            // "sell 5 shares outcome 3 (Others) for 0x..." or "bet on Yes for 0x...")
+            // are parsed reliably by the direct-route layer. When the LLM router can't
+            // fill the slots, defer to the direct route instead of asking for
+            // clarification (otherwise the Sell/outcome buttons appear to "forget"
+            // the context).
+            if (
+              (validation.intent.intent === AgentFlowIntentName.PredmarketBuy ||
+                validation.intent.intent === AgentFlowIntentName.PredmarketSell) &&
+              parseDirectAgentFlowRoute(message, messages)
+            ) {
+              return false;
+            }
             const vaultSelectionReply =
               validation.intent.intent === AgentFlowIntentName.VaultDeposit
                 ? parseDirectAgentFlowRoute(message, messages)
@@ -11209,18 +11660,17 @@ function createPublicApp(): express.Express {
                 },
                 runResearchReport: async (researchTask, options) => {
                   const portfolioImpact = options?.portfolioImpact === true;
-                  const predmarketResearchContext = extractPredmarketResearchContext(researchTask);
                   await executeBrainResearchPipelineForChat({
                     res,
                     memorySessionId,
                     persistUserTurn: message,
                     researchTask,
+                    originalUserMessage: message,
                     reasoningMode: options?.reasoningMode,
                     portfolioImpact,
                     walletAddress: walletCtx.walletAddress,
                     brainEventId,
                     redisActionScopeKey: memorySessionId,
-                    predmarketResearchContext,
                   });
                   return {
                     handled: true,
@@ -11255,7 +11705,7 @@ function createPublicApp(): express.Express {
                   const remark =
                     typeof scheduleSlots.remark === 'string' && scheduleSlots.remark.trim()
                       ? scheduleSlots.remark.trim()
-                      : '';
+                      : extractAgentpayRemark(intentValue.raw_message) || '';
                   const synthesizedTask =
                     recipientHandle && amountValue && cadence
                       ? [
@@ -11517,7 +11967,9 @@ function createPublicApp(): express.Express {
                   };
                 },
                 runBatch: async (intentValue: AgentFlowIntent, walletAddress, sessionId) => {
-                  const parsedBatch = parseBatchMessage(intentValue.raw_message);
+                  const parsedBatch =
+                    extractBatchPaymentsFromIntent(intentValue, intentValue.raw_message) ??
+                    parseBatchMessage(intentValue.raw_message);
                   if ('error' in parsedBatch) {
                     return {
                       handled: true,
@@ -11562,7 +12014,9 @@ function createPublicApp(): express.Express {
                   };
                 },
                 runSplit: async (intentValue: AgentFlowIntent, walletAddress, sessionId) => {
-                  const parsed = parseSplitRequest(intentValue.raw_message);
+                  const parsed =
+                    extractSplitRequestFromIntent(intentValue, intentValue.raw_message) ??
+                    parseSplitRequest(intentValue.raw_message);
                   if (!parsed) {
                     return {
                       handled: true,
@@ -11608,7 +12062,8 @@ function createPublicApp(): express.Express {
                   };
                 },
                 createInvoice: async (intentValue: AgentFlowIntent, walletAddress, sessionId) => {
-                  const parsed = parseInvoiceRequest(intentValue.raw_message);
+                  const parsed =
+                    extractInvoiceRequestFromIntent(intentValue) ?? parseInvoiceRequest(intentValue.raw_message);
                   if (!parsed) {
                     return {
                       handled: true,
@@ -11620,7 +12075,7 @@ function createPublicApp(): express.Express {
                       toolCalled: null,
                     };
                   }
-                  const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+                  const invoiceNumber = generateInvoiceNumber();
                   const pendingPayload = {
                     tool: 'create_invoice',
                     walletAddress,
@@ -11870,6 +12325,9 @@ function createPublicApp(): express.Express {
         return;
       }
 
+      const routerResolvedIntent =
+        ((routerValidationResult as ValidationResult | null)?.intent as AgentFlowIntent | null | undefined) ?? null;
+
       if (
         canUseFastPathForIntents(AgentFlowIntentName.ContactsList) &&
         shouldHandleAsContactView(message) &&
@@ -11955,13 +12413,22 @@ function createPublicApp(): express.Express {
         shouldHandleAsContactSave(message) &&
         walletCtx.walletAddress
       ) {
+        const contactCreateSlots =
+          routerResolvedIntent?.intent === AgentFlowIntentName.ContactsCreate &&
+          routerResolvedIntent.slots &&
+          typeof routerResolvedIntent.slots === 'object'
+            ? (routerResolvedIntent.slots as { name?: unknown; recipient?: unknown })
+            : null;
         const patterns: RegExp[] = [
           /save\s+(\w+)\s+as\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i,
           /add\s+contact\s+(\w+)\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i,
           /(\w+)\s+is\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i,
         ];
-        let contactName = '';
-        let contactAddress = '';
+        let contactName =
+          typeof contactCreateSlots?.name === 'string' && contactCreateSlots.name.trim()
+            ? contactCreateSlots.name.trim().toLowerCase()
+            : '';
+        let contactAddress = extractRecipientTextFromSlot(contactCreateSlots?.recipient) ?? '';
         for (const pattern of patterns) {
           const match = message.match(pattern);
           if (match) {
@@ -12056,12 +12523,23 @@ function createPublicApp(): express.Express {
         shouldHandleAsContactUpdate(message) &&
         walletCtx.walletAddress
       ) {
+        const contactUpdateSlots =
+          routerResolvedIntent?.intent === AgentFlowIntentName.ContactsUpdate &&
+          routerResolvedIntent.slots &&
+          typeof routerResolvedIntent.slots === 'object'
+            ? (routerResolvedIntent.slots as { name?: unknown; recipient?: unknown })
+            : null;
+        const slotName =
+          typeof contactUpdateSlots?.name === 'string' && contactUpdateSlots.name.trim()
+            ? contactUpdateSlots.name.trim().toLowerCase()
+            : '';
+        const slotAddress = extractRecipientTextFromSlot(contactUpdateSlots?.recipient) ?? '';
         const match =
           message.match(/update\s+(\w+)\s+to\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i) ||
           message.match(/change\s+(\w+)\s+address\s+to\s+(0x[a-fA-F0-9]{40}|[\w.-]+\.arc)/i);
-        if (match) {
-          const name = match[1].toLowerCase();
-          const newAddress = match[2].trim();
+        const name = slotName || (match ? match[1].toLowerCase() : '');
+        const newAddress = slotAddress || (match ? match[2].trim() : '');
+        if (name && newAddress) {
           try {
             const w = getAddress(walletCtx.walletAddress);
             const { data: existing } = await adminDb
@@ -12121,9 +12599,19 @@ function createPublicApp(): express.Express {
         shouldHandleAsContactDelete(message) &&
         walletCtx.walletAddress
       ) {
+        const contactDeleteSlots =
+          routerResolvedIntent?.intent === AgentFlowIntentName.ContactsDelete &&
+          routerResolvedIntent.slots &&
+          typeof routerResolvedIntent.slots === 'object'
+            ? (routerResolvedIntent.slots as { name?: unknown })
+            : null;
+        const slotName =
+          typeof contactDeleteSlots?.name === 'string' && contactDeleteSlots.name.trim()
+            ? contactDeleteSlots.name.trim().toLowerCase()
+            : '';
         const match = message.match(/(?:remove|delete)\s+contact\s+(\w+)/i);
-        if (match) {
-          const name = match[1].toLowerCase();
+        const name = slotName || (match ? match[1].toLowerCase() : '');
+        if (name) {
           try {
             const w = getAddress(walletCtx.walletAddress);
             const { data: deletedRows, error } = await adminDb
@@ -12274,7 +12762,8 @@ function createPublicApp(): express.Express {
         shouldHandleAsBatchPayment(message) &&
         walletCtx.walletAddress
       ) {
-        const parsedBatch = parseBatchMessage(message);
+        const parsedBatch =
+          extractBatchPaymentsFromIntent(routerResolvedIntent, message) ?? parseBatchMessage(message);
         if ('error' in parsedBatch) {
           const responseText =
             `I see you want to run a batch payment, but I could not parse the recipients.\n` +
@@ -12359,7 +12848,8 @@ function createPublicApp(): express.Express {
         shouldHandleAsSplitRequest(message) &&
         walletCtx.walletAddress
       ) {
-        const parsed = parseSplitRequest(message);
+        const parsed =
+          extractSplitRequestFromIntent(routerResolvedIntent, message) ?? parseSplitRequest(message);
         if (!parsed) {
           const responseText =
             'I see you want to split a payment, but I could not extract the amount and recipients. ' +
@@ -12446,7 +12936,8 @@ function createPublicApp(): express.Express {
         canUseFastPathForIntents(AgentFlowIntentName.AgentpayPaymentLink) &&
         shouldHandleAsPaymentLinkRequest(message)
       ) {
-        const parsed = parsePaymentLinkRequest(message);
+        const parsed =
+          extractPaymentLinkRequestFromIntent(routerResolvedIntent) ?? parsePaymentLinkRequest(message);
         if (!parsed) {
           const responseText = [
             'I can build a payment link, but I need a recipient.',
@@ -12532,7 +13023,8 @@ function createPublicApp(): express.Express {
         shouldHandleAsInvoiceRequest(message) &&
         walletCtx.walletAddress
       ) {
-        const parsed = parseInvoiceRequest(message);
+        const parsed =
+          extractInvoiceRequestFromIntent(routerResolvedIntent) ?? parseInvoiceRequest(message);
         if (!parsed) {
           const responseText = [
             'Could not parse invoice details.',
@@ -12546,7 +13038,7 @@ function createPublicApp(): express.Express {
           return;
         }
 
-        const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+        const invoiceNumber = generateInvoiceNumber();
         const pendingPayload = {
           tool: 'create_invoice',
           walletAddress: walletCtx.walletAddress,
@@ -12801,6 +13293,7 @@ function createPublicApp(): express.Express {
           memorySessionId,
           persistUserTurn: message,
           researchTask: message,
+          originalUserMessage: message,
           portfolioImpact: detectPortfolioImpactIntent(message),
           walletAddress: walletCtx.walletAddress,
           brainEventId,
@@ -14305,7 +14798,6 @@ function createPublicApp(): express.Express {
 }
 
 async function start(): Promise<void> {
-  await warnIfCanonicalFundsMissing();
   const facilitatorApp = createFacilitatorApp();
   const researchApp = createAgentApp(
     'research',
@@ -14530,29 +15022,6 @@ async function start(): Promise<void> {
       );
     }, 5000);
   });
-}
-
-async function warnIfCanonicalFundsMissing(): Promise<void> {
-  try {
-    const { data, error } = await adminDb
-      .from('funds')
-      .select('id')
-      .in('id', CANONICAL_FUND_IDS)
-      .eq('is_active', true);
-    if (error) {
-      console.warn('[Boot] Funds startup check skipped:', error.message);
-      return;
-    }
-    const activeIds = new Set((data ?? []).map((row) => String(row.id)));
-    const missingIds = CANONICAL_FUND_IDS.filter((id) => !activeIds.has(id));
-    if (missingIds.length > 0) {
-      console.warn(
-        `[Boot] Missing canonical active funds IDs: ${missingIds.join(', ')}. Run: npm run script:seed-funds`,
-      );
-    }
-  } catch (error) {
-    console.warn('[Boot] Funds startup check failed:', getErrorMessage(error));
-  }
 }
 
 start().catch((err) => {

@@ -18,6 +18,11 @@ const steps = [
     args: ["run", "test:hermes-chat-quality:soft"],
   },
   {
+    name: "Multilingual leak regression",
+    command: "npm",
+    args: ["run", "test:chat-multilang-leaks:soft"],
+  },
+  {
     name: "Intent router natural language",
     command: "npm",
     args: ["run", "test:intent-router:natural"],

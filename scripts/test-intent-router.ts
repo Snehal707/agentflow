@@ -64,6 +64,7 @@ const TEST_CASES: TestCase[] = [
   { expectedIntent: AgentFlowIntentName.ResearchReport, expectedDomain: AgentFlowDomain.Research, label: 'variant', phrasing: 'put together a report on circle gateway adoption' },
   { expectedIntent: AgentFlowIntentName.AgentpaySend, expectedDomain: AgentFlowDomain.AgentPay, label: 'canonical', phrasing: 'send 5 USDC to jack.arc' },
   { expectedIntent: AgentFlowIntentName.AgentpaySend, expectedDomain: AgentFlowDomain.AgentPay, label: 'variant', phrasing: 'transfer 7 to 0x79FD75a3fC633259aDD60885f927d973d3A3642b' },
+  { expectedIntent: AgentFlowIntentName.AgentpaySend, expectedDomain: AgentFlowDomain.AgentPay, label: 'variant', phrasing: 'send 1 usdc' },
   { expectedIntent: AgentFlowIntentName.AgentpayRequest, expectedDomain: AgentFlowDomain.AgentPay, label: 'canonical', phrasing: 'request 5 USDC from jack.arc' },
   { expectedIntent: AgentFlowIntentName.AgentpayRequest, expectedDomain: AgentFlowDomain.AgentPay, label: 'variant', phrasing: 'ask alice.arc to pay me 12 usdc' },
   { expectedIntent: AgentFlowIntentName.AgentpayHistory, expectedDomain: AgentFlowDomain.AgentPay, label: 'canonical', phrasing: 'show my payment history' },
@@ -102,6 +103,7 @@ const TEST_CASES: TestCase[] = [
   { expectedIntent: AgentFlowIntentName.TreasuryTopup, expectedDomain: AgentFlowDomain.Treasury, label: 'variant', phrasing: 'refill the agent funding pool now' },
   { expectedIntent: AgentFlowIntentName.GeneralChat, expectedDomain: AgentFlowDomain.General, label: 'canonical', phrasing: 'hi' },
   { expectedIntent: AgentFlowIntentName.GeneralChat, expectedDomain: AgentFlowDomain.General, label: 'variant', phrasing: 'what can you do' },
+  { expectedIntent: AgentFlowIntentName.GeneralChat, expectedDomain: AgentFlowDomain.General, label: 'variant', phrasing: 'how do i send usdc' },
 ];
 
 const EDGE_CASES = [

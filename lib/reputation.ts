@@ -118,6 +118,76 @@ export async function getReputationScore(agentAddress: string): Promise<number> 
   return Number(cache?.score ?? 0);
 }
 
+type OnChainReputation = { count: number; score: number };
+
+const REPUTATION_READ_ABI = [
+  parseAbiItem('function getClients(uint256 agentId) view returns (address[])'),
+  parseAbiItem(
+    'function getSummary(uint256 agentId, address[] clientAddresses, string tag1, string tag2) view returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals)',
+  ),
+] as const;
+
+const onChainRepCache = new Map<string, { value: OnChainReputation; at: number }>();
+const ONCHAIN_REP_TTL_MS = 60_000;
+
+/**
+ * Reads the true ERC-8004 on-chain reputation aggregate for each agentId, using
+ * getClients (all feedback givers) + getSummary (count + average value across all
+ * their feedback). `score` is the average feedback value normalized to whole units
+ * (0–100 in this system). Cached briefly to avoid hammering the RPC on list loads.
+ */
+export async function fetchOnChainReputationByAgentIds(
+  agentIds: string[],
+): Promise<Record<string, OnChainReputation>> {
+  const unique = Array.from(
+    new Set(agentIds.map((id) => String(id).trim()).filter(Boolean)),
+  );
+  if (!unique.length) {
+    return {};
+  }
+  const client = createPublicClient({ chain, transport: http(ARC.rpc) });
+  const registry = ARC.reputationRegistry as `0x${string}`;
+  const out: Record<string, OnChainReputation> = {};
+
+  await Promise.all(
+    unique.map(async (id) => {
+      const cached = onChainRepCache.get(id);
+      if (cached && Date.now() - cached.at < ONCHAIN_REP_TTL_MS) {
+        out[id] = cached.value;
+        return;
+      }
+      let value: OnChainReputation = { count: 0, score: 0 };
+      try {
+        const agentId = BigInt(id);
+        const clients = (await client.readContract({
+          address: registry,
+          abi: REPUTATION_READ_ABI,
+          functionName: 'getClients',
+          args: [agentId],
+        })) as readonly `0x${string}`[];
+        if (clients.length > 0) {
+          const summary = (await client.readContract({
+            address: registry,
+            abi: REPUTATION_READ_ABI,
+            functionName: 'getSummary',
+            args: [agentId, clients as `0x${string}`[], '', ''],
+          })) as readonly [bigint, bigint, number];
+          const decimals = Number(summary[2]) || 0;
+          const score =
+            decimals > 0 ? Number(summary[1]) / 10 ** decimals : Number(summary[1]);
+          value = { count: Number(summary[0]), score };
+        }
+      } catch {
+        // Leave as { count: 0, score: 0 } on read failure.
+      }
+      onChainRepCache.set(id, { value, at: Date.now() });
+      out[id] = value;
+    }),
+  );
+
+  return out;
+}
+
 export function calculateScore(agentSlug: string, executionResult: ExecutionResult): number {
   const slug = agentSlug.toLowerCase();
 

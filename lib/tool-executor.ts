@@ -787,12 +787,23 @@ function formatPredictionPositions(positions: Array<Record<string, any>>): strin
   }
 
   const body = positions.map((position) => {
-    const outcomeLine = Array.isArray(position.outcomes)
-      ? position.outcomes
-          .filter((outcome: Record<string, any>) => BigInt(String(outcome.sharesRaw || '0')) > 0n)
-          .map((outcome: Record<string, any>) => `${outcome.sharesFormatted} ${outcome.label} shares`)
+    const heldOutcomes = (Array.isArray(position.outcomes) ? position.outcomes : [])
+      .map((outcome: Record<string, any>, index: number) => ({ outcome, index }))
+      .filter(({ outcome }: { outcome: Record<string, any> }) =>
+        BigInt(String(outcome.sharesRaw || '0')) > 0n,
+      );
+    const outcomeLine = heldOutcomes.length
+      ? heldOutcomes
+          .map(
+            ({ outcome }: { outcome: Record<string, any> }) =>
+              `${outcome.sharesFormatted} ${outcome.label} shares`,
+          )
           .join(' | ')
       : 'No shares';
+    // Hidden marker (stripped from display via [[AFMETA:...]]) carrying the first held
+    // outcome's index, so the positions "Sell" quick-action can build an unambiguous
+    // `sell ... outcome N (...)` command that resolves without needing chat context.
+    const sellMarker = heldOutcomes.length ? ` [[AFMETA:po=${heldOutcomes[0].index}]]` : '';
     const claimLine = position.canRedeem
       ? 'Redeemable now'
       : position.canRefund
@@ -800,7 +811,7 @@ function formatPredictionPositions(positions: Array<Record<string, any>>): strin
         : `Stage: ${position.stage}`;
     return [
       `### 📊 ${position.market?.title || 'Prediction market position'}`,
-      `- **Position:** ${outcomeLine || 'No shares'}`,
+      `- **Position:** ${outcomeLine}${sellMarker}`,
       `- **Net deposit:** ${formatUsdcMoneyFromRaw(position.netDepositedRaw)}`,
       `- **Status:** ${claimLine}`,
       `- **Provider:** ${position.provider}`,
@@ -809,7 +820,7 @@ function formatPredictionPositions(positions: Array<Record<string, any>>): strin
   }).join('\n\n');
 
   return truncateText(
-    `## Your prediction market positions\n\n${body}\n\n## ⚠️ Important notes\n- ${RESOLUTION_DISCLAIMER}\n- ${FEE_DISCLAIMER}\n\nReply \`redeem [market]\` for resolved markets where you can claim.`,
+    `## Your prediction market positions\n\n${body}\n\n## ⚠️ Important notes\n- ${RESOLUTION_DISCLAIMER}\n- ${FEE_DISCLAIMER}\n\nReply \`sell [amount] [outcome] shares for [market]\` to exit an active position early, or \`redeem [market]\` for resolved markets where you can claim.`,
     1800,
   );
 }

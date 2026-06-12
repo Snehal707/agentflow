@@ -5,6 +5,7 @@ import { adminDb, getRedis } from '../db/client';
 import { fetchPayHistoryForBrain } from '../api/pay';
 import { extractAgentpayRemark } from './agentpay-remark';
 import { getPreferredAgentpayPaymentLinkHandle } from './agentpay-registry';
+import { generateInvoiceNumber } from './invoice-number';
 import { resolvePayee } from './agentpay-payee';
 import {
   parseBatchPaymentsFromMessage,
@@ -434,7 +435,7 @@ async function runTelegramInvoicePreviewFromPrompt(
   const parsed = parseInvoiceRequest(prompt.prompt || '');
   if (!parsed) return { responseText: 'I read the invoice CSV, but could not prepare an invoice preview.' };
   const sessionId = telegramSessionId(wallet.walletAddress);
-  const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+  const invoiceNumber = generateInvoiceNumber();
   await getRedis().set(`invoice:pending:${sessionId}`, JSON.stringify({
     tool: 'create_invoice',
     walletAddress: wallet.walletAddress,

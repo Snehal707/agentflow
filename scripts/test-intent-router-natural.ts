@@ -140,6 +140,21 @@ const CASES: NaturalCase[] = [
     expectedIntents: [AgentFlowIntentName.AgentpayHistory],
   },
   {
+    id: 'split-help-natural',
+    message: 'tell me about split payment',
+    expectedIntents: [AgentFlowIntentName.GeneralChat],
+  },
+  {
+    id: 'split-format-natural',
+    message: 'tell me format of split payment',
+    expectedIntents: [AgentFlowIntentName.GeneralChat],
+  },
+  {
+    id: 'batch-help-natural',
+    message: 'tell me about batch payment',
+    expectedIntents: [AgentFlowIntentName.GeneralChat],
+  },
+  {
     id: 'payment-link-natural',
     message: 'make me a pay link for 8 usdc from alice.arc',
     expectedIntents: [AgentFlowIntentName.AgentpayPaymentLink],

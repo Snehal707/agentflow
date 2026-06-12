@@ -1,21 +1,30 @@
 import { Router } from 'express';
 import { adminDb } from '../db/client';
+import { fetchOnChainReputationByAgentIds } from '../lib/reputation';
+import { CORE_AGENT_SPECS, type CoreAgentSlug } from '../lib/coreAgentSpecs';
+
+export { CORE_AGENT_SPECS };
 
 const router = Router();
 
-type CoreAgentSlug =
-  | 'research'
-  | 'swap'
-  | 'vault'
-  | 'predmarket'
-  | 'bridge'
-  | 'portfolio'
-  | 'invoice'
-  | 'vision'
-  | 'transcribe'
-  | 'schedule'
-  | 'split'
-  | 'batch';
+/**
+ * Overwrites each agent's reputationScore with its true ERC-8004 on-chain aggregate
+ * (keyed by erc8004 token id). Agents with no on-chain feedback get 0.
+ */
+async function applyOnChainReputation(agents: StoreAgent[]): Promise<StoreAgent[]> {
+  const ids = agents
+    .map((a) => a.tokenId)
+    .filter((t): t is string => Boolean(t && String(t).trim()));
+  if (!ids.length) {
+    return agents;
+  }
+  const scores = await fetchOnChainReputationByAgentIds(ids);
+  return agents.map((a) =>
+    a.tokenId && scores[a.tokenId]
+      ? { ...a, reputationScore: scores[a.tokenId].score }
+      : a,
+  );
+}
 
 type StoreAgent = {
   id: string;
@@ -34,114 +43,23 @@ type StoreAgent = {
   agentCardUrl: string | null;
 };
 
-export const CORE_AGENT_SPECS: Array<{
-  slug: CoreAgentSlug;
-  name: string;
-  description: string;
-  category: string;
-  envPriceKey: string;
-  fallbackPrice: number;
-}> = [
-  {
-    slug: 'research',
-    name: 'Research',
-    description: 'Three-stage research pipeline: Research gathers live evidence, Analyst interprets it, and Writer delivers the final report.',
-    category: 'Research',
-    envPriceKey: 'RESEARCH_AGENT_PRICE',
-    fallbackPrice: 0.005,
-  },
-  {
-    slug: 'swap',
-    name: 'Swap',
-    description: 'Quotes and executes live Arc USDC swap flows with guardrails and verification.',
-    category: 'DeFi',
-    envPriceKey: 'SWAP_AGENT_PRICE',
-    fallbackPrice: 0.01,
-  },
-  {
-    slug: 'vault',
-    name: 'Vault',
-    description: 'Multi-protocol yield vaults. Currently: Lunex (testnet, experimental). More providers coming.',
-    category: 'DeFi',
-    envPriceKey: 'VAULT_AGENT_PRICE',
-    fallbackPrice: 0.012,
-  },
-  {
-    slug: 'predmarket',
-    name: 'Prediction Markets',
-    description: 'Multi-protocol prediction markets. Currently: AchMarket (testnet, experimental). LMSR pricing, admin-resolved with public proof. More providers coming.',
-    category: 'DeFi',
-    envPriceKey: 'PREDMARKET_AGENT_PRICE',
-    fallbackPrice: 0.012,
-  },
-  {
-    slug: 'bridge',
-    name: 'Bridge',
-    description: 'Bridges USDC into Arc and streams CCTP progress in real time.',
-    category: 'DeFi',
-    envPriceKey: 'BRIDGE_AGENT_PRICE',
-    fallbackPrice: 0.009,
-  },
-  {
-    slug: 'portfolio',
-    name: 'Portfolio',
-    description: 'Analyzes Arc wallet balances, positions, transfers, and PnL.',
-    category: 'Analytics',
-    envPriceKey: 'PORTFOLIO_AGENT_PRICE',
-    fallbackPrice: 0.015,
-  },
-  {
-    slug: 'invoice',
-    name: 'Invoice',
-    description: 'Automates invoice review, approvals, and business settlement flows.',
-    category: 'Custom',
-    envPriceKey: 'INVOICE_AGENT_PRICE',
-    fallbackPrice: 0.025,
-  },
-  {
-    slug: 'vision',
-    name: 'Vision',
-    description: 'Analyzes screenshots, images, text files, and single-page PDFs with Hermes-first reasoning.',
-    category: 'Perception',
-    envPriceKey: 'VISION_AGENT_PRICE',
-    fallbackPrice: 0.004,
-  },
-  {
-    slug: 'transcribe',
-    name: 'Voice Input',
-    description: 'Converts short voice notes into chat-ready text with guarded daily caps.',
-    category: 'Perception',
-    envPriceKey: 'TRANSCRIBE_AGENT_PRICE',
-    fallbackPrice: 0,
-  },
-  {
-    slug: 'schedule',
-    name: 'Schedule Agent',
-    description:
-      'Creates and manages recurring USDC payments on Arc. Supports daily, weekly, and monthly automated schedules.',
-    category: 'Payments',
-    envPriceKey: 'SCHEDULE_AGENT_PRICE',
-    fallbackPrice: 0.005,
-  },
-  {
-    slug: 'split',
-    name: 'Split Agent',
-    description:
-      'Splits USDC equally between 2-10 recipients in one command. Executes all transfers automatically on Arc.',
-    category: 'Payments',
-    envPriceKey: 'SPLIT_AGENT_PRICE',
-    fallbackPrice: 0.005,
-  },
-  {
-    slug: 'batch',
-    name: 'Batch Agent',
-    description:
-      'Processes bulk USDC payments from CSV. Perfect for payroll, DAO distributions, and team payments up to 500 recipients.',
-    category: 'Payments',
-    envPriceKey: 'BATCH_AGENT_PRICE',
-    fallbackPrice: 0.01,
-  },
-];
+type AgentStatsResponse = {
+  agent: StoreAgent;
+  stats: {
+    completedTasks: number;
+    totalRuns: number;
+    successRate: number;
+    nanopaymentCount: number;
+    nanopaymentVolumeUsdc: number;
+    rating: number;
+    priceLabel: string;
+    scopeLabel: string;
+  };
+};
+
+// CORE_AGENT_SPECS now lives in lib/coreAgentSpecs.ts (a pure, side-effect-free
+// module) so guards/scripts can import it without booting Supabase/Redis.
+// It is imported and re-exported at the top of this file.
 
 router.get('/agents', async (_req, res) => {
   try {
@@ -150,8 +68,9 @@ router.get('/agents', async (_req, res) => {
       fetchPublishedAgents(),
     ]);
 
+    const merged = mergeStoreAgents(systemAgents, publishedAgents);
     return res.json({
-      agents: mergeStoreAgents(systemAgents, publishedAgents),
+      agents: await applyOnChainReputation(merged),
     });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message ?? 'agent store list failed' });
@@ -169,7 +88,9 @@ router.get('/agent/:slug', async (req, res) => {
       fetchSystemAgents(),
       fetchPublishedAgents(),
     ]);
-    const mergedAgents = mergeStoreAgents(systemAgents, publishedAgents);
+    const mergedAgents = await applyOnChainReputation(
+      mergeStoreAgents(systemAgents, publishedAgents),
+    );
 
     const agent =
       mergedAgents.find((item) => item.slug === raw || item.id === raw);
@@ -181,6 +102,85 @@ router.get('/agent/:slug', async (req, res) => {
     return res.json({ agent });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message ?? 'agent lookup failed' });
+  }
+});
+
+router.get('/agent/:slug/stats', async (req, res) => {
+  try {
+    const raw = String(req.params.slug ?? '').trim().toLowerCase();
+    if (!raw) {
+      return res.status(400).json({ error: 'slug required' });
+    }
+
+    const [systemAgents, publishedAgents] = await Promise.all([
+      fetchSystemAgents(),
+      fetchPublishedAgents(),
+    ]);
+    const mergedAgents = await applyOnChainReputation(
+      mergeStoreAgents(systemAgents, publishedAgents),
+    );
+    const agent = mergedAgents.find((item) => item.slug === raw || item.id === raw);
+
+    if (!agent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    const scopedSlugs = raw === 'research' ? ['research', 'analyst', 'writer'] : [raw];
+
+    // Run stats come from the economy ledger — every paid execution where this agent
+    // is the seller (user-paid + agent-to-agent). agent_interactions is swap-only, so
+    // it cannot be used for cross-agent run counts. Use exact counts (head:true) so
+    // high-volume agents aren't capped at the 1000-row fetch limit.
+    const [totalRunsRes, completedRes, volumeRes] = await Promise.all([
+      adminDb
+        .from('agent_economy_ledger')
+        .select('*', { count: 'exact', head: true })
+        .in('seller_agent', scopedSlugs),
+      adminDb
+        .from('agent_economy_ledger')
+        .select('*', { count: 'exact', head: true })
+        .in('seller_agent', scopedSlugs)
+        .eq('status', 'complete'),
+      adminDb
+        .from('agent_economy_ledger')
+        .select('amount')
+        .in('seller_agent', scopedSlugs),
+    ]);
+
+    for (const r of [totalRunsRes, completedRes, volumeRes]) {
+      if (r.error) {
+        throw new Error(r.error.message);
+      }
+    }
+
+    const totalRuns = totalRunsRes.count ?? 0;
+    const completedTasks = completedRes.count ?? 0;
+    const successRate = totalRuns > 0 ? Number(((completedTasks / totalRuns) * 100).toFixed(2)) : 0;
+    const nanopaymentCount = totalRuns;
+    const nanopaymentVolumeUsdc = Number(
+      (volumeRes.data ?? [])
+        .reduce((sum, row) => {
+          const amount = Number(row.amount ?? 0);
+          return sum + (Number.isFinite(amount) ? amount : 0);
+        }, 0)
+        .toFixed(3),
+    );
+
+    return res.json({
+      agent,
+      stats: {
+        completedTasks,
+        totalRuns,
+        successRate,
+        nanopaymentCount,
+        nanopaymentVolumeUsdc,
+        rating: Number((agent.reputationScore / 20).toFixed(1)),
+        priceLabel: raw === 'research' ? 'Pipeline total' : 'Per run',
+        scopeLabel: raw === 'research' ? 'Research + Analyst + Writer' : 'Single agent',
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message ?? 'agent stats lookup failed' });
   }
 });
 
@@ -298,7 +298,7 @@ async function fetchSystemAgents(): Promise<StoreAgent[]> {
       name: spec.name,
       description: spec.description,
       category: spec.category,
-      priceUsdc: spec.slug === 'transcribe' ? 0 : parseUsdcPrice(spec.envPriceKey, spec.fallbackPrice),
+      priceUsdc: resolveSystemAgentPrice(spec),
       reputationScore: scores[spec.slug] ?? 0,
       status: available ? 'live' : 'unavailable',
       available,
@@ -412,6 +412,24 @@ function parseUsdcPrice(envKey: string, fallback: number): number {
   return Number.isFinite(candidate) ? candidate : fallback;
 }
 
+function resolveSystemAgentPrice(
+  spec: (typeof CORE_AGENT_SPECS)[number],
+): number | null {
+  if (spec.slug === 'transcribe') {
+    return 0;
+  }
+
+  if (spec.slug === 'research') {
+    return [
+      parseUsdcPrice('RESEARCH_AGENT_PRICE', 0.005),
+      parseUsdcPrice('ANALYST_AGENT_PRICE', 0.003),
+      parseUsdcPrice('WRITER_AGENT_PRICE', 0.008),
+    ].reduce((sum, value) => sum + value, 0);
+  }
+
+  return parseUsdcPrice(spec.envPriceKey, spec.fallbackPrice);
+}
+
 function resolveHealthUrl(slug: CoreAgentSlug): string {
   switch (slug) {
     case 'research':
@@ -521,7 +539,7 @@ async function buildLeaderboard(): Promise<LeaderboardRow[]> {
     throw new Error(txRes.error.message);
   }
 
-  const agents = [...systemAgents, ...publishedAgents];
+  const agents = await applyOnChainReputation([...systemAgents, ...publishedAgents]);
   const metadataBySlug = new Map(
     agents.map((agent) => [
       agent.slug,

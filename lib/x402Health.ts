@@ -11,26 +11,38 @@ function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/, '');
 }
 
+function bridgeFinalizeHealthPath(pathname: string): string | null {
+  return /\/bridge\/finalize$/i.test(pathname) ? '/health' : null;
+}
+
 export function deriveHealthUrlFromRunUrl(runUrl: string): string {
   const trimmed = runUrl.trim();
   try {
     const url = new URL(trimmed);
     const pathname = url.pathname.replace(/\/+$/, '');
+    const bridgeHealthPath = bridgeFinalizeHealthPath(pathname);
     const confirmIndex = pathname.indexOf('/confirm/');
-    url.pathname = confirmIndex >= 0
+    const terminalMatch = pathname.match(/^(.*)\/(?:run|finalize)$/);
+    url.pathname = bridgeHealthPath
+      ? bridgeHealthPath
+      : confirmIndex >= 0
       ? `${pathname.slice(0, confirmIndex) || ''}/health`
-      : pathname.endsWith('/run')
-      ? `${pathname.slice(0, -4) || ''}/health`
+      : terminalMatch
+      ? `${terminalMatch[1] || ''}/health`
       : `${pathname || ''}/health`;
     url.search = '';
     return url.toString();
   } catch {
     const normalized = normalizeBaseUrl(trimmed);
+    const bridgeHealthPath = bridgeFinalizeHealthPath(normalized);
     const confirmIndex = normalized.indexOf('/confirm/');
-    return confirmIndex >= 0
+    const terminalMatch = normalized.match(/^(.*)\/(?:run|finalize)$/);
+    return bridgeHealthPath
+      ? bridgeHealthPath
+      : confirmIndex >= 0
       ? `${normalized.slice(0, confirmIndex) || ''}/health`
-      : normalized.endsWith('/run')
-      ? `${normalized.slice(0, -4) || ''}/health`
+      : terminalMatch
+      ? `${terminalMatch[1] || ''}/health`
       : `${normalized}/health`;
   }
 }

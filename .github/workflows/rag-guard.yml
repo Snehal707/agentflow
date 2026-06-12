@@ -1,0 +1,34 @@
+name: RAG accuracy guard
+
+# Fails the build if the product knowledge base (lib/product-rag.ts) drifts from
+# the code constants it documents — agent prices, bridge source chains, and usage
+# caps. Pure check: no secrets / no network required.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lib/product-rag.ts"
+      - "lib/coreAgentSpecs.ts"
+      - "lib/bridge/supportedSources.ts"
+      - "lib/usageLimits.ts"
+      - "scripts/check-rag-accuracy.ts"
+  pull_request:
+    paths:
+      - "lib/product-rag.ts"
+      - "lib/coreAgentSpecs.ts"
+      - "lib/bridge/supportedSources.ts"
+      - "lib/usageLimits.ts"
+      - "scripts/check-rag-accuracy.ts"
+
+jobs:
+  rag-accuracy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run check:rag-accuracy

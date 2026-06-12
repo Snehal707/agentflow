@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useState } from "react";
 import { useAccount } from "wagmi";
 import { useConnectModal } from "@rainbow-me/rainbowkit";
@@ -19,6 +20,7 @@ import {
   combinedPortfolioMetrics,
   mergeCombinedHoldings,
   mergeCombinedPositions,
+  pnlSummaryExcludingGateway,
 } from "@/lib/portfolioMetrics";
 import {
   loadVaultHoldingCards,
@@ -102,24 +104,54 @@ function sparkSeries(
 
 const TOKEN_LINE_COLORS: Record<string, string> = {
   USDC: "#f2ca50", // Gold
-  EURC: "#ffffff", // White
+  EURC: "#6fd6ff", // Ice blue
   AFVUSDC: "#d8ad27", // Golden variant
 };
 
 function strokeForIndex(index: number): string {
-  const isAlt = index % 2 === 0;
-  if (isAlt) {
-    const hue = 42 + (index % 4) * 4;
-    return `hsla(${hue}, 82%, 62%, 0.8)`;
-  } else {
-    return `rgba(255, 255, 255, 0.75)`;
-  }
+  const palette = [
+    "#f2ca50",
+    "#6fd6ff",
+    "#ff8f6b",
+    "#8ce38b",
+    "#d8ad27",
+    "#c38bff",
+  ];
+  return palette[index % palette.length];
 }
 
 function strokeForHolding(symbol: string | undefined, index: number): string {
   if (!symbol) return strokeForIndex(index);
   const key = symbol.toUpperCase();
   return TOKEN_LINE_COLORS[key] ?? strokeForIndex(index);
+}
+
+function tokenIconSrc(symbol: string | undefined): string | null {
+  if (!symbol) {
+    return null;
+  }
+
+  const key = symbol.toUpperCase();
+  if (key.includes("EURC")) {
+    return "/media-kit/tokens/eurc.svg";
+  }
+  if (key.includes("USDC")) {
+    return "/media-kit/tokens/usdc.svg";
+  }
+  return null;
+}
+
+function SummaryValue({ value, highlightCurrency = false }: { value: string; highlightCurrency?: boolean }) {
+  if (!highlightCurrency || !value.startsWith("$")) {
+    return <>{value}</>;
+  }
+
+  return (
+    <>
+      <span className="text-[#f2ca50]">$</span>
+      {value.slice(1)}
+    </>
+  );
 }
 
 function MetricCard({
@@ -333,6 +365,7 @@ export default function PortfolioPage() {
     (position) => (position.kind as string) === "prediction_market",
   );
   const pnlMetrics = combinedPortfolioMetrics(walletSnapshot, executionSnapshot);
+  const heroPnlMetrics = pnlSummaryExcludingGateway(executionSnapshot);
   const dcwHoldingRows = dcwHoldings.slice(0, 6);
   const summaryCards = [
     {
@@ -370,11 +403,7 @@ export default function PortfolioPage() {
 
       <div className="flex flex-1 flex-col overflow-hidden">
         <header className="sticky top-0 z-40 flex items-center justify-between border-b border-white/5 bg-[#070707]/92 px-8 py-5 backdrop-blur-md xl:px-10">
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] font-black uppercase tracking-[0.25em] text-[#f2ca50]">DApp</span>
-            <span className="text-[10px] font-bold text-white/20">/</span>
-            <span className="text-[10px] font-black uppercase tracking-[0.25em] text-white/80">Portfolio</span>
-          </div>
+          <div />
           <SessionStatusChip
             address={address}
             isAuthenticated={isAuthenticated}
@@ -398,11 +427,8 @@ export default function PortfolioPage() {
             {/* Title Block */}
             <div className="mb-6 flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
               <div>
-                <p className="mb-2 text-[9px] font-black uppercase tracking-[0.38em] text-white/30">
-                  Wallet / Portfolio
-                </p>
-                <h1 className="font-headline text-[clamp(2.5rem,5vw,4rem)] font-black italic leading-[0.92] tracking-[-0.04em] text-white">
-                  PORT<span className="text-[#f2ca50]">FOLIO</span>
+                <h1 className="font-headline text-[clamp(2.5rem,5vw,4rem)] font-black leading-[0.9] tracking-[-0.055em] text-white">
+                  Port<span className="text-[#f2ca50]">Folio</span>
                 </h1>
               </div>
             </div>
@@ -418,14 +444,14 @@ export default function PortfolioPage() {
                   </div>
                   <div className="mt-3 flex flex-wrap items-center gap-3">
                     <h2 className="font-headline text-[clamp(1.8rem,3vw,2.8rem)] font-black text-white leading-none">
-                    {snapshotLoading ? "..." : formatUsd(pnlMetrics.totalValueUsd)}
+                    {snapshotLoading ? "..." : formatUsd(heroPnlMetrics.currentValueUsd)}
                     </h2>
                     <span className={`text-[11px] font-black uppercase tracking-[0.12em] px-3 py-1 rounded-full border ${
-                      pnlMetrics.netPnlUsd >= 0
+                      heroPnlMetrics.pnlUsd >= 0
                         ? 'text-[#f2ca50] border-[#f2ca50]/20 bg-[#f2ca50]/5'
                         : 'text-white/60 border-white/10 bg-white/5'
                     }`}>
-                      {snapshotLoading ? "..." : `${formatSignedUsd(pnlMetrics.netPnlUsd)} (${formatPct(pnlMetrics.pnlPct)})`}
+                      {snapshotLoading ? "..." : `${formatSignedUsd(heroPnlMetrics.pnlUsd)} (${formatPct(heroPnlMetrics.pnlPct)})`}
                     </span>
                   </div>
                 </div>
@@ -468,7 +494,7 @@ export default function PortfolioPage() {
                             className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border ${
                               card.accent
                                 ? "border-[#f2ca50]/25 bg-[#f2ca50]/10 text-[#f2ca50]"
-                                : "border-white/10 bg-white/[0.03] text-white/80"
+                                : "border-[#f2ca50]/18 bg-[#f2ca50]/[0.07] text-[#f2ca50]"
                             }`}
                           >
                             <span className="material-symbols-outlined text-[20px] leading-none">{card.icon}</span>
@@ -485,10 +511,13 @@ export default function PortfolioPage() {
                     <div className="mt-7 flex items-end justify-between gap-4">
                       <p
                         className={`min-w-0 truncate text-[clamp(1.55rem,1.9vw,2.15rem)] font-semibold leading-none tracking-[-0.035em] tabular-nums ${
-                          card.accent ? "text-[#f2ca50]" : "text-white"
+                          card.accent || card.key === "vault" || card.key === "gateway" ? "text-[#f2ca50]" : "text-white"
                         }`}
                       >
-                        {card.value}
+                        <SummaryValue
+                          value={card.value}
+                          highlightCurrency={card.key === "vault" || card.key === "gateway"}
+                        />
                       </p>
                       <span
                         className={`shrink-0 rounded-full border px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.2em] ${
@@ -602,6 +631,7 @@ export default function PortfolioPage() {
                       const pct = shareDenom > 0 ? Math.max(1, Math.round((usd / shareDenom) * 100)) : 0;
                       const stroke = strokeForHolding(holding.symbol, index);
                       const series = sparkSeries(holding.id, 28, 28, amp);
+                      const iconSrc = tokenIconSrc(holding.symbol);
 
                       return (
                         <div
@@ -610,9 +640,21 @@ export default function PortfolioPage() {
                         >
                           {/* Col 1: Asset */}
                           <div className="col-span-3 flex items-center gap-3">
-                            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[#f2ca50]/20 bg-gradient-to-b from-white/[0.08] to-transparent text-[10px] font-black text-[#f2ca50] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
-                              {holding.symbol.substring(0, 2).toUpperCase()}
-                            </div>
+                            {iconSrc ? (
+                              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full ring-1 ring-white/10">
+                                <Image
+                                  src={iconSrc}
+                                  alt={`${holding.symbol} token icon`}
+                                  width={32}
+                                  height={32}
+                                  className="h-8 w-8 rounded-full"
+                                />
+                              </div>
+                            ) : (
+                              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[#f2ca50]/20 bg-gradient-to-b from-white/[0.08] to-transparent text-[10px] font-black text-[#f2ca50] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+                                {holding.symbol.substring(0, 2).toUpperCase()}
+                              </div>
+                            )}
                             <div className="truncate">
                               <p className="text-sm font-semibold text-white leading-none truncate">{holding.symbol}</p>
                               <p className="text-[10px] text-white/35 mt-1 font-medium truncate">{holding.name}</p>

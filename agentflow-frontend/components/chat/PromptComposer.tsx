@@ -212,9 +212,9 @@ export function PromptComposer({
   const valueRef = useRef(value);
   valueRef.current = value;
   const canSend = canSubmit ?? Boolean(value.trim());
-  const composerHeightClass = isHero ? "min-h-[104px]" : "min-h-[82px]";
-  const textareaHeightClass = isHero ? "h-12" : "h-[62px]";
-  const textareaPaddingClass = isHero ? "py-3" : "py-4";
+  const composerHeightClass = isHero ? "min-h-[96px]" : "min-h-[88px]";
+  const textareaHeightClass = isHero ? "h-9" : "h-[44px]";
+  const textareaPaddingClass = "py-1.5";
   const composerWidthClass = isHero ? "max-w-[1064px]" : "max-w-5xl";
 
   const refreshAudioInputDevices = useCallback(async () => {
@@ -561,176 +561,178 @@ export function PromptComposer({
         onChange={handleAttachmentSelect}
       />
       <div
-        className={`relative mx-auto w-full ${composerWidthClass} overflow-visible rounded-[22px] border border-white/10 bg-[linear-gradient(180deg,rgba(35,35,33,0.96),rgba(20,20,19,0.98))] px-3 py-2 shadow-[0_28px_80px_-28px_rgba(0,0,0,0.95),inset_0_1px_0_rgba(255,255,255,0.07)] ring-1 ring-[#f2ca50]/10 transition-colors focus-within:border-[#f2ca50]/35 focus-within:ring-[#f2ca50]/25 ${composerHeightClass}`}
+        className={`relative mx-auto w-full ${composerWidthClass} overflow-visible rounded-[22px] border border-white/10 bg-neutral-900/60 backdrop-blur-xl px-4 pt-2.5 pb-2 shadow-[0_28px_80px_-28px_rgba(0,0,0,0.95),inset_0_1px_0_rgba(255,255,255,0.07)] ring-1 ring-[#f2ca50]/10 transition-all duration-300 ease-out focus-within:border-[#f2ca50]/35 focus-within:ring-2 focus-within:ring-[#f2ca50]/15 focus-within:shadow-[0_0_50px_-12px_rgba(242,202,80,0.18),0_28px_80px_-28px_rgba(0,0,0,0.95)] ${composerHeightClass}`}
       >
-        <div className="flex min-w-0 items-center gap-2">
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isStreaming || isTranscribing || isExtractingAttachment}
-            className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.03] text-white/45 transition hover:border-[#f2ca50]/35 hover:bg-[#f2ca50]/10 hover:text-[#f2ca50] disabled:cursor-not-allowed disabled:opacity-50 sm:h-11 sm:w-11"
-            aria-label="Attach context"
-          >
-            <span className="material-symbols-outlined text-[21px]">attach_file</span>
-          </button>
-
+        <div className="flex flex-col gap-1.5">
           <textarea
             ref={textareaRef}
             value={value}
             onChange={(event) => onChange(event.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={placeholder}
-            className={`min-w-0 flex-1 self-center resize-none bg-transparent px-1 text-sm leading-6 text-white/90 outline-none placeholder:text-white/30 sm:px-2 sm:text-[15px] ${textareaHeightClass} ${textareaPaddingClass}`}
+            className={`min-w-0 w-full resize-none bg-transparent px-1 text-sm leading-6 text-white/90 outline-none placeholder:text-white/30 sm:px-2 sm:text-[15px] ${textareaHeightClass} ${textareaPaddingClass}`}
           />
 
-          <div className="flex flex-shrink-0 flex-col items-end gap-1 self-center">
-            <div className="flex items-center gap-1.5 rounded-full border border-white/10 bg-black/20 p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-              <div ref={micMenuRef} className="relative flex items-center">
-                <button
-                  type="button"
-                  onClick={toggleMic}
-                  disabled={micBusy}
-                  aria-label={micLabel}
-                  aria-pressed={isRecording}
-                  className={`flex h-8 w-8 items-center justify-center rounded-full transition-colors disabled:opacity-50 sm:h-9 sm:w-9 ${
-                    isRecording
-                      ? "text-[#ff6b6b]"
-                      : isTranscribing
-                        ? "text-[#f2ca50]"
-                        : "text-white/40 hover:text-[#f2ca50]"
-                  }`}
-                >
-                  <span className={`material-symbols-outlined ${isTranscribing ? "animate-pulse" : ""}`}>
-                    mic
+          {pendingAttachment ? (
+            <div className="mt-1 flex items-center gap-3 rounded-xl border border-white/10 bg-[#201f1f]/80 px-3 py-2">
+              {pendingAttachment.kind === "image" && pendingAttachment.previewUrl ? (
+                <Image
+                  src={pendingAttachment.previewUrl}
+                  alt={pendingAttachment.name}
+                  className="h-12 w-12 rounded-xl object-cover"
+                  width={48}
+                  height={48}
+                  unoptimized
+                />
+              ) : (
+                <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-[#2a2a2a]">
+                  <span className="material-symbols-outlined text-[#f2ca50]">
+                    {pendingAttachment.kind === "pdf" ? "picture_as_pdf" : "description"}
                   </span>
-                </button>
-                {showMicTools ? (
-                  <button
-                    type="button"
-                    onClick={() => setIsMicMenuOpen((open) => !open)}
-                    aria-label="Choose microphone"
-                    aria-expanded={isMicMenuOpen}
-                    className="flex h-8 w-6 items-center justify-center rounded-full text-white/40 transition hover:bg-white/5 hover:text-[#f2ca50] sm:h-9 sm:w-7"
-                  >
-                    <span className="material-symbols-outlined text-[14px]">expand_more</span>
-                  </button>
-                ) : null}
-                {isMicMenuOpen ? (
-                  <div
-                    className="absolute bottom-full right-0 z-20 mb-2 w-72 rounded-xl border border-white/10 bg-[#1c1b1b] p-2 text-xs shadow-[0_18px_40px_rgba(0,0,0,0.55)]"
-                    role="menu"
-                  >
-                    <div className="flex items-center justify-between px-2 pt-1 pb-2 text-[10px] uppercase tracking-wider text-white/40">
-                      <span>Input device</span>
-                      <span>{currentMicLabel}</span>
-                    </div>
-                    <div className="flex items-center gap-1 px-2 pb-2">
-                      {meterBars.map((threshold, index) => (
-                        <span
-                          key={index}
-                          className={`h-1.5 flex-1 rounded-full transition-colors ${
-                            micLevel >= threshold ? "bg-[#f2ca50]" : "bg-white/10"
-                          }`}
-                        />
-                      ))}
-                    </div>
-                    <div className="max-h-56 overflow-y-auto">
-                      {audioInputDevices.length === 0 ? (
-                        <div className="px-2 py-3 text-center text-white/40">
-                          No microphones detected.
-                        </div>
-                      ) : (
-                        audioInputDevices.map((device, index) => {
-                          const label = formatMicLabel(device.label) || `Microphone ${index + 1}`;
-                          const isActive = device.deviceId === selectedMicId;
-                          return (
-                            <button
-                              key={device.deviceId || `${index}-${label}`}
-                              type="button"
-                              onClick={() => {
-                                setSelectedMicId(device.deviceId);
-                                setIsMicMenuOpen(false);
-                              }}
-                              className={`flex w-full items-center justify-between rounded-lg px-2 py-2 text-left transition-colors ${
-                                isActive
-                                  ? "bg-[#2a2622] text-[#f2ca50]"
-                                  : "text-white/80 hover:bg-white/5"
-                              }`}
-                            >
-                              <span className="truncate pr-2">{label}</span>
-                              {isActive ? (
-                                <span className="material-symbols-outlined text-[16px]">check</span>
-                              ) : null}
-                            </button>
-                          );
-                        })
-                      )}
-                    </div>
-                  </div>
-                ) : null}
+                </div>
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-medium text-white/90">
+                  {pendingAttachment.name}
+                </div>
+                <div className="text-xs text-white/40">
+                  {pendingAttachment.kind.toUpperCase()} ·{" "}
+                  {formatAttachmentSize(pendingAttachment.size)}
+                </div>
               </div>
               <button
-                type="submit"
-                disabled={isStreaming || !canSend}
-                className="flex h-10 w-10 items-center justify-center rounded-full bg-[#b99a2f] text-[#211800] shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_8px_18px_rgba(185,154,47,0.18)] transition hover:brightness-110 active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-80 sm:h-11 sm:w-11"
-                aria-label={isStreaming ? "Running" : "Send"}
+                type="button"
+                onClick={() => {
+                  setAttachmentStatus(null);
+                  setAttachmentError(null);
+                  onClearAttachment?.();
+                }}
+                className="rounded-lg p-1.5 text-white/40 transition hover:bg-[#2a2a2a] hover:text-white/90"
+                aria-label="Remove attachment"
               >
-                <span className="material-symbols-outlined text-[23px]">arrow_upward</span>
+                <span className="material-symbols-outlined text-[18px]">close</span>
               </button>
             </div>
-            {voiceError ? (
-              <p className="max-w-[220px] text-right text-[10px] leading-snug text-[#ff6b6b]" role="alert">
-                {voiceError}
-              </p>
-            ) : voiceStatus ? (
-              <p className="max-w-[260px] text-right text-[10px] leading-snug text-[#f2ca50]" role="status">
-                {voiceStatus}
-              </p>
-            ) : null}
-          </div>
-        </div>
+          ) : null}
 
-        {pendingAttachment ? (
-          <div className="mt-2 flex items-center gap-3 rounded-xl border border-white/10 bg-[#201f1f] px-3 py-2">
-            {pendingAttachment.kind === "image" && pendingAttachment.previewUrl ? (
-              <Image
-                src={pendingAttachment.previewUrl}
-                alt={pendingAttachment.name}
-                className="h-12 w-12 rounded-xl object-cover"
-                width={48}
-                height={48}
-                unoptimized
-              />
-            ) : (
-              <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-[#2a2a2a]">
-                <span className="material-symbols-outlined text-[#f2ca50]">
-                  {pendingAttachment.kind === "pdf" ? "picture_as_pdf" : "description"}
-                </span>
-              </div>
-            )}
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-medium text-white/90">
-                {pendingAttachment.name}
-              </div>
-              <div className="text-xs text-white/40">
-                {pendingAttachment.kind.toUpperCase()} ·{" "}
-                {formatAttachmentSize(pendingAttachment.size)}
-              </div>
-            </div>
+          <div className="flex items-center justify-between pt-2">
             <button
               type="button"
-              onClick={() => {
-                setAttachmentStatus(null);
-                setAttachmentError(null);
-                onClearAttachment?.();
-              }}
-              className="rounded-lg p-1.5 text-white/40 transition hover:bg-[#2a2a2a] hover:text-white/90"
-              aria-label="Remove attachment"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isStreaming || isTranscribing || isExtractingAttachment}
+              className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.03] text-white/45 transition-all duration-200 hover:scale-[1.04] hover:border-[#f2ca50]/30 hover:bg-[#f2ca50]/8 hover:text-[#f2ca50] active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-50"
+              aria-label="Attach context"
             >
-              <span className="material-symbols-outlined text-[18px]">close</span>
+              <span className="material-symbols-outlined text-[20px]">attach_file</span>
             </button>
+
+            <div className="flex flex-shrink-0 flex-col items-end gap-1">
+              <div className="flex items-center gap-1.5 rounded-full border border-white/10 bg-black/40 p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+                <div ref={micMenuRef} className="relative flex items-center">
+                  <button
+                    type="button"
+                    onClick={toggleMic}
+                    disabled={micBusy}
+                    aria-label={micLabel}
+                    aria-pressed={isRecording}
+                    className={`flex h-8 w-8 items-center justify-center rounded-full transition-colors disabled:opacity-50 sm:h-9 sm:w-9 ${
+                      isRecording
+                        ? "text-[#ff6b6b]"
+                        : isTranscribing
+                          ? "text-[#f2ca50]"
+                          : "text-white/40 hover:text-[#f2ca50]"
+                    }`}
+                  >
+                    <span className={`material-symbols-outlined ${isTranscribing ? "animate-pulse" : ""}`}>
+                      mic
+                    </span>
+                  </button>
+                  {showMicTools ? (
+                    <button
+                      type="button"
+                      onClick={() => setIsMicMenuOpen((open) => !open)}
+                      aria-label="Choose microphone"
+                      aria-expanded={isMicMenuOpen}
+                      className="flex h-8 w-6 items-center justify-center rounded-full text-white/40 transition hover:bg-white/5 hover:text-[#f2ca50] sm:h-9 sm:w-7"
+                    >
+                      <span className="material-symbols-outlined text-[14px]">expand_more</span>
+                    </button>
+                  ) : null}
+                  {isMicMenuOpen ? (
+                    <div
+                      className="absolute bottom-full right-0 z-20 mb-2 w-72 rounded-xl border border-white/10 bg-[#1c1b1b] p-2 text-xs shadow-[0_18px_40px_rgba(0,0,0,0.55)]"
+                      role="menu"
+                    >
+                      <div className="flex items-center justify-between px-2 pt-1 pb-2 text-[10px] uppercase tracking-wider text-white/40">
+                        <span>Input device</span>
+                        <span>{currentMicLabel}</span>
+                      </div>
+                      <div className="flex items-center gap-1 px-2 pb-2">
+                        {meterBars.map((threshold, index) => (
+                          <span
+                            key={index}
+                            className={`h-1.5 flex-1 rounded-full transition-colors ${
+                              micLevel >= threshold ? "bg-[#f2ca50]" : "bg-white/10"
+                            }`}
+                          />
+                        ))}
+                      </div>
+                      <div className="max-h-56 overflow-y-auto">
+                        {audioInputDevices.length === 0 ? (
+                          <div className="px-2 py-3 text-center text-white/40">
+                            No microphones detected.
+                          </div>
+                        ) : (
+                          audioInputDevices.map((device, index) => {
+                            const label = formatMicLabel(device.label) || `Microphone ${index + 1}`;
+                            const isActive = device.deviceId === selectedMicId;
+                            return (
+                              <button
+                                key={device.deviceId || `${index}-${label}`}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedMicId(device.deviceId);
+                                  setIsMicMenuOpen(false);
+                                }}
+                                className={`flex w-full items-center justify-between rounded-lg px-2 py-2 text-left transition-colors ${
+                                  isActive
+                                    ? "bg-[#2a2622] text-[#f2ca50]"
+                                    : "text-white/80 hover:bg-white/5"
+                                }`}
+                              >
+                                <span className="truncate pr-2">{label}</span>
+                                {isActive ? (
+                                  <span className="material-symbols-outlined text-[16px]">check</span>
+                                ) : null}
+                              </button>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+                <button
+                  type="submit"
+                  disabled={isStreaming || !canSend}
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-[#f2ca50] to-[#b99a2f] hover:from-[#f5d468] hover:to-[#c6a536] text-[#211800] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_8px_20px_rgba(242,202,80,0.16)] transition-all duration-200 hover:scale-[1.04] active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-80 sm:h-9 sm:w-9"
+                  aria-label={isStreaming ? "Running" : "Send"}
+                >
+                  <span className="material-symbols-outlined text-[18px]">arrow_upward</span>
+                </button>
+              </div>
+              {voiceError ? (
+                <p className="max-w-[220px] text-right text-[10px] leading-snug text-[#ff6b6b]" role="alert">
+                  {voiceError}
+                </p>
+              ) : voiceStatus ? (
+                <p className="max-w-[260px] text-right text-[10px] leading-snug text-[#f2ca50]" role="status">
+                  {voiceStatus}
+                </p>
+              ) : null}
+            </div>
           </div>
-        ) : null}
+        </div>
       </div>
 
       {attachmentError ? (
@@ -748,7 +750,6 @@ export function PromptComposer({
           {voicePaymentLabel}
         </div>
       ) : null}
-
     </form>
   );
 }

@@ -1,14 +1,18 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { useAccount } from "wagmi";
+import { useAccount, useWalletClient } from "wagmi";
 import { useConnectModal } from "@rainbow-me/rainbowkit";
 import { QRCodeSVG } from "qrcode.react";
+import type { Address } from "viem";
+import type { LiveChatMessage } from "@/components/chat/types";
+import { ARC_CHAIN_ID } from "@/lib/arcChain";
 import { useAgentJwt } from "@/lib/hooks/useAgentJwt";
 import {
+  postPayRequest,
   deleteScheduledPayment,
-  exportAgentPayWorkbook,
   fetchArcNameAvailability,
   fetchMyArcName,
   fetchPayContext,
@@ -21,7 +25,6 @@ import {
   postArcNameRenew,
   postPayApprove,
   postPayDecline,
-  postPayRequest,
   postPaySend,
   putArcNameDcw,
   type PayContextResponse,
@@ -30,13 +33,22 @@ import {
   type ScheduledPaymentRow,
   type WalletBalanceResponse,
 } from "@/lib/liveProductClient";
+import { createBrowserX402RequestId, payProtectedResource } from "@/lib/x402BrowserClient";
 import { shortenAddress } from "@/lib/appData";
 import { formatServerDate, formatServerDateTime, parseServerDate } from "@/lib/dateUtils";
 import { AppSidebar } from "@/components/app/AppSidebar";
 import { SessionStatusChip } from "@/components/app/SessionStatusChip";
 import { useSidebarPreference } from "@/lib/useSidebarPreference";
 
-type TabId = "send" | "receive" | "requests" | "history" | "scheduled" | "invoices" | "batch";
+type TabId = "send" | "receive" | "requests" | "history" | "scheduled" | "invoices" | "batch" | "split";
+
+const ChatPaymentPanel = dynamic(
+  () => import("@/components/chat/ChatPaymentPanel").then((mod) => mod.ChatPaymentPanel),
+  { ssr: false },
+);
+
+const SPLIT_PRICE_LABEL = "$0.005";
+const BATCH_PRICE_LABEL = "$0.010";
 
 function formatUsd(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "$0.00";
@@ -48,10 +60,19 @@ function formatUsd(value: number | null | undefined): string {
   }).format(value);
 }
 
+function escapeCsvCell(value: unknown): string {
+  const text = String(value ?? "");
+  if (/[",\n]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
 export default function AgentPayPage() {
   const router = useRouter();
   const { isCollapsed, toggleSidebar } = useSidebarPreference();
   const { address } = useAccount();
+  const { data: walletClient } = useWalletClient();
   const { openConnectModal } = useConnectModal();
   const {
     isAuthenticated,
@@ -63,6 +84,8 @@ export default function AgentPayPage() {
 
   const [tab, setTab] = useState<TabId>("send");
   const [payContext, setPayContext] = useState<PayContextResponse | null>(null);
+  const [paymentRailOpen, setPaymentRailOpen] = useState(false);
+  const [paymentEntries, setPaymentEntries] = useState<NonNullable<LiveChatMessage["paymentMeta"]>["entries"]>([]);
 
   const [toAddress, setToAddress] = useState("");
   const [amount, setAmount] = useState("");
@@ -108,6 +131,11 @@ export default function AgentPayPage() {
   const [receivedInvoices, setReceivedInvoices] = useState<any[]>([]);
   const [invoiceLoading, setInvoiceLoading] = useState(false);
   const [payingRequestId, setPayingRequestId] = useState<string | null>(null);
+  const [requestActionId, setRequestActionId] = useState<string | null>(null);
+  const [requestActionKind, setRequestActionKind] = useState<"approve" | "decline" | null>(null);
+  // Requests the user just approved/declined. Kept so background refreshes that
+  // fire before the backend settles can't resurrect a row the user already acted on.
+  const dismissedRequestIdsRef = useRef<Set<string>>(new Set());
 
   // Batch tab state
   const batchFileInputRef = useRef<HTMLInputElement>(null);
@@ -117,6 +145,47 @@ export default function AgentPayPage() {
   const [batchExecuting, setBatchExecuting] = useState(false);
   const [batchResult, setBatchResult] = useState<any>(null);
   const [batchError, setBatchError] = useState<string | null>(null);
+
+  // Split tab state
+  const [splitRecipientsText, setSplitRecipientsText] = useState("");
+  const [splitTotalAmount, setSplitTotalAmount] = useState("");
+  const [splitRemark, setSplitRemark] = useState("");
+  const [splitPreview, setSplitPreview] = useState<any>(null);
+  const [splitLoading, setSplitLoading] = useState(false);
+  const [splitExecuting, setSplitExecuting] = useState(false);
+  const [splitResult, setSplitResult] = useState<any>(null);
+  const [splitError, setSplitError] = useState<string | null>(null);
+  const [splitReceiptRemark, setSplitReceiptRemark] = useState<string | null>(null);
+
+  const paymentRailMessage: LiveChatMessage | null = paymentEntries.length
+    ? {
+        id: "agentpay-payment-rail",
+        role: "assistant",
+        content: "",
+        paymentMeta: { entries: paymentEntries },
+      }
+    : null;
+
+  const addPaymentEntry = useCallback(
+    (entry: NonNullable<LiveChatMessage["paymentMeta"]>["entries"][number]) => {
+      setPaymentEntries((current) => {
+        const next = current.filter((item) => item.requestId !== entry.requestId);
+        return [...next, entry].slice(-6);
+      });
+      setPaymentRailOpen(true);
+    },
+    [],
+  );
+
+  const beginPaidAction = useCallback(
+    (entry: Omit<NonNullable<LiveChatMessage["paymentMeta"]>["entries"][number], "requestId">) => {
+      const requestId = createBrowserX402RequestId();
+      setPaymentEntries([{ ...entry, requestId }]);
+      setPaymentRailOpen(true);
+      return requestId;
+    },
+    [],
+  );
 
   const [paymentBaseUrl, setPaymentBaseUrl] = useState(
     process.env.NEXT_PUBLIC_APP_URL?.trim() || "",
@@ -182,16 +251,26 @@ export default function AgentPayPage() {
     }
   }, [getAuthHeaders, address]);
 
-  const loadRequests = useCallback(async () => {
+  const loadRequests = useCallback(async (silent = false) => {
     const headers = getAuthHeaders();
     if (!headers) return;
-    setReqLoading(true);
+    // Silent refreshes (after approve/decline) skip the full-section spinner so
+    // the Incoming list doesn't flash "Loading…" over the rows the user is acting on.
+    if (!silent) setReqLoading(true);
     try {
       const r = await fetchPayRequests(headers);
-      setIncoming(r.incoming ?? []);
+      const dismissed = dismissedRequestIdsRef.current;
+      const incomingRows = (r.incoming ?? []).filter((row) => !dismissed.has(row.id));
+      // Once the backend stops returning a dismissed row, drop it from the guard
+      // set so it can't silently hide a genuinely new request with the same id.
+      const stillPresent = new Set((r.incoming ?? []).map((row) => row.id));
+      dismissed.forEach((id) => {
+        if (!stillPresent.has(id)) dismissed.delete(id);
+      });
+      setIncoming(incomingRows);
       setOutgoing(r.outgoing ?? []);
     } finally {
-      setReqLoading(false);
+      if (!silent) setReqLoading(false);
     }
   }, [getAuthHeaders]);
 
@@ -546,23 +625,140 @@ export default function AgentPayPage() {
     setBatchError(null);
     try {
       const headers = getAuthHeaders();
-      if (!headers) return;
-      const res = await fetch(`/api/batch/confirm/${encodeURIComponent(confirmId)}`, {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
+      if (!headers || !address || !walletClient) return;
+      const requestId = beginPaidAction({
+        agent: "batch",
+        price: BATCH_PRICE_LABEL,
+        payer: address,
+        mode: "eoa",
       });
-      const data = await res.json();
-      if (res.ok) {
-        setBatchResult(data);
+      const result = await payProtectedResource<Record<string, unknown>, Record<string, unknown>>({
+        url: `/api/batch/confirm/${encodeURIComponent(confirmId)}`,
+        method: "POST",
+        body: {},
+        walletClient,
+        payer: address as Address,
+        chainId: ARC_CHAIN_ID,
+        headers: { ...headers, "Content-Type": "application/json" },
+        requestId,
+      });
+      addPaymentEntry({
+        requestId: result.requestId,
+        agent: "batch",
+        price: BATCH_PRICE_LABEL,
+        payer: address,
+        mode: "eoa",
+        transactionRef: result.transaction ?? null,
+      });
+      if (result.status >= 200 && result.status < 300) {
+        setBatchResult(result.data);
         setBatchPreview(null);
         setBatchCSVText("");
       } else {
-        setBatchError(data.message ?? "Batch failed");
+        setBatchError("Batch failed");
       }
     } catch (e) {
       setBatchError(e instanceof Error ? e.message : "Batch failed");
     } finally {
       setBatchExecuting(false);
+    }
+  };
+
+  const handleSplitPreview = async () => {
+    const headers = getAuthHeaders();
+    if (!headers || !address) return;
+
+    const recipients = splitRecipientsText
+      .split(/\r?\n|,/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    if (recipients.length < 2) {
+      setSplitError("Add at least two recipients.");
+      return;
+    }
+
+    if (!splitTotalAmount.trim() || Number(splitTotalAmount) <= 0) {
+      setSplitError("Enter a valid total amount.");
+      return;
+    }
+
+    setSplitLoading(true);
+    setSplitPreview(null);
+    setSplitResult(null);
+    setSplitError(null);
+
+    try {
+      const res = await fetch("/api/split/run", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: `web-split-${Date.now()}`,
+          walletAddress: address,
+          recipients,
+          totalAmount: splitTotalAmount.trim(),
+          remark: splitRemark.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.action === "preview") {
+        setSplitPreview(data);
+      } else {
+        setSplitError(data.message ?? "Split preview failed");
+      }
+    } catch (e) {
+      setSplitError(e instanceof Error ? e.message : "Split preview failed");
+    } finally {
+      setSplitLoading(false);
+    }
+  };
+
+  const handleSplitConfirm = async (confirmId: string) => {
+    const headers = getAuthHeaders();
+    if (!headers || !address || !walletClient) return;
+
+    setSplitExecuting(true);
+    setSplitError(null);
+    try {
+      const requestId = beginPaidAction({
+        agent: "split",
+        price: SPLIT_PRICE_LABEL,
+        payer: address,
+        mode: "eoa",
+      });
+      const result = await payProtectedResource<Record<string, unknown>, Record<string, unknown>>({
+        url: `/api/split/confirm/${encodeURIComponent(confirmId)}`,
+        method: "POST",
+        body: { walletAddress: address },
+        walletClient,
+        payer: address as Address,
+        chainId: ARC_CHAIN_ID,
+        headers: { ...headers, "Content-Type": "application/json" },
+        requestId,
+      });
+      addPaymentEntry({
+        requestId: result.requestId,
+        agent: "split",
+        price: SPLIT_PRICE_LABEL,
+        payer: address,
+        mode: "eoa",
+        transactionRef: result.transaction ?? null,
+      });
+      if (result.status >= 200 && result.status < 300) {
+        setSplitResult(result.data);
+        setSplitReceiptRemark(splitRemark.trim() || null);
+        setSplitPreview(null);
+        setSplitRecipientsText("");
+        setSplitTotalAmount("");
+        setSplitRemark("");
+        void Promise.all([loadBalance(), loadHistory()]);
+      } else {
+        setSplitError("Split failed");
+      }
+    } catch (e) {
+      setSplitError(e instanceof Error ? e.message : "Split failed");
+    } finally {
+      setSplitExecuting(false);
     }
   };
 
@@ -585,13 +781,16 @@ export default function AgentPayPage() {
   const handleApprove = async (id: string) => {
     const headers = getAuthHeaders();
     if (!headers) return;
-    setSendBusy(true);
+    setOperationsError(null);
+    setRequestActionId(id);
+    setRequestActionKind("approve");
     setPayingRequestId(id);
     try {
       await postPayApprove(headers, id);
+      dismissedRequestIdsRef.current.add(id);
+      setIncoming((prev) => prev.filter((row) => row.id !== id));
 
-      // Optimistic UI: flip this invoice to "paid" in local state so the user
-      // sees the change instantly, even before the reload roundtrip.
+      // Optimistic UI for invoice-backed requests: show paid immediately.
       setReceivedInvoices((prev) =>
         prev.map((row: any) => {
           if (row.id !== id) return row;
@@ -605,12 +804,20 @@ export default function AgentPayPage() {
         }),
       );
 
-      // Fire background reloads in parallel; don't block the click handler on them.
-      void Promise.all([loadRequests(), loadHistory(), loadInvoices()]);
+      // Only refresh what's actually on screen. History/Invoices tabs reload
+      // themselves when opened, so refreshing them here just forces an extra
+      // full-page repaint (the "screen jump") for views the user can't see.
+      const refresh = () => {
+        void loadRequests(true);
+        if (tab === "invoices") void loadInvoices();
+      };
+      refresh();
+      window.setTimeout(refresh, 1500);
     } catch (e) {
       setOperationsError(e instanceof Error ? e.message : "Approve failed");
     } finally {
-      setSendBusy(false);
+      setRequestActionId(null);
+      setRequestActionKind(null);
       setPayingRequestId(null);
     }
   };
@@ -618,26 +825,54 @@ export default function AgentPayPage() {
   const handleDecline = async (id: string) => {
     const headers = getAuthHeaders();
     if (!headers) return;
-    setSendBusy(true);
+    setOperationsError(null);
+    setRequestActionId(id);
+    setRequestActionKind("decline");
     try {
       await postPayDecline(headers, id);
-      await loadRequests();
+      dismissedRequestIdsRef.current.add(id);
+      setIncoming((prev) => prev.filter((row) => row.id !== id));
+      await loadRequests(true);
     } catch (e) {
       setOperationsError(e instanceof Error ? e.message : "Decline failed");
     } finally {
-      setSendBusy(false);
+      setRequestActionId(null);
+      setRequestActionKind(null);
     }
   };
 
   const handleExport = async () => {
-    const headers = getAuthHeaders();
-    if (!headers) return;
     try {
-      const blob = await exportAgentPayWorkbook(headers);
+      const rows = (history ?? []).map((row) => {
+        const outgoing = row.direction === "out";
+        const counterparty = outgoing ? row.to_wallet : row.from_wallet;
+        return [
+          row.created_at ? formatServerDateTime(row.created_at) : "",
+          outgoing ? "Outgoing" : "Incoming",
+          Number(row.amount ?? 0).toFixed(2),
+          counterparty ?? "",
+          row.status ?? "",
+          row.arc_tx_id ?? "",
+          row.remark ?? "",
+        ];
+      });
+
+      const csvRows = [
+        ["Date", "Type", "Amount_USDC", "Counterparty", "Status", "TxHash", "Remark"],
+        ...rows,
+      ];
+
+      const csv = csvRows
+        .map((row) => row.map((cell) => escapeCsvCell(cell)).join(","))
+        .join("\n");
+
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
+      const filterLabel =
+        historyFilter === "in" ? "incoming" : historyFilter === "out" ? "outgoing" : "all";
       a.href = url;
-      a.download = "agentpay-transactions.xlsx";
+      a.download = `agentpay-history-${filterLabel}.csv`;
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
@@ -835,10 +1070,11 @@ export default function AgentPayPage() {
     { id: "send", label: "Send" },
     { id: "receive", label: "Receive" },
     { id: "requests", label: "Requests" },
-    { id: "history", label: "History" },
+    { id: "split", label: "Split" },
     { id: "scheduled", label: "Scheduled" },
     { id: "invoices", label: "Invoices" },
     { id: "batch", label: "Batch" },
+    { id: "history", label: "History" },
   ];
   const recentRelocations = (history ?? []).slice(0, 3);
 
@@ -846,64 +1082,56 @@ export default function AgentPayPage() {
     <div className="flex h-screen overflow-hidden bg-[#050505] text-[#f2f2f2]">
       <AppSidebar collapsed={isCollapsed} onToggleCollapse={toggleSidebar} />
 
-      <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Top bar */}
-        <header className="flex-shrink-0 h-20 flex items-center justify-between px-10 border-b border-white/5 bg-[#050505]/90 backdrop-blur-md">
-          <div className="flex items-center gap-2">
-            <span className="text-lg font-headline italic text-white/70 tracking-tighter">AgentPay</span>
-          </div>
-          <div className="flex items-center gap-6">
-            <div className="hidden lg:flex items-center bg-[#020202] px-4 py-2 border border-white/10 focus-within:border-[#f2ca50]/40 transition-all">
-              <span className="material-symbols-outlined icon-standard text-white/30 mr-2 text-sm">search</span>
-              <input className="bg-transparent border-none focus:ring-0 focus:outline-none text-[10px] w-40 text-white/80 uppercase tracking-[0.15em]" placeholder="Search payments..." type="text"/>
-            </div>
-            <SessionStatusChip
-              address={address}
-              isAuthenticated={isAuthenticated}
-              isLoading={authLoading}
-              error={authError}
-              onAction={() => {
-                if (!address) { openConnectModal?.(); return; }
-                if (!isAuthenticated) { void signIn().catch(() => {}); }
-              }}
-              compact
-            />
-          </div>
-        </header>
-
-        <main className="flex-1 overflow-y-auto pb-16 px-10 pt-12">
+      <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 flex flex-col overflow-hidden">
+        <main className="scrollbar-hide flex-1 overflow-y-auto pb-16 px-10 pt-12">
           <div className="mx-auto max-w-[1240px]">
             {/* Page header */}
-            <header className="mb-14 flex flex-col md:flex-row md:items-end justify-between gap-10">
+            <section className="relative mb-8 overflow-hidden rounded-[24px] border border-white/5 bg-[#050505] px-6 py-5 shadow-2xl">
+              <div className="pointer-events-none absolute right-0 top-0 h-full w-1/3 bg-[radial-gradient(circle_at_top_right,rgba(242,202,80,0.03),transparent_70%)]" />
+              <div className="relative flex flex-col gap-6 md:flex-row md:items-end md:justify-between">
               <div>
-                <h2 className="text-5xl font-headline text-white mb-4 tracking-tight">AgentPay</h2>
-                <div className="flex items-center gap-5">
-                  <span className="px-2.5 py-1 bg-[#f2ca50]/5 text-[#f2ca50] border border-[#f2ca50]/20 font-label text-[8px] uppercase tracking-[0.3em]">
-                    {isAuthenticated ? "Authorized Session" : address ? "Sign Session" : "Connect Wallet"}
-                  </span>
-                  <div className="flex items-center gap-2.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-[#f2ca50]/80 shadow-[0_0_8px_rgba(212,175,55,0.4)]" />
-                    <span className="text-white/30 text-[9px] uppercase tracking-widest">Arc live</span>
-                  </div>
-                </div>
+                <h2 className="mt-3 font-headline text-[clamp(3rem,4.8vw,4.6rem)] font-black leading-[0.92] tracking-[-0.055em] text-white">
+                  Agent<span className="text-[#f2ca50]">Pay</span>
+                </h2>
               </div>
-              <div className="bg-[#020202] p-8 border border-[rgba(212,175,55,0.12)] relative group transition-all duration-500 hover:border-[#f2ca50]/20 obsidian-shadow">
-                <div className="absolute inset-0 bg-gradient-to-tr from-[#f2ca50]/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-700" />
-                <p className="font-label uppercase tracking-[0.4em] text-[8px] text-white/30 mb-2.5">Available USDC</p>
-                <div className="flex items-baseline gap-3 relative z-10">
+              <div className="rounded-[20px] border border-[#f2ca50]/12 bg-black/20 px-5 py-4 backdrop-blur-sm">
+                <p className="mb-2.5 font-label text-[8px] uppercase tracking-[0.4em] text-white/72">Available USDC</p>
+                <div className="relative z-10 flex items-baseline gap-3">
                   {balanceLoading ? (
                     <span className="text-white/30 text-sm">Loading…</span>
                   ) : (
                     <>
-                      <h3 className="text-4xl font-headline italic text-[#f2ca50]" style={{ letterSpacing: "-0.02em", fontVariantNumeric: "tabular-nums" }}>
+                      <h3 className="font-headline text-4xl font-black text-[#f2ca50]" style={{ letterSpacing: "-0.02em", fontVariantNumeric: "tabular-nums" }}>
                         {usdcAvailable !== null ? usdcAvailable.toFixed(2) : "—"}
                       </h3>
-                      <span className="text-white/20 font-label text-[10px] tracking-widest uppercase">USDC</span>
+                      <span className="font-label text-[10px] uppercase tracking-widest text-white/68">USDC</span>
                     </>
                   )}
                 </div>
               </div>
-            </header>
+              </div>
+              {address && isAuthenticated ? (
+                <div className="relative mt-6 border-t border-white/5 pt-5">
+                  <nav className="flex gap-8 border-b border-white/5">
+                    {tabs.map((t) => (
+                      <button
+                        key={t.id}
+                        type="button"
+                        onClick={() => goTab(t.id)}
+                        className={`pb-5 border-b-2 font-label text-[11px] uppercase tracking-[0.34em] transition-all ${
+                          tab === t.id
+                            ? "border-[#f2ca50] text-[#f2ca50]"
+                            : "border-transparent text-white/60 hover:text-white/88"
+                        }`}
+                      >
+                        {t.label}
+                      </button>
+                    ))}
+                  </nav>
+                </div>
+              ) : null}
+            </section>
 
             {!address ? (
               <div className="border border-white/10 bg-[#0a0a0a] p-6 text-sm text-white/40">
@@ -928,23 +1156,6 @@ export default function AgentPayPage() {
               </div>
             ) : (
               <>
-                <nav className="flex gap-10 border-b border-white/5 mb-12">
-                  {tabs.map((t) => (
-                    <button
-                      key={t.id}
-                      type="button"
-                      onClick={() => goTab(t.id)}
-                      className={`pb-5 border-b-2 font-label text-[10px] uppercase tracking-[0.4em] transition-all ${
-                        tab === t.id
-                          ? "border-[#f2ca50] text-[#f2ca50]"
-                          : "border-transparent text-white/20 hover:text-white/80"
-                      }`}
-                    >
-                      {t.label}
-                    </button>
-                  ))}
-                </nav>
-
                 {tab === "send" && sendFlowError ? (
                   <div className="mb-4 rounded-xl border border-[#ff716c]/30 bg-[#9f0519]/10 px-4 py-3 text-sm text-[#ffa8a3]">
                     {sendFlowError}
@@ -960,22 +1171,37 @@ export default function AgentPayPage() {
                     {scheduledToast}
                   </div>
                 ) : null}
+                {tab === "split" && splitError ? (
+                  <div className="mb-4 rounded-xl border border-[#ff716c]/30 bg-[#9f0519]/10 px-4 py-3 text-sm text-[#ffa8a3]">
+                    {splitError}
+                  </div>
+                ) : null}
 
                 {tab === "send" ? (
                   <div className="grid gap-8 xl:grid-cols-12">
                     <div className="space-y-8 xl:col-span-8">
-                      <div className="space-y-4 border border-[rgba(212,175,55,0.08)] bg-[#0a0a0a] p-8">
-                      <div className="text-[11px] uppercase tracking-[0.18em] text-white/40">
+                      <div className="internal-admin-panel space-y-5 rounded-[24px] p-8">
+                      <div className="flex items-start justify-between gap-4 border-b border-white/8 pb-4">
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50]">
+                          Send payment
+                        </p>
+                      </div>
+                        <span className="rounded-full border border-[#f2ca50]/18 bg-[#f2ca50]/8 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50]">
+                          Arc USDC
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
                         Recipient
                       </div>
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
+                      <div className="flex flex-col gap-2.5 sm:flex-row sm:items-stretch">
                         <input
                           value={toAddress}
                           onChange={(e) => {
                             setSendFlowError(null);
                             setToAddress(e.target.value);
                           }}
-                          className="min-w-0 flex-1 w-full bg-[#0e0e0e]/50 border border-[rgba(212,175,55,0.12)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/90 font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm"
+                          className="min-w-0 flex-1 w-full rounded-xl bg-[#0e0e0e]/65 border border-[rgba(212,175,55,0.18)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/95 placeholder:text-[#8fb4d9] font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm"
                           placeholder="Enter .arc name, 0x address, or scan QR"
                           autoComplete="off"
                         />
@@ -990,36 +1216,53 @@ export default function AgentPayPage() {
                           <button
                             type="button"
                             onClick={() => void startScanner()}
-                            className="transition-all rounded-xl border border-[rgba(242,202,80,0.35)] px-3 py-2 text-xs font-semibold text-[#f2ca50] whitespace-nowrap hover:bg-[rgba(242,202,80,0.12)] active:scale-[0.98]"
+                            className="flex h-[42px] items-center gap-1.5 rounded-xl border border-[#f2ca50]/35 bg-[linear-gradient(180deg,rgba(242,202,80,0.16),rgba(242,202,80,0.08))] px-3 text-xs font-semibold text-[#f2ca50] whitespace-nowrap transition-all hover:border-[#f2ca50]/55 hover:bg-[linear-gradient(180deg,rgba(242,202,80,0.22),rgba(242,202,80,0.12))] active:scale-[0.98]"
                           >
+                            <span className="material-symbols-outlined text-[14px] leading-none">qr_code_scanner</span>
                             Scan QR
                           </button>
                           <button
                             type="button"
                             onClick={() => qrFileInputRef.current?.click()}
-                            className="transition-all rounded-xl border border-white/10 bg-[#0e0e0e] px-3 py-2 text-xs font-semibold text-white/90 whitespace-nowrap hover:bg-[#161616] active:scale-[0.98]"
+                            className="flex h-[42px] items-center gap-1.5 rounded-xl border border-white/12 bg-[linear-gradient(180deg,rgba(255,255,255,0.04),rgba(255,255,255,0.02))] px-3 text-xs font-semibold text-white/92 whitespace-nowrap transition-all hover:border-white/20 hover:bg-[linear-gradient(180deg,rgba(255,255,255,0.06),rgba(255,255,255,0.025))] active:scale-[0.98]"
                           >
+                            <span className="material-symbols-outlined text-[14px] leading-none">upload</span>
                             Upload QR
                           </button>
                         </div>
                       </div>
                       <label className="block">
-                        <span className="mb-1 block text-[11px] uppercase tracking-[0.18em] text-white/40">
-                          Amount (USDC)
-                        </span>
+                        <div className="mb-1 flex items-center justify-between gap-3">
+                          <span className="block text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
+                            Amount (USDC)
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSendFlowError(null);
+                              if (typeof usdcAvailable === "number" && Number.isFinite(usdcAvailable)) {
+                                setAmount(usdcAvailable.toFixed(2));
+                              }
+                            }}
+                            disabled={typeof usdcAvailable !== "number" || !Number.isFinite(usdcAvailable)}
+                            className="rounded-lg border border-[#f2ca50]/20 bg-[#f2ca50]/8 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50] transition hover:border-[#f2ca50]/35 hover:bg-[#f2ca50]/12 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            Max
+                          </button>
+                        </div>
                         <input
                           value={amount}
                           onChange={(e) => {
                             setSendFlowError(null);
                             setAmount(e.target.value);
                           }}
-                          className="w-full w-full bg-[#0e0e0e]/50 border border-[rgba(212,175,55,0.12)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/90 font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm"
+                          className="w-full rounded-xl bg-[#0e0e0e]/65 border border-[rgba(212,175,55,0.18)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/95 placeholder:text-white/55 font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm"
                           inputMode="decimal"
                           placeholder="0.00"
                         />
                       </label>
                       <label className="block">
-                        <span className="mb-1 block text-[11px] uppercase tracking-[0.18em] text-white/40">
+                        <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
                           Remark (optional, max 100 chars)
                         </span>
                         <input
@@ -1028,18 +1271,15 @@ export default function AgentPayPage() {
                             setSendFlowError(null);
                             setRemark(e.target.value.slice(0, 100));
                           }}
-                          className="w-full w-full bg-[#0e0e0e]/50 border border-[rgba(212,175,55,0.12)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/90 font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm"
+                          className="w-full rounded-xl bg-[#0e0e0e]/65 border border-[rgba(212,175,55,0.18)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/95 placeholder:text-white/55 font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm"
                           maxLength={100}
                         />
                       </label>
-                      <div className="rounded-xl border border-white/10 bg-[#0e0e0e]/50 px-4 py-3 text-sm text-white/40">
-                        Preview: {previewLabel}
-                      </div>
                       <button
                         type="button"
                         disabled={sendBusy}
                         onClick={openReviewModal}
-                        className="burnished-gold w-full py-5 text-[#1a1500] font-label text-[11px] uppercase tracking-[0.5em] font-extrabold flex items-center justify-center gap-4 transition-all active:scale-[0.985] disabled:opacity-60"
+                        className="internal-admin-button-primary flex w-full items-center justify-center gap-4 rounded-xl py-4 text-[#1a1500] font-label text-[11px] font-extrabold uppercase tracking-[0.32em] transition-all active:scale-[0.985] disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         Confirm & authorize
                       </button>
@@ -1062,12 +1302,12 @@ export default function AgentPayPage() {
                     </div>
 
                     <div className="space-y-6">
-                      <h4 className="font-headline text-2xl italic text-white/90/85">
+                      <h4 className="font-headline text-2xl italic text-white/92">
                         Recent transfers
                       </h4>
                       <div className="space-y-3">
                         {recentRelocations.length === 0 ? (
-                          <div className="rounded-xl border border-white/10 bg-[#0e0e0e] p-5 text-sm text-white/40">
+                          <div className="rounded-xl border border-white/10 bg-[#0e0e0e] p-5 text-sm text-white/60">
                             No completed transfers yet.
                           </div>
                         ) : (
@@ -1088,7 +1328,7 @@ export default function AgentPayPage() {
                                     <p className="text-sm font-bold text-white/90">
                                       {shortenAddress(counterparty)}
                                     </p>
-                                    <p className="mt-1 text-xs text-white/40/70">
+                                    <p className="mt-1 text-xs text-white/55">
                                       {formatServerDateTime(row.created_at)}
                                     </p>
                                   </div>
@@ -1097,7 +1337,7 @@ export default function AgentPayPage() {
                                       {outgoing ? "-" : "+"}
                                       {formatUsd(Number(row.amount))}
                                     </p>
-                                    <p className="text-[10px] uppercase tracking-[0.16em] text-white/40/70">
+                                    <p className="text-[10px] uppercase tracking-[0.16em] text-white/55">
                                       {row.status || "processed"}
                                     </p>
                                   </div>
@@ -1111,22 +1351,22 @@ export default function AgentPayPage() {
                     </div>
 
                     <div className="space-y-6 xl:col-span-4">
-                      <div className="relative overflow-hidden border border-[rgba(212,175,55,0.08)] bg-[#0a0a0a] p-6">
+                      <div className="relative overflow-hidden border border-[rgba(212,175,55,0.12)] bg-[#0a0a0a] p-6">
                         <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent" />
                         <div className="relative">
                           <span className="inline-block rounded-full bg-[rgba(242,202,80,0.14)] px-2 py-1 text-[10px] font-bold uppercase tracking-[0.18em] text-[#f2ca50]">
                             Arc Testnet
                           </span>
-                          <h4 className="mt-3 font-headline text-2xl italic text-white/90">Settlement rail</h4>
-                          <p className="mt-2 text-sm text-white/40">
-                            Send and receive USDC from the Agent wallet on Arc Testnet.
+                          <h4 className="mt-3 font-headline text-2xl italic text-white/95">Settlement rail</h4>
+                          <p className="mt-2 text-sm text-white/60">
+                            Send and receive USDC on Arc Testnet.
                           </p>
                         </div>
                       </div>
-                      <div className="border border-[rgba(212,175,55,0.08)] bg-[#0a0a0a]/80 p-6 text-sm text-white/40">
+                      <div className="border border-[rgba(212,175,55,0.12)] bg-[#0a0a0a]/80 p-6 text-sm text-white/60">
                         <p>
-                          Transfers use your <strong className="text-white/90">Circle developer-controlled</strong>{" "}
-                          agent wallet on Arc Testnet. Ensure the wallet holds enough USDC for the amount plus fees.
+                          Uses your <strong className="text-white/90">Circle developer-controlled</strong> wallet.
+                          Keep enough USDC for the transfer and fees.
                         </p>
                       </div>
                     </div>
@@ -1400,7 +1640,7 @@ export default function AgentPayPage() {
                         type="button"
                         disabled={reqBusy}
                         onClick={() => void submitRequest()}
-                        className="burnished-gold mt-4 rounded-xl px-5 py-2 text-sm font-bold disabled:opacity-60"
+                        className="internal-admin-button-primary mt-4 rounded-xl px-5 py-2 text-sm font-bold disabled:opacity-60"
                       >
                         {reqBusy ? "Submitting…" : "Create request"}
                       </button>
@@ -1437,19 +1677,33 @@ export default function AgentPayPage() {
                               <div className="flex gap-2">
                                 <button
                                   type="button"
-                                  disabled={sendBusy}
+                                  disabled={requestActionId === r.id}
                                   onClick={() => void handleApprove(r.id)}
-                                  className="rounded-lg border border-[rgba(242,202,80,0.35)] px-3 py-1.5 text-xs font-semibold text-[#f2ca50]"
+                                  className="flex items-center gap-1.5 rounded-lg border border-[rgba(242,202,80,0.35)] px-3 py-1.5 text-xs font-semibold text-[#f2ca50] transition disabled:cursor-not-allowed disabled:opacity-70"
                                 >
-                                  Approve
+                                  {requestActionId === r.id && requestActionKind === "approve" ? (
+                                    <>
+                                      <span className="h-3 w-3 animate-spin rounded-full border border-t-transparent border-[#f2ca50]/60" />
+                                      Approving…
+                                    </>
+                                  ) : (
+                                    "Approve"
+                                  )}
                                 </button>
                                 <button
                                   type="button"
-                                  disabled={sendBusy}
+                                  disabled={requestActionId === r.id}
                                   onClick={() => void handleDecline(r.id)}
-                                  className="rounded-lg border border-[#ff716c]/40 px-3 py-1.5 text-xs font-semibold text-[#ff716c]"
+                                  className="flex items-center gap-1.5 rounded-lg border border-[#ff716c]/40 px-3 py-1.5 text-xs font-semibold text-[#ff716c] transition disabled:cursor-not-allowed disabled:opacity-70"
                                 >
-                                  Decline
+                                  {requestActionId === r.id && requestActionKind === "decline" ? (
+                                    <>
+                                      <span className="h-3 w-3 animate-spin rounded-full border border-t-transparent border-[#ff716c]/60" />
+                                      Declining…
+                                    </>
+                                  ) : (
+                                    "Decline"
+                                  )}
                                 </button>
                               </div>
                             </div>
@@ -1505,7 +1759,7 @@ export default function AgentPayPage() {
                         onChange={(e) =>
                           setHistoryFilter(e.target.value as "" | "in" | "out")
                         }
-                        className="rounded-xl border border-[#46484d]/20 bg-[#000000] px-3 py-2 text-sm"
+                        className="min-w-[104px] rounded-xl border border-white/10 bg-[#050505] px-3 py-2 text-sm text-white outline-none transition hover:border-white/18 focus:border-[#f2ca50]/35"
                       >
                         <option value="">All</option>
                         <option value="in">Incoming</option>
@@ -1514,16 +1768,16 @@ export default function AgentPayPage() {
                       <button
                         type="button"
                         onClick={() => void loadHistory()}
-                        className="rounded-xl border border-white/10 px-3 py-2 text-sm text-[#aaabb0]"
+                        className="rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-2 text-sm font-medium text-white/72 transition hover:border-white/18 hover:text-white"
                       >
                         Refresh
                       </button>
                       <button
                         type="button"
                         onClick={() => void handleExport()}
-                        className="burnished-gold rounded-xl px-4 py-2 text-sm font-bold"
+                        className="internal-admin-button-primary rounded-xl px-3.5 py-2 text-sm font-bold"
                       >
-                        Export Excel
+                        Export CSV
                       </button>
                     </div>
                     {historyLoading ? (
@@ -1884,6 +2138,196 @@ export default function AgentPayPage() {
                   </div>
                 ) : null}
 
+                {tab === "split" ? (
+                  <div className="grid gap-8 xl:grid-cols-12">
+                    <div className="space-y-6 xl:col-span-8">
+                      <div className="internal-admin-panel space-y-5 rounded-[24px] p-8">
+                        <div className="flex items-start justify-between gap-4 border-b border-white/8 pb-4">
+                          <div>
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50]">
+                              Split payment
+                            </p>
+                          </div>
+                          <span className="rounded-full border border-[#f2ca50]/18 bg-[#f2ca50]/8 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50]">
+                            Equal split
+                          </span>
+                        </div>
+
+                        <label className="block">
+                          <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
+                            Recipients
+                          </span>
+                          <textarea
+                            value={splitRecipientsText}
+                            onChange={(e) => {
+                              setSplitError(null);
+                              setSplitRecipientsText(e.target.value);
+                            }}
+                            rows={5}
+                            placeholder={"alice.arc\nbob.arc\ncharlie.arc"}
+                            className="w-full rounded-xl bg-[#0e0e0e]/65 border border-[rgba(212,175,55,0.18)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/95 placeholder:text-white/55 font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm resize-none"
+                          />
+                          <div className="mt-2 text-xs text-white/45">
+                            Add one recipient per line or separate them with commas.
+                          </div>
+                        </label>
+
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
+                              Total amount (USDC)
+                            </span>
+                            <input
+                              value={splitTotalAmount}
+                              onChange={(e) => {
+                                setSplitError(null);
+                                setSplitTotalAmount(e.target.value);
+                              }}
+                              inputMode="decimal"
+                              placeholder="30.00"
+                              className="w-full rounded-xl bg-[#0e0e0e]/65 border border-[rgba(212,175,55,0.18)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/95 placeholder:text-white/55 font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm"
+                            />
+                          </label>
+
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
+                              Remark (optional)
+                            </span>
+                            <input
+                              value={splitRemark}
+                              onChange={(e) => {
+                                setSplitError(null);
+                                setSplitRemark(e.target.value.slice(0, 100));
+                              }}
+                              maxLength={100}
+                              placeholder="Dinner, cab, hotel..."
+                              className="w-full rounded-xl bg-[#0e0e0e]/65 border border-[rgba(212,175,55,0.18)] hover:border-[#f2ca50]/30 focus:border-[#f2ca50]/50 px-5 py-4 text-white/95 placeholder:text-white/55 font-body tracking-[0.05em] transition-all outline-none focus:ring-0 text-sm"
+                            />
+                          </label>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => void handleSplitPreview()}
+                          disabled={splitLoading}
+                          className="internal-admin-button-primary flex w-full items-center justify-center gap-4 rounded-xl py-4 text-[#1a1500] font-label text-[11px] font-extrabold uppercase tracking-[0.32em] transition-all active:scale-[0.985] disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {splitLoading ? "Preparing split..." : "Preview split"}
+                        </button>
+                      </div>
+
+                      {splitPreview ? (
+                        <div className="rounded-[24px] border border-white/10 bg-[#0d0d0d] p-6 space-y-4">
+                          <div className="flex items-start justify-between gap-4">
+                            <div>
+                              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50]">
+                                Split preview
+                              </div>
+                              <div className="mt-2 overflow-hidden whitespace-pre-wrap break-all text-sm text-white/72">
+                                {splitPreview.message}
+                              </div>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => void handleSplitConfirm(splitPreview.confirmId)}
+                            disabled={splitExecuting}
+                            className="internal-admin-button-primary rounded-xl px-5 py-3 text-[11px] font-extrabold uppercase tracking-[0.24em] text-[#1a1500] transition-all disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {splitExecuting ? "Sending split..." : splitPreview.confirmLabel || "Confirm split"}
+                          </button>
+                        </div>
+                      ) : null}
+
+                      {splitResult ? (
+                        <div className="rounded-[24px] border border-white/10 bg-[#0d0d0d] p-6 space-y-4">
+                          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50]">
+                            Split receipt
+                          </div>
+                          <div className="text-3xl font-semibold tracking-[-0.04em] text-white/92">
+                            Split complete!
+                          </div>
+                          {Array.isArray(splitResult.results) ? (
+                            <div className="text-sm text-white/62">
+                              Sent {splitResult.results.filter((row: any) => row.status === "success").length} of{" "}
+                              {splitResult.results.length} transfers
+                            </div>
+                          ) : null}
+                          {splitReceiptRemark ? (
+                            <div className="rounded-xl border border-[#f2ca50]/15 bg-[#f2ca50]/[0.04] px-4 py-3 text-sm text-white/72">
+                              <span className="mr-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50]">
+                                Remark
+                              </span>
+                              {splitReceiptRemark}
+                            </div>
+                          ) : null}
+                          {Array.isArray(splitResult.results) ? (
+                            <div className="space-y-3">
+                              {splitResult.results.map((row: any, index: number) => (
+                                <div
+                                  key={`${row.recipient}-${index}`}
+                                  className="flex items-start justify-between gap-4 rounded-xl border border-white/8 bg-[#111111] px-4 py-3"
+                                >
+                                  <div>
+                                    <div className="text-sm font-semibold text-white/90">{row.recipient}</div>
+                                    <div className="mt-1 text-xs text-white/45">{row.amount} USDC</div>
+                                    {splitReceiptRemark ? (
+                                      <div className="mt-1 text-[10px] uppercase tracking-[0.16em] text-white/30">
+                                        {splitReceiptRemark}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                  <div className="text-right">
+                                    <div className={`text-xs font-semibold uppercase tracking-[0.18em] ${row.status === "success" ? "text-[#f2ca50]" : "text-[#ffa8a3]"}`}>
+                                      {row.status}
+                                    </div>
+                                    {row.txHash ? (
+                                      <div className="mt-1 break-all font-mono text-[10px] text-white/45">{row.txHash}</div>
+                                    ) : row.error ? (
+                                      <div className="mt-1 max-w-[24ch] text-[10px] text-[#ffa8a3]">{row.error}</div>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="space-y-6 xl:col-span-4">
+                      <div className="relative overflow-hidden border border-[rgba(212,175,55,0.12)] bg-[#0a0a0a] p-6">
+                        <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent" />
+                        <div className="relative">
+                          <span className="inline-block rounded-full bg-[rgba(242,202,80,0.14)] px-2 py-1 text-[10px] font-bold uppercase tracking-[0.18em] text-[#f2ca50]">
+                            Arc split agent
+                          </span>
+                          <h4 className="mt-3 font-headline text-2xl italic text-white/95">One total, equal shares</h4>
+                          <p className="mt-2 text-sm text-white/60">
+                            AgentPay divides one USDC total equally across up to ten recipients, previews the route, then settles each transfer on Arc.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="border border-[rgba(212,175,55,0.12)] bg-[#0a0a0a]/80 p-6 text-sm text-white/60">
+                        <p>
+                          Need a natural-language version instead? Use chat for prompts like{" "}
+                          <span className="font-mono text-[#f2ca50]">
+                            split 30 USDC between alice.arc, bob.arc and charlie.arc
+                          </span>
+                          .
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => openAgentPayChat("split 30 USDC between alice.arc, bob.arc and charlie.arc")}
+                          className="mt-4 rounded-lg border border-[rgba(242,202,80,0.35)] bg-[rgba(242,202,80,0.08)] px-4 py-2 text-sm font-medium text-[#f2ca50] transition hover:bg-[rgba(242,202,80,0.16)]"
+                        >
+                          Open in chat
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
                 {tab === "batch" ? (
                   <div className="space-y-5">
                     <div className="text-sm text-[#d0c5af]/70">
@@ -1941,7 +2385,7 @@ export default function AgentPayPage() {
                         type="button"
                         onClick={() => void handleBatchPreview()}
                         disabled={batchLoading || !isAuthenticated}
-                        className="burnished-gold btn-hover-effect w-full py-3 rounded-xl text-sm font-semibold text-[#1a1200] disabled:opacity-50"
+                        className="internal-admin-button-primary w-full rounded-xl py-3 text-sm font-semibold text-[#1a1200] disabled:opacity-50"
                       >
                         {batchLoading ? "Validating…" : "Preview Batch Payment"}
                       </button>
@@ -1973,7 +2417,7 @@ export default function AgentPayPage() {
                           type="button"
                           onClick={() => void handleBatchConfirm(batchPreview.confirmId)}
                           disabled={batchExecuting}
-                          className="burnished-gold btn-hover-effect w-full py-3 rounded-xl text-sm font-semibold text-[#1a1200] disabled:opacity-50"
+                          className="internal-admin-button-primary w-full rounded-xl py-3 text-sm font-semibold text-[#1a1200] disabled:opacity-50"
                         >
                           {batchExecuting
                             ? "Sending…"
@@ -2072,68 +2516,78 @@ export default function AgentPayPage() {
             )}
           </div>
         </main>
+        </div>
+        <ChatPaymentPanel
+          message={paymentRailMessage}
+          isOpen={paymentRailOpen}
+          onClose={() => setPaymentRailOpen(false)}
+          onOpen={() => setPaymentRailOpen(true)}
+        />
       </div>
 
       {confirmOpen ? (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
           <div className="absolute inset-0 bg-black/90 backdrop-blur-xl" onClick={() => { setConfirmOpen(false); setConfirmModalError(null); }} />
-          <div className="relative bg-[#0a0a0a] border border-[#f2ca50]/20 w-full max-w-xl obsidian-shadow overflow-hidden">
+          <div className="relative w-full max-w-xl overflow-hidden rounded-[28px] border border-[#f2ca50]/20 bg-[#0a0a0a] obsidian-shadow">
             <div className="h-1 burnished-gold w-full opacity-80" />
-            <div className="px-10 py-7 border-b border-[rgba(212,175,55,0.08)] flex justify-between items-center bg-[#161616]/30">
-              <h3 className="font-headline text-2xl italic text-white/90">Payment Authorization</h3>
+            <div className="flex items-center justify-between border-b border-[rgba(212,175,55,0.08)] bg-[linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.01))] px-8 py-6">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.32em] text-[#f2ca50]">Review payment</p>
+                <h3 className="mt-2 font-headline text-[2rem] font-bold tracking-tight text-white">Payment Authorization</h3>
+              </div>
               <button
                 type="button"
                 onClick={() => { setConfirmOpen(false); setConfirmModalError(null); }}
-                className="text-white/20 hover:text-red-500 transition-colors"
+                className="rounded-full bg-white/[0.03] p-2 text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/75"
               >
                 <span className="material-symbols-outlined icon-standard">close</span>
               </button>
             </div>
-            <div className="p-10 space-y-10">
-              <div className="text-center py-4">
-                <p className="font-label text-[9px] uppercase tracking-[0.5em] text-white/30 mb-6">Ready to send</p>
-                <h4 className="text-5xl font-headline italic text-[#f2ca50]" style={{ letterSpacing: "-0.02em" }}>
-                  {amount || "0.00"} <span className="text-sm tracking-[0.4em] not-italic opacity-30 ml-2">USDC</span>
+            <div className="space-y-8 p-8">
+              <div className="rounded-[24px] bg-[radial-gradient(circle_at_top,rgba(242,202,80,0.12),transparent_60%),linear-gradient(180deg,rgba(20,20,20,0.98),rgba(10,10,10,0.98))] px-6 py-7 text-center">
+                <p className="mb-4 text-[10px] font-semibold uppercase tracking-[0.42em] text-white/42">Ready to send</p>
+                <h4 className="font-headline text-[4rem] font-bold leading-none tracking-[-0.045em] text-[#f2ca50]">
+                  {amount || "0.00"} <span className="ml-2 text-base tracking-[0.32em] text-white/38">USDC</span>
                 </h4>
               </div>
-              <div className="space-y-5 px-4">
-                <div className="flex justify-between items-center pb-4 border-b border-[rgba(212,175,55,0.08)]">
-                  <span className="font-label text-[9px] uppercase tracking-[0.3em] text-white/30">Recipient</span>
-                  <span className="font-body text-[11px] text-white/80 tracking-[0.1em] uppercase">{toAddress ? shortenAddress(toAddress) : "—"}</span>
+              <div className="rounded-[24px] bg-white/[0.02] px-5 py-4">
+                <div className="flex items-center justify-between border-b border-[rgba(212,175,55,0.08)] py-4 first:pt-0">
+                  <span className="font-label text-[9px] uppercase tracking-[0.3em] text-white/34">Recipient</span>
+                  <span className="font-body text-[12px] text-white/86 tracking-[0.08em] uppercase">{toAddress ? shortenAddress(toAddress) : "—"}</span>
                 </div>
-                <div className="flex justify-between items-center pb-4 border-b border-[rgba(212,175,55,0.08)]">
-                  <span className="font-label text-[9px] uppercase tracking-[0.3em] text-white/30">Protocol</span>
-                  <span className="font-body text-[11px] text-white/80 tracking-[0.1em] uppercase">Arc Testnet</span>
+                <div className="flex items-center justify-between border-b border-[rgba(212,175,55,0.08)] py-4">
+                  <span className="font-label text-[9px] uppercase tracking-[0.3em] text-white/34">Network</span>
+                  <span className="font-body text-[12px] text-white/86 tracking-[0.08em] uppercase">Arc Testnet</span>
                 </div>
-                <div className="flex justify-between items-center">
-                  <span className="font-label text-[9px] uppercase tracking-[0.3em] text-white/30">Execution</span>
-                  <span className="font-body text-[11px] text-[#f2ca50] tracking-[0.15em] uppercase italic">Immediate</span>
+                <div className="flex items-center justify-between py-4 pb-0">
+                  <span className="font-label text-[9px] uppercase tracking-[0.3em] text-white/34">Execution</span>
+                  <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[#f2ca50]">Immediate</span>
                 </div>
               </div>
               {confirmModalError ? (
-                <div className="rounded border border-[#ff716c]/30 bg-[#9f0519]/10 px-4 py-3 text-sm text-[#ffa8a3]">
+                <div className="rounded-xl border border-[#ff716c]/30 bg-[#9f0519]/10 px-4 py-3 text-sm text-[#ffa8a3]">
                   {confirmModalError}
                 </div>
               ) : null}
-              <div className="flex flex-col gap-5 pt-4">
+              <div className="flex flex-col gap-4 pt-2">
                 <button
                   type="button"
                   disabled={sendBusy}
                   onClick={() => void runSend()}
-                  className="burnished-gold w-full py-5 text-[#1a1500] font-label text-[11px] uppercase tracking-[0.5em] font-extrabold flex items-center justify-center gap-4 transition-all active:scale-[0.985] disabled:opacity-60"
+                  className="internal-admin-button-primary flex w-full items-center justify-center gap-3 rounded-xl py-4 text-[#1a1500] font-label text-[11px] font-extrabold uppercase tracking-[0.28em] transition-all active:scale-[0.985] disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  <span className="material-symbols-outlined icon-filled text-lg opacity-70">fingerprint</span>
+                  <span className="material-symbols-outlined icon-filled text-lg opacity-80">fingerprint</span>
                   {sendBusy ? "Confirming..." : "Confirm & Authorize"}
                 </button>
                 <button
                   type="button"
                   onClick={() => { setConfirmOpen(false); setConfirmModalError(null); }}
-                  className="w-full py-2 text-white/20 hover:text-red-500/60 transition-colors font-label text-[9px] uppercase tracking-[0.4em]"
+                  className="w-full rounded-xl bg-white/[0.02] py-3 text-white/58 transition-colors hover:bg-white/[0.05] hover:text-white/82 font-label text-[9px] uppercase tracking-[0.32em]"
                 >
                   Cancel
                 </button>
               </div>
-              <div className="flex items-center justify-center gap-3 text-white/10 pt-4 border-t border-[rgba(212,175,55,0.08)]">
+              <div className="flex items-center justify-center gap-3 border-t border-[rgba(212,175,55,0.08)] pt-5 text-white/28">
                 <span className="material-symbols-outlined icon-standard text-sm">verified_user</span>
                 <span className="text-[8px] font-label uppercase tracking-[0.4em]">Session verified</span>
               </div>

@@ -15,6 +15,20 @@ export type StoreAgent = {
   agentCardUrl: string | null;
 };
 
+export type StoreAgentStats = {
+  agent: StoreAgent;
+  stats: {
+    completedTasks: number;
+    totalRuns: number;
+    successRate: number;
+    nanopaymentCount: number;
+    nanopaymentVolumeUsdc: number;
+    rating: number;
+    priceLabel: string;
+    scopeLabel: string;
+  };
+};
+
 export type BusinessRecord = {
   wallet_address: string;
   business_name: string;
@@ -141,6 +155,13 @@ export async function fetchStoreAgents(): Promise<StoreAgent[]> {
   });
   const json = await readJson<{ agents: StoreAgent[] }>(response, "Store fetch failed");
   return Array.isArray(json.agents) ? json.agents : [];
+}
+
+export async function fetchStoreAgentStats(slug: string): Promise<StoreAgentStats> {
+  const response = await fetch(`/api/agent-store/agent/${encodeURIComponent(slug)}/stats`, {
+    cache: "no-store",
+  });
+  return readJson<StoreAgentStats>(response, "Agent stats fetch failed");
 }
 
 export async function fetchBusinessDashboard(
@@ -374,7 +395,15 @@ export async function postPayApprove(
 }> {
   const response = await fetch(`/api/pay/approve/${encodeURIComponent(requestId)}`, {
     method: "POST",
-    headers: authHeaders,
+    headers: {
+      "Content-Type": "application/json",
+      "x-agentflow-confirmed": "true",
+      ...authHeaders,
+    },
+    body: JSON.stringify({
+      confirmed: true,
+      idempotencyKey: `agentpay-request:${requestId}`,
+    }),
   });
   return readJson<{
     accepted?: boolean;
@@ -393,7 +422,11 @@ export async function postPayDecline(
 ): Promise<{ success: boolean }> {
   const response = await fetch(`/api/pay/decline/${encodeURIComponent(requestId)}`, {
     method: "POST",
-    headers: authHeaders,
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders,
+    },
+    body: JSON.stringify({}),
   });
   return readJson<{ success: boolean }>(response, "AgentPay decline failed");
 }
@@ -775,6 +808,22 @@ export type ConversationReviewCase = {
   reviewNote: string | null;
 };
 
+export type ChatFeedbackEntry = {
+  id: string;
+  at: string;
+  sessionId: string | null;
+  walletAddress: string | null;
+  feedback: "positive" | "negative";
+  note: string | null;
+  query: string;
+  responseSummary: string | null;
+  outcome: string | null;
+  failureReason: string | null;
+  intentLabel: string | null;
+  finalIntent: string | null;
+  layerUsed: string | null;
+};
+
 export async function fetchSemanticMemoryMetrics(
   authHeaders: Record<string, string>,
 ): Promise<SemanticMemoryMetricsReport> {
@@ -887,6 +936,38 @@ export async function exportConversationReviewDataset(
   if (!response.ok) {
     const err = (await response.json().catch(() => ({}))) as { error?: string };
     throw new ClientApiError(response.status, err.error || "Conversation review export failed");
+  }
+  return response.blob();
+}
+
+export async function fetchChatFeedbackEntries(
+  authHeaders: Record<string, string>,
+  options?: { limit?: number },
+): Promise<ChatFeedbackEntry[]> {
+  const limit = options?.limit ?? 80;
+  const response = await fetch(`/api/internal/feedback/messages?limit=${encodeURIComponent(String(limit))}`, {
+    headers: authHeaders,
+    cache: "no-store",
+  });
+  const json = await readJson<{ entries: ChatFeedbackEntry[] }>(
+    response,
+    "Chat feedback fetch failed",
+  );
+  return Array.isArray(json.entries) ? json.entries : [];
+}
+
+export async function exportChatFeedbackEntries(
+  authHeaders: Record<string, string>,
+  options?: { limit?: number },
+): Promise<Blob> {
+  const limit = options?.limit ?? 400;
+  const response = await fetch(`/api/internal/feedback/messages/export?limit=${encodeURIComponent(String(limit))}`, {
+    headers: authHeaders,
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new ClientApiError(response.status, err.error || "Chat feedback export failed");
   }
   return response.blob();
 }

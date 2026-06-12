@@ -129,6 +129,10 @@ CREATE TABLE IF NOT EXISTS invoices (
   settled_at timestamp
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS invoices_invoice_number_unique_idx
+ON invoices (invoice_number)
+WHERE invoice_number IS NOT NULL;
+
 -- Agent Store published agents
 CREATE TABLE IF NOT EXISTS agent_store_agents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -284,40 +288,3 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS gateway_transfer_id varchar;
 ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS invoice_id uuid REFERENCES invoices(id);
 ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payment_request_id uuid REFERENCES payment_requests(id);
 
-CREATE TABLE IF NOT EXISTS funds (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  name varchar NOT NULL,
-  description text,
-  strategy_type varchar NOT NULL,
-  creator_wallet varchar,
-  min_deposit numeric DEFAULT 1,
-  estimated_apy numeric DEFAULT 0,
-  risk_level varchar DEFAULT 'low',
-  is_active boolean DEFAULT true,
-  plan_count integer DEFAULT 0,
-  total_value_locked numeric DEFAULT 0,
-  created_at timestamp DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS fund_plans (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_wallet varchar NOT NULL,
-  fund_id uuid NOT NULL REFERENCES funds(id),
-  amount numeric NOT NULL,
-  status varchar DEFAULT 'active',
-  started_at timestamp DEFAULT now(),
-  last_run_at timestamp,
-  next_run_at timestamp
-);
-
-INSERT INTO funds (name, description, strategy_type, min_deposit, estimated_apy, risk_level)
-SELECT 'Weekly DCA Vault', 'Automatically deposits USDC into vault every Monday', 'dca_vault', 5, 5.0, 'low'
-WHERE NOT EXISTS (SELECT 1 FROM funds WHERE strategy_type = 'dca_vault');
-
-INSERT INTO funds (name, description, strategy_type, min_deposit, estimated_apy, risk_level)
-SELECT 'Yield Optimizer', 'Monitors and auto-compounds vault APY every 6 hours', 'auto_compound', 10, 6.5, 'low'
-WHERE NOT EXISTS (SELECT 1 FROM funds WHERE strategy_type = 'auto_compound');
-
-INSERT INTO funds (name, description, strategy_type, min_deposit, estimated_apy, risk_level)
-SELECT 'Research Alerts', 'Daily intelligence on DeFi, stablecoins, AI crypto, security alerts, macro markets, and Circle ecosystem — delivered to Telegram', 'research_monitor', 1, 0, 'none'
-WHERE NOT EXISTS (SELECT 1 FROM funds WHERE strategy_type = 'research_monitor');

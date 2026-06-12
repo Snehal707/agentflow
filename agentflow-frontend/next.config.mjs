@@ -41,6 +41,11 @@ const nextConfig = {
       },
     ],
   },
+  // The funding page moved from /funds to /funding (clearer naming, and avoids
+  // confusion with the removed "Funds" DCA feature). Keep old links working.
+  async redirects() {
+    return [{ source: "/funds", destination: "/funding", permanent: true }];
+  },
   webpack(config) {
     config.resolve.alias = {
       ...config.resolve.alias,

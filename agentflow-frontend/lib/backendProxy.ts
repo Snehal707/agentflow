@@ -13,6 +13,14 @@ export function getBackendUrl(path: string): string {
   return `${normalizeBaseUrl(base)}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+function appendRequestSearch(path: string, request: Request): string {
+  const { search } = new URL(request.url);
+  if (!search) {
+    return path;
+  }
+  return `${path}${path.includes("?") ? "&" : "?"}${search.slice(1)}`;
+}
+
 const UPSTREAM_FETCH_MS = 55_000;
 
 export async function proxyBackendRequest(
@@ -31,6 +39,16 @@ export async function proxyBackendRequest(
     headers.set("authorization", authorization);
   }
 
+  // Forward the real client IP. Without this, a same-host backend sees every
+  // proxied request as loopback (127.0.0.1) and could wrongly grant the
+  // INTERNAL_ADMIN_BYPASS_LOCAL admin bypass to any public user. Passing the
+  // edge's X-Forwarded-For / X-Real-IP through keeps that bypass loopback-only.
+  const forwardedFor =
+    request.headers.get("x-forwarded-for") ?? request.headers.get("x-real-ip");
+  if (forwardedFor) {
+    headers.set("x-forwarded-for", forwardedFor);
+  }
+
   const body =
     method === "GET" || method === "HEAD" ? undefined : await request.text();
 
@@ -38,7 +56,8 @@ export async function proxyBackendRequest(
   const kill = setTimeout(() => ctrl.abort(), UPSTREAM_FETCH_MS);
 
   try {
-    const upstream = await fetch(getBackendUrl(path), {
+    const upstreamPath = appendRequestSearch(path, request);
+    const upstream = await fetch(getBackendUrl(upstreamPath), {
       method,
       headers,
       body,

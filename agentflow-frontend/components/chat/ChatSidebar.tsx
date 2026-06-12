@@ -11,12 +11,54 @@ import { sidebarWidthClass } from "@/lib/useSidebarPreference";
 const navIconMap: Record<string, string> = {
   "/chat": "forum",
   "/pay": "payments",
-  "/funds": "account_balance_wallet",
+  "/funding": "account_balance_wallet",
   "/portfolio": "pie_chart",
   "/agents": "storefront",
-  "/memory": "neurology",
   "/telegram": "send",
 };
+
+const socialLinks = [
+  { label: "X", href: "https://x.com/AgentFlowone" },
+  { label: "Discord", href: "https://discord.gg/MskKAf6VRz" },
+  { label: "Docs", href: "/docs" },
+] as const;
+
+function SidebarSocialIcon({ label }: { label: (typeof socialLinks)[number]["label"] }) {
+  if (label === "X") {
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden className="h-[0.85rem] w-[0.85rem]">
+        <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+      </svg>
+    );
+  }
+
+  if (label === "Discord") {
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden className="h-[0.85rem] w-[0.85rem]">
+        <path d="M20.317 4.37A19.8 19.8 0 0 0 15.886 3c-.192.34-.414.797-.567 1.154a18.3 18.3 0 0 0-6.638 0A12.7 12.7 0 0 0 8.114 3a19.74 19.74 0 0 0-4.432 1.37C.883 8.58-.033 12.64.321 16.64A19.9 19.9 0 0 0 6.39 19.69c.486-.66.92-1.36 1.296-2.1a12.9 12.9 0 0 1-2.036-.98c.171-.13.338-.26.5-.39a14.18 14.18 0 0 0 12.13 0c.16.13.328.26.499.39-.647.38-1.329.71-2.036.98.376.74.81 1.44 1.296 2.1a19.86 19.86 0 0 0 6.07-3.05c.41-4.63-.69-8.67-3.8-12.27zM8.02 14.18c-1.18 0-2.15-1.08-2.15-2.41 0-1.34.95-2.42 2.15-2.42 1.21 0 2.18 1.09 2.16 2.42 0 1.33-.95 2.41-2.16 2.41zm7.96 0c-1.18 0-2.15-1.08-2.15-2.41 0-1.34.95-2.42 2.15-2.42 1.21 0 2.18 1.09 2.16 2.42 0 1.33-.95 2.41-2.16 2.41z" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+      className="h-[0.85rem] w-[0.85rem]"
+    >
+      <path d="M8 3.5h6l4 4V20.5H8a2.5 2.5 0 0 1-2.5-2.5V6A2.5 2.5 0 0 1 8 3.5z" />
+      <path d="M14 3.5v4h4" />
+      <path d="M9 11h6" />
+      <path d="M9 14.5h6" />
+      <path d="M9 18h4" />
+    </svg>
+  );
+}
 
 type ChatSidebarProps = {
   collapsed?: boolean;
@@ -149,7 +191,7 @@ export function ChatSidebar({
                 {icon}
               </span>
               {collapsed ? null : (
-                <span className="font-label tracking-[0.18em] uppercase text-[10px] font-extrabold">
+                <span className="min-w-0 flex-1 font-label text-left text-[11px] font-bold uppercase tracking-[0.12em] subpixel-antialiased">
                   {item.label}
                 </span>
               )}
@@ -159,6 +201,29 @@ export function ChatSidebar({
       </nav>
 
       <div className="min-h-0 flex-1" />
+
+      <div className={`border-t border-white/5 pt-4 ${collapsed ? "px-2 pb-3" : "px-4 pb-4"}`}>
+        <div
+          className={`flex ${
+            collapsed
+              ? "items-center justify-center gap-2 border-y border-white/5 py-3"
+              : "items-center gap-2 px-3"
+          }`}
+        >
+          {socialLinks.map((link) => (
+            <a
+              key={link.label}
+              href={link.href}
+              target={link.href.startsWith("http") ? "_blank" : undefined}
+              rel={link.href.startsWith("http") ? "noreferrer noopener" : undefined}
+              title={link.label}
+              className="flex h-9 w-9 items-center justify-center text-white/34 transition-all duration-300 hover:text-[#f2ca50]"
+            >
+              <SidebarSocialIcon label={link.label} />
+            </a>
+          ))}
+        </div>
+      </div>
 
       {/* History */}
       <div ref={historyWrapRef} className={`relative mt-1 w-full flex-shrink-0 border-t border-white/5 pt-4 ${collapsed ? "px-2" : "px-4"}`}>
@@ -180,7 +245,7 @@ export function ChatSidebar({
             history
           </span>
           {collapsed ? null : (
-            <span className="min-w-0 flex-1 text-left text-[10px] font-extrabold uppercase tracking-[0.18em]">
+            <span className="min-w-0 flex-1 text-left text-[11px] font-bold uppercase tracking-[0.12em] subpixel-antialiased">
               Recent chats
             </span>
           )}

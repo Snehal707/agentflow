@@ -63,6 +63,7 @@ function encodeQuickActionMessage(action: QuickAction, contextTitle?: string): s
   return `[[AF_ACTION:${encodeURIComponent(JSON.stringify({
     prompt: action.prompt,
     ...(action.actionId ? { actionId: action.actionId } : {}),
+    ...(action.routeIntent ? { routeIntent: action.routeIntent } : {}),
   }))}]]${quickActionDisplayLabel(action, contextTitle)}`;
 }
 
@@ -78,6 +79,7 @@ function isArcTxReceiptMessage(message: LiveChatMessage): boolean {
     /^Swap complete on Arc\./m.test(c) ||
     /^Vault (?:deposit|withdraw) complete on Arc\./m.test(c) ||
     /^Bridge complete on Arc\./m.test(c) ||
+    /^- \*\*Amount:\*\* .+\n- \*\*Route:\*\* .+ -> Arc/m.test(c) ||
     /^Bridge:\s.+-> Arc/m.test(c) ||
     /^Bridged .* USDC to Arc/m.test(c) ||
     /\bcomplete on Arc\.\s*\n\nTx:/m.test(c) ||
@@ -100,7 +102,7 @@ function stripDisplayMetadata(content: string): string {
 
 function stripConfirmationCta(content: string): string {
   return content
-    .replace(/\n*Reply\s+YES\s+to\s+\w[\w\s]*?(?:\s+or\s+NO\s+to\s+cancel)?\.?\s*$/i, "")
+    .replace(/\n*Reply\s+[*_]*YES[*_]*\s+to\s+\w[\w\s]*?(?:\s+or\s+[*_]*NO[*_]*\s+to\s+cancel)?\.?\s*$/i, "")
     .replace(/\n*Reply\s+YES\s+to\s+cancel\s+or\s+NO\s+to\s+keep\s+it\.?\s*$/i, "")
     .replace(
       /\n+(?:\*\*)?Reply\s+YES\s+to\s+confirm[\s\S]*?(?:NO\s+to\s+cancel)?\.?\s*$/i,
@@ -108,6 +110,13 @@ function stripConfirmationCta(content: string): string {
     )
     .replace(/\n*Confirm\s+to\s+send\s+all\s+transfers[^.]*\.?\s*$/i, "")
     .trimEnd();
+}
+
+function isRefundConfirmationPrompt(content: string): boolean {
+  return (
+    /\brefund this market\?/i.test(content) &&
+    /reply\s+[*_]*yes[*_]*\s+to\s+execute\s+or\s+[*_]*no[*_]*\s+to\s+cancel\.?/i.test(content)
+  );
 }
 
 function stripPortfolioPaymentFooter(content: string): string {
@@ -609,14 +618,18 @@ export function ChatThread({
               ? deriveRatingMeta(message)
               : undefined;
           const hasImplicitConfirmationPrompt =
-            (/reply\s*YES\b/i.test(message.content) ||
-              /\bconfirm(?:\s+with)?\s+YES\b/i.test(message.content)) &&
+            (/reply[\s*_]*YES\b/i.test(message.content) ||
+              /\bconfirm(?:\s+with)?[\s*_]*YES\b/i.test(message.content)) &&
             /\bNO\b/i.test(message.content);
+          const hasRefundConfirmationPrompt = isRefundConfirmationPrompt(message.content);
           const showConfirmationActions =
             isAssistant &&
             typeof onSendMessage === "function" &&
-            (message.confirmation?.required === true || hasImplicitConfirmationPrompt) &&
-            index === messages.length - 1;
+            (
+              message.confirmation?.required === true ||
+              hasRefundConfirmationPrompt ||
+              (hasImplicitConfirmationPrompt && index === messages.length - 1)
+            );
           const renderedContent = isAssistant
             ? normalizeCollapsedAssistantFormatting(
                 stripOuterCodeFenceForAssistantText(

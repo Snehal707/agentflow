@@ -29,7 +29,7 @@ export type HandleProfile = {
 export const navItems: NavItem[] = [
   { href: "/chat", label: "Chat", icon: "forum" },
   { href: "/pay", label: "AgentPay", icon: "payments" },
-  { href: "/funds", label: "Funding", icon: "account_balance" },
+  { href: "/funding", label: "Funding", icon: "account_balance" },
   { href: "/portfolio", label: "Portfolio", icon: "bar_chart" },
   { href: "/agents", label: "Agents", icon: "smart_toy" },
   { href: "/telegram", label: "Telegram", icon: "send" },

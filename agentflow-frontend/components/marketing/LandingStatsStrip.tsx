@@ -3,12 +3,13 @@
 import { useEffect, useState } from "react";
 
 type StatsPayload = {
-  total_transactions?: number;
+  core_agents?: number;
   onchain_transactions?: number;
+  agent_to_agent_payments?: number;
 };
 
 export function LandingStatsStrip() {
-  const [stats, setStats] = useState({ total: 0, onchain: 0 });
+  const [stats, setStats] = useState({ a2a: 0, onchain: 0, coreAgents: 12 });
 
   useEffect(() => {
     let cancelled = false;
@@ -17,13 +18,17 @@ export function LandingStatsStrip() {
       .then((data: StatsPayload) => {
         if (cancelled) return;
         setStats({
-          total: typeof data.total_transactions === "number" ? data.total_transactions : 0,
+          coreAgents: typeof data.core_agents === "number" ? data.core_agents : 12,
+          a2a:
+            typeof data.agent_to_agent_payments === "number"
+              ? data.agent_to_agent_payments
+              : 0,
           onchain:
             typeof data.onchain_transactions === "number" ? data.onchain_transactions : 0,
         });
       })
       .catch(() => {
-        if (!cancelled) setStats({ total: 0, onchain: 0 });
+        if (!cancelled) setStats({ a2a: 0, onchain: 0, coreAgents: 12 });
       });
     return () => {
       cancelled = true;
@@ -31,34 +36,37 @@ export function LandingStatsStrip() {
   }, []);
 
   return (
-    <div className="grid gap-4 border-y border-[#4d4635]/20 py-6 sm:grid-cols-3 sm:gap-8">
-      <div>
-        <div className="font-label text-[10px] uppercase tracking-[0.2em] text-[#d0c5af]/48">
+    <div className="font-display-sans">
+      <div className="grid gap-4 py-2 sm:grid-cols-3 sm:gap-5">
+        <div className="flex h-full flex-col rounded-2xl border border-white/[0.06] bg-white/[0.02] p-5 transition-all duration-300 hover:border-amber-400/20 hover:bg-white/[0.04]">
+          <div className="max-w-[10ch] text-[10px] font-bold uppercase tracking-[0.2em] text-white/50">
           Onchain transactions
+          </div>
+          <div className="mt-auto pt-4 bg-gradient-to-r from-amber-400 via-yellow-400 to-amber-200 bg-clip-text text-3xl font-black tracking-tight tabular-nums text-transparent md:text-4xl">
+            {stats.onchain.toLocaleString("en-US")}
+          </div>
         </div>
-        <div className="mt-2 font-headline text-3xl font-bold text-[#f2ca50] md:text-4xl">
-          {stats.onchain.toLocaleString("en-US")}+
+        <div className="flex h-full flex-col rounded-2xl border border-white/[0.06] bg-white/[0.02] p-5 transition-all duration-300 hover:border-amber-400/20 hover:bg-white/[0.04]">
+          <div className="max-w-[10ch] text-[10px] font-bold uppercase tracking-[0.2em] text-white/50">
+            Core agents
+          </div>
+          <div className="mt-auto pt-4 bg-gradient-to-r from-amber-400 via-yellow-400 to-amber-200 bg-clip-text text-3xl font-black tracking-tight tabular-nums text-transparent md:text-4xl">
+            {stats.coreAgents}
+          </div>
         </div>
-        <div className="mt-1 text-xs text-[#d0c5af]/60">Recorded on Arc</div>
+        <div className="flex h-full flex-col rounded-2xl border border-white/[0.06] bg-white/[0.02] p-5 transition-all duration-300 hover:border-amber-400/20 hover:bg-white/[0.04]">
+          <div className="max-w-[10ch] text-[10px] font-bold uppercase tracking-[0.2em] text-white/50">
+            Agent-to-agent payments
+          </div>
+          <div className="mt-auto pt-4 bg-gradient-to-r from-amber-400 via-yellow-400 to-amber-200 bg-clip-text text-3xl font-black tracking-tight tabular-nums text-transparent md:text-4xl">
+            {stats.a2a.toLocaleString("en-US")}
+          </div>
+        </div>
       </div>
-      <div>
-        <div className="font-label text-[10px] uppercase tracking-[0.2em] text-[#d0c5af]/48">
-          Settlement rail
-        </div>
-        <div className="mt-2 font-headline text-3xl font-bold text-[#f2ca50] md:text-4xl">
-          Arc + USDC
-        </div>
-        <div className="mt-1 text-xs text-[#d0c5af]/60">Stable-fee execution</div>
-      </div>
-      <div>
-        <div className="font-label text-[10px] uppercase tracking-[0.2em] text-[#d0c5af]/48">
-          x402 activity
-        </div>
-        <div className="mt-2 font-headline text-3xl font-bold text-[#f2ca50] md:text-4xl">
-          {stats.total > 0 ? stats.total.toLocaleString("en-US") : "Live"}
-        </div>
-        <div className="mt-1 text-xs text-[#d0c5af]/60">Buyer and seller traces</div>
-      </div>
+
+      <p className="mt-4 text-center font-mono text-[10px] uppercase tracking-[0.2em] text-amber-100/45">
+        Live product and settlement metrics
+      </p>
     </div>
   );
 }

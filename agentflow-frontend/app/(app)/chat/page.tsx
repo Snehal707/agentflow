@@ -216,23 +216,54 @@ function QuickAgentPromptStrip({
   disabled: boolean;
   onSelect: (prompt: QuickAgentPrompt) => void;
 }) {
+  // Default to "Start here" so a first-time user sees free discovery prompts,
+  // not a money-moving action.
+  const [activeGroup, setActiveGroup] = useState<StarterGroup>("Start here");
+  const groupPrompts = quickAgentPrompts.filter((item) => item.group === activeGroup);
+
   return (
-    <div
-      className="mx-auto mt-[22px] flex max-w-[1064px] flex-wrap justify-center gap-3"
-      aria-label="AgentFlow prompt starters"
-    >
-      {quickAgentPrompts.map((item) => (
-        <button
-          key={item.label}
-          type="button"
-          disabled={disabled}
-          onClick={() => onSelect(item)}
-          title={item.prompt}
-          className="min-h-[50px] rounded-full border border-white/10 bg-[#202020]/90 px-6 text-[11px] font-black uppercase tracking-[0.2em] text-white/45 shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_12px_30px_rgba(0,0,0,0.28)] transition hover:border-[#f2ca50]/45 hover:bg-[#211f16] hover:text-[#f2ca50] disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {item.label}
-        </button>
-      ))}
+    <div className="mx-auto mt-[22px] flex max-w-[1064px] flex-col items-center gap-4">
+      {/* Category tabs */}
+      <div className="flex flex-wrap justify-center gap-2" role="tablist" aria-label="Prompt categories">
+        {starterGroups.map((group) => {
+          const active = group === activeGroup;
+          return (
+            <button
+              key={group}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              onClick={() => setActiveGroup(group)}
+              className={`rounded-full px-4 py-1.5 text-[10px] font-bold uppercase tracking-[0.18em] transition ${
+                active
+                  ? "border border-[#f2ca50]/50 bg-[#211f16] text-[#f2ca50]"
+                  : "border border-white/10 bg-transparent text-white/40 hover:text-white/75"
+              }`}
+            >
+              {group}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Prompts for the active category */}
+      <div
+        className="flex flex-wrap justify-center gap-3"
+        aria-label="AgentFlow prompt starters"
+      >
+        {groupPrompts.map((item) => (
+          <button
+            key={item.label}
+            type="button"
+            disabled={disabled}
+            onClick={() => onSelect(item)}
+            title={item.prompt}
+            className="min-h-[50px] rounded-full border border-white/10 bg-[#202020]/90 px-6 text-[11px] font-black uppercase tracking-[0.2em] text-white/45 shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_12px_30px_rgba(0,0,0,0.28)] transition hover:border-[#f2ca50]/45 hover:bg-[#211f16] hover:text-[#f2ca50] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -250,43 +281,72 @@ const promptTabs = [
 ] as const;
 type PromptTab = (typeof promptTabs)[number];
 
+// Display-only grouping for the starter strip (decoupled from PromptTab routing).
+// Newbies land on "Start here" (free info), then explore a service group where
+// "learn" prompts sit next to a "try" action — information first, then action.
+const starterGroups = [
+  "Start here",
+  "Payments",
+  "DeFi & Trading",
+  "Bridge & Funds",
+  "Research & AI",
+  "Agents & trust",
+] as const;
+type StarterGroup = (typeof starterGroups)[number];
+
 type QuickAgentPrompt = {
   label: string;
+  /** Routing fallback. Info prompts use "AgentPay" which inferPromptIntent maps
+   * to free Conversation (product knowledge); action prompts use their service. */
   tab: PromptTab;
+  group: StarterGroup;
   prompt: string;
+  routeIntent?: ChatIntent;
+  actionId?: string;
 };
 
 const quickAgentPrompts: QuickAgentPrompt[] = [
-  {
-    label: "Agent Runs",
-    tab: "Research",
-    prompt: "Research Arc stablecoin payments today and write a concise sourced report.",
-  },
-  {
-    label: "AgentPay",
-    tab: "AgentPay",
-    prompt: "Show my contacts.",
-  },
-  {
-    label: "Swap USDC",
-    tab: "Swap",
-    prompt: "Swap 1 USDC to EURC.",
-  },
-  {
-    label: "Vault Yield",
-    tab: "Vault",
-    prompt: "What is the current AgentFlow Vault APY?",
-  },
-  {
-    label: "Bridge to Arc",
-    tab: "Bridge",
-    prompt: "Bridge 0.1 USDC from Ethereum Sepolia to Arc.",
-  },
-  {
-    label: "Portfolio Scan",
-    tab: "Portfolio",
-    prompt: "Show my portfolio.",
-  },
+  // --- Start here: free discovery, no wallet/funds needed ---
+  { label: "What can you do?", tab: "AgentPay", group: "Start here", prompt: "What can AgentFlow do for me?", routeIntent: "Conversation" },
+  { label: "Get started", tab: "AgentPay", group: "Start here", prompt: "How do I get started with AgentFlow?", routeIntent: "Conversation" },
+  { label: "Add funds", tab: "AgentPay", group: "Start here", prompt: "Explain how funding and Gateway work", routeIntent: "Conversation" },
+  { label: "What it costs", tab: "AgentPay", group: "Start here", prompt: "What does AgentFlow cost per task?", routeIntent: "Conversation" },
+  { label: "Use my language", tab: "AgentPay", group: "Start here", prompt: "Explain what languages AgentFlow supports", routeIntent: "Conversation" },
+
+  // --- Payments: full AgentPay surface ---
+  { label: "About AgentPay", tab: "AgentPay", group: "Payments", prompt: "Explain AgentPay and its features", routeIntent: "Conversation" },
+  { label: "Send USDC", tab: "AgentPay", group: "Payments", prompt: "Explain how sending USDC works on AgentFlow", routeIntent: "Conversation" },
+  { label: "Request & links", tab: "AgentPay", group: "Payments", prompt: "Explain payment requests, links and QR codes on AgentFlow", routeIntent: "Conversation" },
+  { label: "Invoices", tab: "AgentPay", group: "Payments", prompt: "Explain how invoices work on AgentFlow", routeIntent: "Conversation" },
+  { label: "Split a bill", tab: "AgentPay", group: "Payments", prompt: "Explain how splitting a bill works on AgentFlow", routeIntent: "Conversation" },
+  { label: "Batch / payroll", tab: "AgentPay", group: "Payments", prompt: "Explain how batch payments and payroll work", routeIntent: "Conversation" },
+  { label: "Scheduled pay", tab: "AgentPay", group: "Payments", prompt: "Explain how scheduled and recurring payments work", routeIntent: "Conversation" },
+  { label: "Contacts & .arc", tab: "AgentPay", group: "Payments", prompt: "Explain how contacts and .arc handles work", routeIntent: "Conversation" },
+
+  // --- DeFi & Trading: learn, then try ---
+  { label: "How swaps work", tab: "AgentPay", group: "DeFi & Trading", prompt: "Explain how token swaps work on AgentFlow", routeIntent: "Conversation" },
+  { label: "Try a swap", tab: "Swap", group: "DeFi & Trading", prompt: "Swap 1 USDC to EURC.", routeIntent: "Swap" },
+  { label: "Vaults & yield", tab: "AgentPay", group: "DeFi & Trading", prompt: "Explain how vaults and yield work on AgentFlow", routeIntent: "Conversation" },
+  { label: "Show vaults", tab: "Vault", group: "DeFi & Trading", prompt: "Show available vaults.", routeIntent: "Vault" },
+  { label: "Prediction markets", tab: "AgentPay", group: "DeFi & Trading", prompt: "Explain how prediction markets work on AgentFlow", routeIntent: "Conversation" },
+  { label: "Show markets", tab: "AgentPay", group: "DeFi & Trading", prompt: "Show prediction markets.", routeIntent: "Conversation" },
+
+  // --- Bridge & Funds ---
+  { label: "How to bridge", tab: "Bridge", group: "Bridge & Funds", prompt: "Explain how bridging USDC to Arc works", routeIntent: "Bridge" },
+  { label: "Supported chains", tab: "Bridge", group: "Bridge & Funds", prompt: "Which chains can I bridge from?", routeIntent: "Bridge" },
+  { label: "My portfolio", tab: "Portfolio", group: "Bridge & Funds", prompt: "Show my portfolio.", routeIntent: "Portfolio" },
+
+  // --- Research & AI ---
+  { label: "About Research", tab: "AgentPay", group: "Research & AI", prompt: "What can the Research agent do?", routeIntent: "Conversation" },
+  { label: "Image analysis", tab: "AgentPay", group: "Research & AI", prompt: "What can you do with an image I upload?", routeIntent: "Conversation" },
+  { label: "Voice to text", tab: "AgentPay", group: "Research & AI", prompt: "Explain how voice to text works on AgentFlow", routeIntent: "Conversation" },
+  { label: "Remembers me", tab: "AgentPay", group: "Research & AI", prompt: "Explain how AgentFlow remembers my preferences and past chats", routeIntent: "Conversation" },
+  { label: "On Telegram", tab: "AgentPay", group: "Research & AI", prompt: "Explain how to use AgentFlow on Telegram", routeIntent: "Conversation" },
+
+  // --- Agents & trust ---
+  { label: "Agent Store", tab: "AgentPay", group: "Agents & trust", prompt: "What is the Agent Store?", routeIntent: "Conversation" },
+  { label: "Reputation & ratings", tab: "AgentPay", group: "Agents & trust", prompt: "Explain how agent reputation and ratings work", routeIntent: "Conversation" },
+  { label: "The AI runtime", tab: "AgentPay", group: "Agents & trust", prompt: "What AI powers AgentFlow?", routeIntent: "Conversation" },
 ];
 
 type ExecutionTarget = "EOA" | "DCW";
@@ -601,20 +661,37 @@ function decodeQuickActionMessage(value: string): {
   displayText: string;
   prompt: string | null;
   actionId: string | null;
+  routeIntent: ChatIntent | null;
 } {
   const match = value.match(/^\[\[AF_ACTION:([^\]]+)]]([\s\S]*)$/);
   if (!match) {
-    return { displayText: value, prompt: null, actionId: null };
+    return { displayText: value, prompt: null, actionId: null, routeIntent: null };
   }
 
   let prompt: string | null = null;
   let actionId: string | null = null;
+  let routeIntent: ChatIntent | null = null;
   try {
     const decoded = decodeURIComponent(match[1]);
     try {
-      const payload = JSON.parse(decoded) as { prompt?: unknown; actionId?: unknown };
+      const payload = JSON.parse(decoded) as {
+        prompt?: unknown;
+        actionId?: unknown;
+        routeIntent?: unknown;
+      };
       prompt = typeof payload.prompt === "string" ? payload.prompt : null;
       actionId = typeof payload.actionId === "string" ? payload.actionId : null;
+      routeIntent =
+        payload.routeIntent === "Research" ||
+        payload.routeIntent === "AgentPay" ||
+        payload.routeIntent === "Swap" ||
+        payload.routeIntent === "Vault" ||
+        payload.routeIntent === "Bridge" ||
+        payload.routeIntent === "Portfolio" ||
+        payload.routeIntent === "Conversation" ||
+        payload.routeIntent === "Vision"
+          ? payload.routeIntent
+          : null;
     } catch {
       // Keep older quick-action envelopes working during rolling frontend updates.
       prompt = decoded;
@@ -627,7 +704,41 @@ function decodeQuickActionMessage(value: string): {
     displayText: match[2] || "",
     prompt,
     actionId,
+    routeIntent,
   };
+}
+
+function tabForIntent(intent: ChatIntent | PromptTab): PromptTab {
+  switch (intent) {
+    case "Swap":
+      return "Swap";
+    case "Vault":
+      return "Vault";
+    case "Bridge":
+      return "Bridge";
+    case "Portfolio":
+      return "Portfolio";
+    case "Research":
+      return "Research";
+    case "AgentPay":
+    case "Conversation":
+    case "Vision":
+    default:
+      return "AgentPay";
+  }
+}
+
+function resolveQuickActionIntentOverride(input: {
+  routeIntent?: ChatIntent | null;
+  actionId?: string | null;
+}): ChatIntent | null {
+  if (input.routeIntent) {
+    return input.routeIntent;
+  }
+  if (input.actionId === "bridge.funded_chains") {
+    return "Bridge";
+  }
+  return null;
 }
 
 function flattenQuickActions(
@@ -1260,6 +1371,24 @@ function isBridgeSourceDiscoveryPrompt(prompt: string): boolean {
   );
 }
 
+function isBridgeFundedChainsQuickAction(input: {
+  prompt?: string | null;
+  actionId?: string | null;
+}): boolean {
+  if (input.actionId === "bridge.funded_chains") {
+    return true;
+  }
+  const prompt = String(input.prompt ?? "").trim();
+  if (!prompt) {
+    return false;
+  }
+  return (
+    /\bshow my funded chains\b/i.test(prompt) ||
+    /\bwhich bridge source chains have usdc and gas\b/i.test(prompt) ||
+    /\bsupported source chains where this wallet already has usdc and gas\b/i.test(prompt)
+  );
+}
+
 function formatBridgeAmountPrompt(amount: number | null, label: string): string {
   return amount
     ? `Bridge ${amount} USDC from ${label} to Arc.`
@@ -1274,7 +1403,10 @@ function findPendingBridgeAmountSource(messages: LiveChatMessage[]): BridgeSourc
     }
     if (
       /\bhow much\s+usdc\b[\s\S]*\bbridge\b/i.test(message.content) ||
-      /\bsource chain locked\b[\s\S]*\btell me how much\b/i.test(message.content)
+      /\bsource chain locked\b[\s\S]*\btell me how much\b/i.test(message.content) ||
+      /\bhow much\s+usdc\s+from\b[\s\S]*\b(?:pick an amount|say\s+"?all"?|say\s+'?all'?)\b/i.test(
+        message.content,
+      )
     ) {
       const source = detectBridgeSource(message.content);
       if (source) {
@@ -1317,23 +1449,42 @@ function buildBridgeReceiptContent(input: {
   mintTxHash?: string | null;
   paymentRequestId?: string | null;
 }): string {
-  return [
-    `Bridge: ${input.amount} USDC from ${input.sourceLabel} -> Arc`,
-    "Bridge complete on Arc.",
-    `Source signer: Connected EOA on ${input.sourceLabel}`,
-    `AgentFlow wallet: ${input.userDcwAddress}`,
-    input.approvalTxHash ? "Approval tx:" : null,
-    input.approvalTxHash ?? null,
-    input.approvalTxHash ? `Approval explorer: ${bridgeTxExplorerUrl(input.sourceChain, input.approvalTxHash)}` : null,
-    "Burn tx:",
-    input.burnTxHash,
-    `Burn explorer: ${bridgeTxExplorerUrl(input.sourceChain, input.burnTxHash)}`,
-    input.mintTxHash ? "Mint tx:" : null,
-    input.mintTxHash ?? null,
-    input.mintTxHash ? `Mint explorer: ${arcTxExplorerUrl(input.mintTxHash)}` : "Mint completed through Circle forwarder.",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const lines = [
+    `- **Amount:** ${input.amount} USDC`,
+    `- **Route:** ${input.sourceLabel} -> Arc`,
+    `- **Source signer:** Connected EOA on ${input.sourceLabel}`,
+    `- **AgentFlow wallet:** **${input.userDcwAddress}**`,
+  ];
+
+  if (input.approvalTxHash) {
+    lines.push(
+      "",
+      "### Source approval",
+      `- **Explorer:** [View on ${input.sourceLabel}](${bridgeTxExplorerUrl(input.sourceChain, input.approvalTxHash)})`,
+    );
+  }
+
+  lines.push(
+    "",
+    "### Source burn",
+    `- **Explorer:** [View on ${input.sourceLabel}](${bridgeTxExplorerUrl(input.sourceChain, input.burnTxHash)})`,
+  );
+
+  if (input.mintTxHash) {
+    lines.push(
+      "",
+      "### Arc mint",
+      `- **Explorer:** [View on Arcscan](${arcTxExplorerUrl(input.mintTxHash)})`,
+    );
+  } else {
+    lines.push(
+      "",
+      "### Arc mint",
+      "- Mint completed through Circle forwarder.",
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function buildVaultListContent(vaults: Array<Record<string, unknown>>): string {
@@ -2545,7 +2696,7 @@ function ChatPageInner() {
   };
 
   const handleQuickAgentPrompt = useCallback((item: QuickAgentPrompt) => {
-    setSelectedTab(item.tab);
+    setSelectedTab(tabForIntent(item.routeIntent ?? item.tab));
     setInput(item.prompt);
     setPendingAttachment(null);
     setPendingBridgeDraft(null);
@@ -4057,6 +4208,10 @@ function ChatPageInner() {
         ? resolveQuickActionPromptFromReply(trimmed, messages)
         : null);
     const effectiveInput = resolvedQuickActionPrompt ?? trimmed;
+    const quickActionIntentOverride = resolveQuickActionIntentOverride({
+      routeIntent: decodedQuickAction.routeIntent,
+      actionId: decodedQuickAction.actionId,
+    });
 
     if (pendingSwapSelection && !activeAttachment) {
       const followupAmount = parseOptionalAmount(trimmed);
@@ -4544,14 +4699,15 @@ function ChatPageInner() {
       }
     }
 
-    const inferredIntent = csvBatchMessage
+    const inferredIntent = quickActionIntentOverride ??
+      (csvBatchMessage
       ? inferPromptIntent(csvBatchMessage, selectedTab)
       : activeAttachment
       ? "Vision"
-      : inferPromptIntent(effectiveInput, selectedTab);
+      : inferPromptIntent(effectiveInput, selectedTab));
     const routedTab = promptTabs.includes(inferredIntent as PromptTab)
       ? (inferredIntent as PromptTab)
-      : null;
+      : tabForIntent(inferredIntent);
 
     if (routedTab && routedTab !== selectedTab) {
       setSelectedTab(routedTab);
@@ -4564,12 +4720,18 @@ function ChatPageInner() {
       : inferredIntent;
     const normalizedEffectiveInput = normalizePromptForIntent(effectiveInput);
     const promptBridgeSource = detectBridgeSource(effectiveInput);
+    const bridgeFundedChainsQuickAction = isBridgeFundedChainsQuickAction({
+      prompt: decodedQuickAction.prompt,
+      actionId: decodedQuickAction.actionId,
+    });
     const useNativeBridgeFlow =
       !activeAttachment &&
-      intent === "Bridge" &&
-      ((explicitBridgeActionPattern.test(normalizedEffectiveInput) &&
-        (!isBridgeInfoPrompt(normalizedEffectiveInput) || isBridgeSourceDiscoveryPrompt(normalizedEffectiveInput))) ||
-        Boolean(promptBridgeSource));
+      (Boolean(promptBridgeSource) ||
+        (intent === "Bridge" &&
+          explicitBridgeActionPattern.test(normalizedEffectiveInput) &&
+          (!isBridgeInfoPrompt(normalizedEffectiveInput) ||
+            isBridgeSourceDiscoveryPrompt(normalizedEffectiveInput))) ||
+        bridgeFundedChainsQuickAction);
     const useBrainConversation =
       (!activeAttachment || Boolean(csvBatchMessage)) && !useNativeBridgeFlow;
 
@@ -4639,10 +4801,9 @@ function ChatPageInner() {
           const holdings = await fetchBridgeSourceHoldings(bridgeContext.payerAddress);
           const fundedChains = holdings.filter((entry) => entry.usdcBalanceRaw > BigInt(0));
           const choices = (fundedChains.length ? fundedChains : holdings).map((entry) => ({
-            label:
-              `${entry.label} (${formatBridgeBalanceShort(entry.usdcBalanceRaw, 6)} USDC` +
-              `, ${formatBridgeBalanceShort(entry.nativeBalanceRaw, 18)} gas)`,
+            label: entry.label,
             prompt: formatBridgeAmountPrompt(amount, entry.label),
+            routeIntent: "Bridge" as const,
             tone: "primary" as const,
           }));
 
@@ -5621,7 +5782,7 @@ function ChatPageInner() {
         />
 
         <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
-          <section className="flex min-h-0 min-w-0 flex-1 justify-center overflow-hidden bg-[#080808]">
+          <section className="flex min-h-0 min-w-0 flex-1 justify-center overflow-x-hidden overflow-y-visible bg-[#080808]">
             <div className="flex min-h-0 w-full max-w-6xl flex-1 px-6 xl:px-10">
             {hasConversation ? (
               <div className="flex min-h-0 min-w-0 flex-1">
@@ -5676,10 +5837,10 @@ function ChatPageInner() {
                 </div>
               </div>
             ) : (
-              <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+              <div className="flex min-h-0 min-w-0 flex-1 overflow-visible">
                 <div className="mx-auto flex h-full w-full max-w-[1064px] flex-col justify-start px-6 pb-8 pt-[clamp(11.25rem,26vh,14rem)] xl:px-10">
-                  <div className="text-center">
-                    <h1 className="font-headline text-[clamp(2.6rem,4.35vw,4.05rem)] font-black leading-[1] tracking-tight text-white">
+                  <div className="overflow-visible pt-2 pb-5 text-center">
+                    <h1 className="inline-block pb-[0.2em] font-headline text-[clamp(2.6rem,4.35vw,4.05rem)] font-black leading-[1.22] tracking-tight text-white [text-shadow:0_1px_0_rgba(255,255,255,0.14),0_6px_0_rgba(0,0,0,0.16),0_14px_24px_rgba(0,0,0,0.42)]">
                       How can I help today?
                     </h1>
                   </div>

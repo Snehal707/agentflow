@@ -36,14 +36,46 @@ const RESTART_DELAY_MS = 3000;
 const HEALTH_CHECK_DELAY_MS = 30000;
 const HEALTH_CHECK_INTERVAL_MS = 30000;
 const HEALTH_CHECK_TIMEOUT_MS = 3000;
+const DEFAULT_STARTUP_GRACE_MS = 45_000;
 const CRITICAL_HEALTH_TARGETS = [
-  { name: "frontend", url: "http://127.0.0.1:3005/api/health", starter: () => startFrontend() },
-  { name: "hermes", url: "http://127.0.0.1:8000/health", starter: () => startHermes() },
-  { name: "facilitator", url: "http://127.0.0.1:3010/health", starter: () => startBackendProcess({ name: "facilitator", command: "tsx facilitator/server.ts" }) },
-  { name: "research", url: "http://127.0.0.1:3001/health", starter: () => startBackendProcess({ name: "research", command: "tsx agents/research/server.ts" }) },
-  { name: "analyst", url: "http://127.0.0.1:3002/health", starter: () => startBackendProcess({ name: "analyst", command: "tsx agents/analyst/server.ts" }) },
-  { name: "writer", url: "http://127.0.0.1:3003/health", starter: () => startBackendProcess({ name: "writer", command: "tsx agents/writer/server.ts" }) },
-  { name: "api", url: "http://127.0.0.1:4000/health", starter: () => startBackendProcess({ name: "api", command: "tsx server.ts" }) },
+  {
+    name: "frontend",
+    url: "http://127.0.0.1:3005/api/health",
+    startupGraceMs: 120_000,
+    starter: () => startFrontend(),
+  },
+  {
+    name: "hermes",
+    url: "http://127.0.0.1:8000/health",
+    startupGraceMs: 60_000,
+    starter: () => startHermes(),
+  },
+  {
+    name: "facilitator",
+    url: "http://127.0.0.1:3010/health",
+    starter: () => startBackendProcess({ name: "facilitator", command: "tsx facilitator/server.ts" }),
+  },
+  {
+    name: "research",
+    url: "http://127.0.0.1:3001/health",
+    starter: () => startBackendProcess({ name: "research", command: "tsx agents/research/server.ts" }),
+  },
+  {
+    name: "analyst",
+    url: "http://127.0.0.1:3002/health",
+    starter: () => startBackendProcess({ name: "analyst", command: "tsx agents/analyst/server.ts" }),
+  },
+  {
+    name: "writer",
+    url: "http://127.0.0.1:3003/health",
+    starter: () => startBackendProcess({ name: "writer", command: "tsx agents/writer/server.ts" }),
+  },
+  {
+    name: "api",
+    url: "http://127.0.0.1:4000/health",
+    startupGraceMs: 60_000,
+    starter: () => startBackendProcess({ name: "api", command: "tsx server.ts" }),
+  },
 ];
 const criticalHealthTargetByName = new Map(
   CRITICAL_HEALTH_TARGETS.map((target) => [target.name, target]),
@@ -67,7 +99,13 @@ async function probeHealth(url) {
 }
 
 function registerManagedChild(name, child, restartFactory) {
-  managedChildren.set(name, { child, restartFactory });
+  const target = criticalHealthTargetByName.get(name);
+  managedChildren.set(name, {
+    child,
+    restartFactory,
+    startedAt: Date.now(),
+    startupGraceMs: target?.startupGraceMs ?? DEFAULT_STARTUP_GRACE_MS,
+  });
 
   child.on("exit", (code, signal) => {
     const current = managedChildren.get(name);
@@ -122,6 +160,18 @@ async function verifyCriticalServices() {
     const ok = await probeHealth(target.url);
     if (ok) {
       criticalHealthFailures.delete(target.name);
+      continue;
+    }
+    const managed = managedChildren.get(target.name);
+    const startupGraceMs = target.startupGraceMs ?? DEFAULT_STARTUP_GRACE_MS;
+    if (managed && Date.now() - managed.startedAt < startupGraceMs) {
+      const secondsRemaining = Math.ceil(
+        (startupGraceMs - (Date.now() - managed.startedAt)) / 1000,
+      );
+      criticalHealthFailures.delete(target.name);
+      console.warn(
+        `[dev:stack] ${target.name} is still within startup grace (${secondsRemaining}s left); skipping restart check for ${target.url}.`,
+      );
       continue;
     }
     if (managedChildren.has(target.name) || pendingRestarts.has(target.name)) {

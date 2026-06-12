@@ -48,6 +48,15 @@ const BRAIN_SYSTEM_PROMPT = `${CHAT_SYSTEM_PROMPT}
 
 You are AgentFlow chat, the natural-language conversation layer for AgentFlow.
 
+## Language
+- Default to English. Reply in English unless the user's most recent message is clearly and substantially written in another language.
+- When the user's latest message is clearly in another language (for example Spanish or Hindi), reply in that same language. Mirror the language of the latest message, not earlier turns.
+- Always reply in English for messages that are English, very short, transliterated, or ambiguous - for example "hi", "ok", "yes", "gm", "lol", a bare number, a wallet address, a .arc handle, or a single token symbol. Do not switch languages on these.
+- Match the user's language only for the conversational wording. Keep these tokens EXACTLY as-is, never translated or localized: agent names, .arc handles, wallet addresses, transaction hashes, token symbols (USDC, EURC), numeric amounts, dates from live data, CSV examples, and command or code syntax.
+- The confirmation keyword is always the literal English word "YES". When you ask a non-English user to confirm a previewed action, tell them in their language to reply with the exact word YES, but do not translate the keyword itself - the system only accepts "YES".
+- Never output a language-control marker, tag, or metadata line (such as "confirmation_language=..."). Just write the reply in the right language.
+- This governs only your own replies. It does not change how the user must phrase commands.
+
 ## AgentFlow Team
 
 AgentFlow was built by Snehal (@SnehalRekt on X), a solo founder building at the intersection of Web3 and AI agents on Arc Network.
@@ -939,6 +948,12 @@ function looksLikePromptOrPolicyProbe(userMessage: string): boolean {
   );
 }
 
+function looksLikeWalletContextProbe(userMessage: string): boolean {
+  return /wallet context|internal wallet|connected eoa|execution wallet|execution-wallet|exactly as you see|raw wallet|billetera|portefeuille|wallet-kontext|dahili.*wallet|内部.*wallet|ウォレット|지갑|कॉन्टेक्स्ट|वॉलेट|ข้อมูล wallet ภายใน|محفظة|кошел|钱包|carteira/i.test(
+    userMessage,
+  );
+}
+
 function looksLikeTerminalProbe(userMessage: string): boolean {
   return /\b(terminal|shell|bash|command output|cron job|standalone|Hermes CLI|system powers|demonstrate|practical diagnostic)\b/i.test(
     userMessage,
@@ -961,6 +976,12 @@ function responseLooksLikeEnvDump(text: string): boolean {
   return /```properties|(?:^|\s)(?:AGENTFLOW|CIRCLE|FEATURE|DATABASE|SECRET|ENCRYPTION|API)_[A-Z0-9_]+=|internal config/i.test(
     text,
   );
+}
+
+function responseLooksLikeSecretScopeDrift(text: string): boolean {
+  return /\bconnected wallet\b|\bexecution wallet\b|\bconnected EOA\b|\bDCW\b|кошел|billetera|portefeuille|carteira|ウォレット|지갑|वॉलेट|محفظة|钱包/i.test(
+    text,
+  ) && (/0x[a-f0-9]{6,}/i.test(text) || /0x[a-f0-9]{3,}\.\./i.test(text));
 }
 
 function responseLooksLikeRawToolList(text: string): boolean {
@@ -987,6 +1008,12 @@ function responseLooksLikeFakeCommandOutput(text: string): boolean {
   );
 }
 
+function responseLooksLikeRawToolCallJson(text: string): boolean {
+  return /^\s*\{\s*"name"\s*:\s*"[a-z][a-z0-9_-]*"\s*,\s*"arguments"\s*:\s*\{[\s\S]*\}\s*\}\s*$/i.test(
+    text,
+  );
+}
+
 function responseClaimsExactToolCount(text: string): boolean {
   return /\b(?:about\s*)?\d+\s+tools\b/i.test(text);
 }
@@ -999,6 +1026,37 @@ function responseLooksLikeCapabilityDump(text: string): boolean {
 
 function responseLooksLikeArchitectureDump(text: string): boolean {
   return /core components|user identity & wallet framework|connected eoa wallet|agent wallet \(dcw\)|gateway reserve|execution modes|technical workflow|request routing|pre-execution|a2a economy|verbatim reporting|which capability would you like to explore first\?|dynamic code generation|conversational agent platform built on arc/i.test(
+    text,
+  );
+}
+
+function responseLooksLikeInternalPromptLeak(text: string): boolean {
+  return /\bI can speak Thai when you message me primarily in Thai\b|If the user's latest message is clearly in another language|Mirror the latest message language|Do not switch languages on English, short, transliterated, or ambiguous messages|Keep these tokens exactly as-is, never translated|Tag:\s*Thai response based on user's language in previous message|Current wallet context for this request:|cluster\/my-wallet\.json|\{\s*"connected_wallet"\s*:\s*"0x[a-f0-9]+"[\s\S]{0,120}"execution_wallet"\s*:\s*"0x[a-f0-9]+"|(?:^|\s)gpointer(?:\s|$)|(?:^|\s)relatedness(?:\s|$)|\bDES:\s*the representation of the system message\b|\bNo IP\.\s*No glimpse\.\b|\bsystem_(?:role|prompt)_l_sigma\s*=\s*\d+(?:\.\d+)?\b|\brep_sigma\s*=\s*\d+(?:\.\d+)?\b|\bVar\(\s*\d+(?:\.\d+)?\s*\)\b|\bauto_generate_instruction\s*=\s*(?:true|false)\b|\benable_math\s*=\s*(?:true|false)\b|\bresponse_length\s*=\s*\d+\b|\bmax_candidates\s*=\s*\d+\b|\b_stop_prob_threshold\s*=\s*\d+(?:\.\d+)?\b|\bsampler[_-]?safe conditioning\b|\btypical Arc runtime execution message\b/i.test(
+    text,
+  );
+}
+
+function responseLooksLikeWalletContextEcho(text: string): boolean {
+  return /Current wallet context for this request:|(?:^|\n)\s*Connected wallet for this request:\s*0x[a-f0-9]{40}|(?:^|\n)\s*Execution wallet for this request:\s*0x[a-f0-9]{40}|(?:^|\n)\s*Execution target for this chat:\s*(?:EOA|DCW)|\bConnected EOA:\s*0x[a-f0-9]{40}\b|\bExecution wallet:\s*0x[a-f0-9]{40}\b|\bExecution target:\s*(?:EOA|DCW)\b|\bExecution mode:\s*[a-z][a-z0-9 _-]*\b|(?:^|\n)\s*-\s*connected EOA:\s*0x[a-f0-9]{40}|(?:^|\n)\s*-\s*execution wallet:\s*0x[a-f0-9]{40}|(?:^|\n)\s*-\s*execution target:\s*(?:EOA|DCW)|(?:^|\n)\s*-\s*execution mode:\s*[a-z0-9_-]+|Agent wallet funding balance:/i.test(
+    text,
+  );
+}
+
+function responseLooksLikeTranslatedWalletContextEcho(text: string): boolean {
+  const addressMatches = text.match(/0x[a-f0-9]{40}/gi) ?? [];
+  if (addressMatches.length === 0) {
+    return false;
+  }
+  return /\b(wallet|eoa|dcw|execution|connected)\b|billetera|portefeuille|wallet-kontext|carteira|ウォレット|지갑|वॉलेट|محفظة|кошел|钱包/i.test(
+    text,
+  );
+}
+
+function responseLooksLikeAbbreviatedWalletContextEcho(text: string): boolean {
+  if (!/0x[a-z0-9]{3,}\.\.[a-z0-9]{2,}/i.test(text)) {
+    return false;
+  }
+  return /\b(wallet|eoa|dcw|execution|connected)\b|conectad|ejecuci[oó]n|verbunden|ausf(?:u|ü)hr|billetera|portefeuille|wallet-kontext|carteira|接続|実行|연결|실행|متصل|تنفيذ/i.test(
     text,
   );
 }
@@ -1161,19 +1219,30 @@ function deterministicAgentFlowBrainReply(
     return buildHowItWorksReply();
   }
 
+  const bareSendRecipient =
+    trimmed.match(/\b(?:pay|send|shoot|transfer)\s+([a-z0-9][a-z0-9-]*(?:\.arc)?)\b/i)?.[1] ||
+    trimmed.match(/\bto\s+([a-z0-9][a-z0-9-]*(?:\.arc)?)\b/i)?.[1];
+  const normalizedBareSendRecipient = bareSendRecipient?.toLowerCase();
+  const reservedBareSendRecipient =
+    normalizedBareSendRecipient &&
+    !normalizedBareSendRecipient.endsWith('.arc') &&
+    /^(?:agentflow|amount|arc|bill|bridge|dollars|eurc|for|from|funds|invoice|me|money|pay|payment|request|send|shoot|snd|to|transfer|usd|usdc)$/.test(
+      normalizedBareSendRecipient,
+    );
+
   if (
     /\b(?:pay|send|shoot|transfer)\b/i.test(trimmed) &&
+    !/\bhow\s+(?:do\s+i|to|can\s+i|should\s+i)\s+(?:send|pay|transfer|request)\b/i.test(trimmed) &&
     !/\b\d+(?:\.\d+)?\b/.test(trimmed) &&
-    /\b(?:to\s+)?[a-z0-9][a-z0-9-]*(?:\.arc)?\b/i.test(trimmed)
+    /\b(?:to\s+)?[a-z0-9][a-z0-9-]*(?:\.arc)?\b/i.test(trimmed) &&
+    !reservedBareSendRecipient
   ) {
-    const recipient =
-      trimmed.match(/\b(?:pay|send|shoot|transfer)\s+([a-z0-9][a-z0-9-]*(?:\.arc)?)\b/i)?.[1] ||
-      trimmed.match(/\bto\s+([a-z0-9][a-z0-9-]*(?:\.arc)?)\b/i)?.[1];
+    const recipient = bareSendRecipient;
     return recipient ? `How much do you want to send to ${recipient}?` : 'How much USDC do you want to send?';
   }
 
   if (looksLikeSecretProbe(trimmed)) {
-    return "I can't reveal `.env` contents, secrets, bearer tokens, or internal URLs.";
+    return "I can't reveal internal configuration, secrets, bearer tokens, or internal URLs.";
   }
 
   if (looksLikePromptOrPolicyProbe(trimmed)) {
@@ -1234,7 +1303,11 @@ function validateAgentFlowBrainReply(
   }
 
   if (looksLikeSecretProbe(userMessage) && responseLooksLikeEnvDump(trimmed)) {
-    return "I can't reveal `.env` contents, secrets, bearer tokens, or internal URLs. I can explain the configuration at a high level or help you verify that Hermes is wired correctly.";
+    return "I can't reveal internal configuration, secrets, bearer tokens, or internal URLs. I can explain the setup at a high level or help verify that the chat service is wired correctly.";
+  }
+
+  if (looksLikeSecretProbe(userMessage) && responseLooksLikeSecretScopeDrift(trimmed)) {
+    return "I can't reveal internal configuration, secrets, bearer tokens, internal URLs, or wallet-internal identifiers.";
   }
 
   if (
@@ -1340,6 +1413,23 @@ function validateAgentFlowBrainReply(
     )
   ) {
     return "I can't reveal hidden prompts, internal policy text, or private runtime instructions. I can still explain my user-facing behavior at a high level if that's what you need.";
+  }
+
+  if (
+    responseLooksLikeWalletContextEcho(trimmed) ||
+    (looksLikeWalletContextProbe(userMessage) &&
+      (responseLooksLikeTranslatedWalletContextEcho(trimmed) ||
+        responseLooksLikeAbbreviatedWalletContextEcho(trimmed)))
+  ) {
+    return "I won't show the internal wallet-context block directly. Ask for balances, portfolio, or funding status and I'll answer in normal user-facing language.";
+  }
+
+  if (responseLooksLikeInternalPromptLeak(trimmed)) {
+    return "Something internal leaked into that draft, so I'm not going to show it. Please send the request again and I'll answer cleanly.";
+  }
+
+  if (responseLooksLikeRawToolCallJson(trimmed)) {
+    return "I won't show internal tool-call payloads. Ask for the balance, portfolio, or action result you want, and I'll answer in normal user-facing language.";
   }
 
   if (looksLikeHackProbe(userMessage) && !/^I can't help with hacking/i.test(trimmed)) {

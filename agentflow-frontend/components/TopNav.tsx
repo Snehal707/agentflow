@@ -8,7 +8,7 @@ import { BrandLockup } from "@/components/BrandLockup";
 const links = [
   { href: "/chat", label: "Chat" },
   { href: "/pay", label: "AgentPay" },
-  { href: "/funds", label: "Funding" },
+  { href: "/funding", label: "Funding" },
   { href: "/portfolio", label: "Portfolio" },
 ] as const;
 

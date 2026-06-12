@@ -10,6 +10,7 @@ import { executeInvoicePayment } from './subagents/executor';
 import { resolveInvoicePayeeWallet } from './subagents/resolve-payee';
 import { validateInvoiceForBusiness, type ValidationResult } from './subagents/validator';
 import { createPaymentRequestFromInvoice } from '../../lib/invoice-agentpay';
+import { generateInvoiceNumber, isInvoiceNumberUniqueViolation } from '../../lib/invoice-number';
 
 export type InvoiceParseInput =
   | { channel: 'json'; invoice: NormalizedInvoice }
@@ -90,27 +91,47 @@ export async function runInvoicePipeline(
     throw new Error('[invoice/pipeline] Normalized invoice failed validation');
   }
 
-  const { data: inserted, error: insErr } = await adminDb
-    .from('invoices')
-    .insert({
-      business_wallet: input.businessWallet,
-      vendor_name: invoice.vendor,
-      vendor_email: invoice.vendorEmail,
-      vendor_handle: invoiceVendorHandle(invoice),
-      amount: invoice.amount,
-      currency: invoice.currency,
-      invoice_number: invoice.invoiceNumber,
-      line_items: invoice.lineItems,
-      status: 'pending',
-    })
-    .select('id')
-    .single();
+  let persistedInvoiceNumber = invoice.invoiceNumber.trim() || generateInvoiceNumber();
+  let inserted: { id: string } | null = null;
+  let insErr: { code?: string; message?: string } | null = null;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const insertResult = await adminDb
+      .from('invoices')
+      .insert({
+        business_wallet: input.businessWallet,
+        vendor_name: invoice.vendor,
+        vendor_email: invoice.vendorEmail,
+        vendor_handle: invoiceVendorHandle(invoice),
+        amount: invoice.amount,
+        currency: invoice.currency,
+        invoice_number: persistedInvoiceNumber,
+        line_items: invoice.lineItems,
+        status: 'pending',
+      })
+      .select('id')
+      .single();
+
+    inserted = insertResult.data;
+    insErr = insertResult.error;
+
+    if (!insErr && inserted?.id) {
+      break;
+    }
+
+    if (!isInvoiceNumberUniqueViolation(insErr)) {
+      break;
+    }
+
+    persistedInvoiceNumber = generateInvoiceNumber();
+  }
 
   if (insErr || !inserted?.id) {
     throw new Error(`[invoice/pipeline] insert failed: ${insErr?.message ?? 'unknown'}`);
   }
 
   const invoiceId = String(inserted.id);
+  invoice.invoiceNumber = persistedInvoiceNumber;
 
   const validation = await validateInvoiceForBusiness({
     businessWallet: input.businessWallet,

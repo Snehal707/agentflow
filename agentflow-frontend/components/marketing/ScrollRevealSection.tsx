@@ -46,9 +46,8 @@ export function ScrollRevealSection<TElement extends ElementType = "section">({
   return (
     <Component
       ref={ref}
-      data-snap="true"
-      className={`${className} transition-all duration-700 ${
-        visible ? "translate-y-0 opacity-100" : "translate-y-8 opacity-0"
+      className={`${className} transition-[opacity,transform] duration-500 ease-out will-change-[opacity,transform] motion-reduce:transition-none ${
+        visible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
       }`}
       {...props}
     >

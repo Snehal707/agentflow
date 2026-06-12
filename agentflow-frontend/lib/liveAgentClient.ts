@@ -1051,7 +1051,7 @@ export async function finalizeBridgeRun(input: {
     price: string;
     payer: Address;
     mode: "eoa";
-  };
+  } | null;
 }> {
   const requestId = input.requestId?.trim() || createBrowserX402RequestId();
   const { response, requestId: finalizedRequestId } = await payProtectedFetchWithMeta({
@@ -1073,15 +1073,19 @@ export async function finalizeBridgeRun(input: {
     throw new Error("Bridge finalize failed");
   }
 
+  const settlementHeader = response.headers.get("PAYMENT-RESPONSE");
+
   return {
     requestId: finalizedRequestId,
-    payment: {
-      requestId: finalizedRequestId,
-      agent: "bridge",
-      price: paymentPriceLabel("bridge"),
-      payer: input.payer,
-      mode: "eoa",
-    },
+    payment: settlementHeader
+      ? {
+          requestId: finalizedRequestId,
+          agent: "bridge",
+          price: paymentPriceLabel("bridge"),
+          payer: input.payer,
+          mode: "eoa",
+        }
+      : null,
   };
 }
 

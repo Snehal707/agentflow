@@ -165,13 +165,31 @@ class BrowserGatewayBatchScheme {
       throw new Error(`Invalid chain id in network "${requirements.network}".`);
     }
 
+    // Circle Gateway batches settlements asynchronously, so it requires the
+    // signed authorization to remain valid for a minimum window (currently
+    // 604800s / 7 days) regardless of the advertised maxTimeoutSeconds (~4 days).
+    // Signing with only maxTimeoutSeconds is rejected at verify with
+    // `authorization_validity_too_short`. Mirror x402ServerClient: extend the
+    // window to at least the Gateway minimum plus a settlement buffer.
+    const GATEWAY_MIN_VALIDITY_SECONDS = 604800;
+    const SETTLEMENT_BUFFER_SECONDS = 600;
+    const extraMinValidity = Number(
+      (requirements.extra as { minValiditySeconds?: unknown } | undefined)
+        ?.minValiditySeconds,
+    );
+    const requiredValiditySeconds = Math.max(
+      Number(requirements.maxTimeoutSeconds) || 0,
+      GATEWAY_MIN_VALIDITY_SECONDS,
+      Number.isFinite(extraMinValidity) && extraMinValidity > 0 ? extraMinValidity : 0,
+    );
+
     const now = Math.floor(Date.now() / 1000);
     const authorization = {
       from: getAddress(this.payer),
       to: getAddress(requirements.payTo as Address),
       value: requirements.amount,
       validAfter: String(now - 600),
-      validBefore: String(now + requirements.maxTimeoutSeconds),
+      validBefore: String(now + requiredValiditySeconds + SETTLEMENT_BUFFER_SECONDS),
       nonce: createNonce(),
     };
 
@@ -249,6 +267,13 @@ function describeStructuredError(
       (typeof record.message === 'string' && record.message.trim()) ||
       '';
 
+    // When a structured error carries both a generic `error` label and a
+    // specific `reason` (e.g. the facilitator's `invalidReason` on a verify
+    // failure), surface the reason too — otherwise the real cause is lost.
+    const reason =
+      typeof record.reason === 'string' ? record.reason.trim() : '';
+    const detail = reason && reason !== primary ? reason : '';
+
     const executionWallet =
       typeof record.executionWalletAddress === 'string'
         ? record.executionWalletAddress
@@ -260,11 +285,17 @@ function describeStructuredError(
         : null;
 
     const parts = [primary || fallbackLabel];
+    if (detail) {
+      parts.push(`Reason: ${detail}`);
+    }
     if (executionWallet) {
       parts.push(`Execution wallet: ${executionWallet}`);
     }
     if (requestId) {
       parts.push(`Request ID: ${requestId}`);
+    }
+    if (!primary && !detail && !executionWallet && !requestId) {
+      return fallbackLabel;
     }
     return parts.join('\n');
   }
@@ -465,14 +496,7 @@ async function safeRecordX402AttemptStage(
 
 async function describeFailedResponse(response: Response, fallbackLabel: string): Promise<string> {
   const details = await parseResponseBody<unknown>(response.clone());
-  if (typeof details === 'string') {
-    return details || fallbackLabel;
-  }
-  try {
-    return JSON.stringify(details);
-  } catch {
-    return fallbackLabel;
-  }
+  return describeStructuredError(details, fallbackLabel);
 }
 
 async function preflightX402Request(

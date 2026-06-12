@@ -6,6 +6,7 @@ import {
   waitForTransaction,
 } from './dcw';
 import { acquireExecutionGuard } from './execution-guard';
+import type { GuardLock } from './execution-guard';
 
 const ARC_USDC = '0x3600000000000000000000000000000000000000' as const;
 
@@ -51,17 +52,20 @@ export async function executeUsdcTransfer(params: {
   remark: string | null;
   actionType: string;
   idempotencyKey?: string;
+  existingGuard?: GuardLock | null;
 }): Promise<{ txHash: `0x${string}` }> {
   const payer = getAddress(params.payerEoa);
   const payee = getAddress(params.toAddress);
-  const guard = await acquireExecutionGuard({
-    walletAddress: payer,
-    amount: params.amountUsdc,
-    recipients: [payee],
-    idempotencyKey: params.idempotencyKey,
-    route: `agentpay:${params.actionType}`,
-    requireConfirmation: true,
-  });
+  const guard =
+    params.existingGuard ??
+    (await acquireExecutionGuard({
+      walletAddress: payer,
+      amount: params.amountUsdc,
+      recipients: [payee],
+      idempotencyKey: params.idempotencyKey,
+      route: `agentpay:${params.actionType}`,
+      requireConfirmation: true,
+    }));
   try {
   if (payer === payee) {
     throw new Error('Cannot send to the same wallet');
@@ -110,7 +114,9 @@ export async function executeUsdcTransfer(params: {
 
     return { txHash: hash };
   } finally {
-    await guard.release();
+    if (!params.existingGuard) {
+      await guard.release();
+    }
   }
 }
 

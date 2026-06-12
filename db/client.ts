@@ -85,6 +85,7 @@ function resolveRedisUrl(): string {
 }
 
 const DEFAULT_POOL_SIZE = 4;
+const DEFAULT_REDIS_COMMAND_TIMEOUT_MS = 3000;
 
 function parsePoolSize(): number {
   const raw = process.env.REDIS_POOL_SIZE?.trim();
@@ -98,7 +99,20 @@ function parsePoolSize(): number {
   return Math.min(n, 32);
 }
 
+function parseRedisCommandTimeoutMs(): number {
+  const raw = process.env.REDIS_COMMAND_TIMEOUT_MS?.trim();
+  if (!raw) {
+    return DEFAULT_REDIS_COMMAND_TIMEOUT_MS;
+  }
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 250) {
+    return DEFAULT_REDIS_COMMAND_TIMEOUT_MS;
+  }
+  return Math.min(n, 30_000);
+}
+
 const poolSize = parsePoolSize();
+const redisCommandTimeoutMs = parseRedisCommandTimeoutMs();
 
 const redisPool: Redis[] = [];
 let redisPoolInitialized = false;
@@ -113,7 +127,13 @@ function initRedisPoolIfNeeded(): void {
 
   for (let i = 0; i < poolSize; i++) {
     const client = new Redis(redisUrl, {
-      maxRetriesPerRequest: 3,
+      // Railway recommends dual-stack lookup for ioredis so clients can
+      // resolve either IPv4 or IPv6 Redis endpoints cleanly.
+      family: 0,
+      maxRetriesPerRequest: 2,
+      // Bound Redis stalls so chat does not hang indefinitely, but keep enough
+      // headroom for cold connections / transient network jitter in dev.
+      commandTimeout: redisCommandTimeoutMs,
       enableReadyCheck: true,
       lazyConnect: false,
     });

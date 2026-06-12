@@ -122,6 +122,11 @@ assert.equal(
   'Check "vault options" for options.',
   'replaces internal tool identifiers in visible text',
 );
+assert.equal(
+  sanitizeAssistantStreamDelta('Call the portfolio tool to show your current balances and positions.'),
+  'I can check your current portfolio here. Ask me to show your portfolio for a live snapshot.',
+  'sanitizes leaked portfolio tool instructions',
+);
 
 // --- Portfolio speech acts ---
 assert.equal(classifyPortfolioRequestMode('where can I view my holdings?'), 'clarify');
@@ -167,5 +172,21 @@ assert.doesNotMatch(voiceAnswer, /Want to try it/i, 'voice answer does not creat
 const capabilityAnswer = answerProductQuestion('what can you do?')?.answer ?? '';
 assert.match(capabilityAnswer, /payments on Arc/i, 'capability answer includes payments on Arc');
 assert.match(capabilityAnswer, /voice notes/i, 'capability answer includes voice notes');
+
+const scheduleAnswer = answerProductQuestion('how to make schedule payment?')?.answer ?? '';
+assert.match(scheduleAnswer, /recurring USDC payments on a schedule/i);
+assert.doesNotMatch(scheduleAnswer, /AgentPay is the payments surface/i);
+
+const batchAnswer = answerProductQuestion('how to make batch payment?')?.answer ?? '';
+assert.match(batchAnswer, /bulk USDC payouts from CSV/i);
+assert.doesNotMatch(batchAnswer, /AgentPay is the payments surface/i);
+
+const paymentRequestAnswer = answerProductQuestion('how to request money?')?.answer ?? '';
+assert.match(paymentRequestAnswer, /without moving funds immediately/i);
+assert.match(paymentRequestAnswer, /do not need YES confirmation/i);
+
+const telegramAnswer = answerProductQuestion('explain how to use AgentFlow on Telegram')?.answer ?? '';
+assert.match(telegramAnswer, /link AgentFlow to Telegram/i);
+assert.doesNotMatch(telegramAnswer, /How to start using AgentFlow/i);
 
 console.log('[test:chat-routing] OK');

@@ -51,15 +51,15 @@ function stageLabel(stage?: string): string {
     case "started":
       return "Started";
     case "preflight_ok":
-      return "Preflight passed";
+      return "Preparing";
     case "preflight_failed":
-      return "Preflight failed";
+      return "Preparation failed";
     case "payment_required":
       return "Payment required";
     case "payload_created":
-      return "Payload created";
+      return "Ready to sign";
     case "paid_request_sent":
-      return "Paid request sent";
+      return "Processing";
     case "succeeded":
       return "Settled";
     case "failed":
