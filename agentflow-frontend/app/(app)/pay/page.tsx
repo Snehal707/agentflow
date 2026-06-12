@@ -136,6 +136,10 @@ export default function AgentPayPage() {
   // Requests the user just approved/declined. Kept so background refreshes that
   // fire before the backend settles can't resurrect a row the user already acted on.
   const dismissedRequestIdsRef = useRef<Set<string>>(new Set());
+  // Invoices whose on-chain payment is still settling in the backend. Drives a
+  // persistent "Processing…" indicator so the spinner doesn't vanish the moment
+  // the (async) approve POST returns.
+  const [settlingInvoiceIds, setSettlingInvoiceIds] = useState<Set<string>>(new Set());
 
   // Batch tab state
   const batchFileInputRef = useRef<HTMLInputElement>(null);
@@ -305,9 +309,11 @@ export default function AgentPayPage() {
     }
   }, [getAuthHeaders]);
 
-  const loadInvoices = useCallback(async () => {
-    if (!isAuthenticated || !address) return;
-    setInvoiceLoading(true);
+  const loadInvoices = useCallback(async (silent = false): Promise<any[]> => {
+    if (!isAuthenticated || !address) return [];
+    // Silent refreshes (during invoice settle polling) skip the full-section
+    // spinner so the list doesn't flash "Loading invoices…" over the live row.
+    if (!silent) setInvoiceLoading(true);
     try {
       const headers = getAuthHeaders();
       const res = await fetch("/api/pay/invoices", { headers: headers ?? {} });
@@ -315,11 +321,31 @@ export default function AgentPayPage() {
         const data = (await res.json()) as { sent?: any[]; received?: any[] };
         setSentInvoices(data.sent ?? []);
         setReceivedInvoices(data.received ?? []);
+        return data.received ?? [];
       }
+      return [];
     } finally {
-      setInvoiceLoading(false);
+      if (!silent) setInvoiceLoading(false);
     }
   }, [isAuthenticated, address, getAuthHeaders]);
+
+  // Poll the invoices endpoint until a just-paid invoice's backend status leaves
+  // "pending"/"processing" (the approve POST returns before the on-chain payment
+  // finalizes). Bounded so a stuck backend can't spin forever.
+  const waitForInvoiceSettled = useCallback(
+    async (requestId: string) => {
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const received = await loadInvoices(true);
+        const row = received.find((r: any) => r.id === requestId);
+        const status = String(row?.invoices?.status ?? row?.status ?? "").toLowerCase();
+        if (!row || status === "paid" || status === "failed" || status === "declined") {
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    },
+    [loadInvoices],
+  );
 
   const goTab = (id: TabId) => {
     setTab(id);
@@ -347,31 +373,40 @@ export default function AgentPayPage() {
     }
     void loadContext();
     void loadBalance();
-  }, [address, isAuthenticated, loadContext, loadBalance]);
+    // Loaders are intentionally omitted: they're rebuilt when the auth session
+    // object changes identity, and including them re-fires this effect in a loop
+    // (fetch → setState → re-render → new loader → fetch …). Re-running on auth
+    // readiness (address/isAuthenticated) is sufficient and captures a live loader.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [address, isAuthenticated]);
 
   useEffect(() => {
     if (tab === "requests" && address && isAuthenticated) {
       void loadRequests();
     }
-  }, [tab, address, isAuthenticated, loadRequests]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, address, isAuthenticated]);
 
   useEffect(() => {
     if (tab === "history" && address && isAuthenticated) {
       void loadHistory();
     }
-  }, [tab, address, isAuthenticated, historyFilter, loadHistory]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, address, isAuthenticated, historyFilter]);
 
   useEffect(() => {
     if (tab === "scheduled" && address && isAuthenticated) {
       void loadScheduled();
     }
-  }, [tab, address, isAuthenticated, loadScheduled]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, address, isAuthenticated]);
 
   useEffect(() => {
     if (tab === "invoices" && address && isAuthenticated) {
       void loadInvoices();
     }
-  }, [tab, address, isAuthenticated, loadInvoices]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, address, isAuthenticated]);
 
   useEffect(() => {
     if (tab !== "scheduled" || !address || !isAuthenticated) {
@@ -403,7 +438,8 @@ export default function AgentPayPage() {
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("storage", handleStorage);
     };
-  }, [tab, address, isAuthenticated, loadScheduled]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, address, isAuthenticated]);
 
   const loadMyChainArc = useCallback(async () => {
     const headers = getAuthHeaders();
@@ -420,7 +456,8 @@ export default function AgentPayPage() {
     if (tab === "receive" && address && isAuthenticated) {
       void loadMyChainArc();
     }
-  }, [tab, address, isAuthenticated, loadMyChainArc]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, address, isAuthenticated]);
 
   useEffect(() => {
     const raw = arcRegDraft.trim().replace(/\.arc$/i, "");
@@ -781,41 +818,39 @@ export default function AgentPayPage() {
   const handleApprove = async (id: string) => {
     const headers = getAuthHeaders();
     if (!headers) return;
+    const onInvoices = tab === "invoices";
     setOperationsError(null);
     setRequestActionId(id);
     setRequestActionKind("approve");
     setPayingRequestId(id);
+    if (onInvoices) {
+      setSettlingInvoiceIds((prev) => new Set(prev).add(id));
+    }
     try {
       await postPayApprove(headers, id);
-      dismissedRequestIdsRef.current.add(id);
-      setIncoming((prev) => prev.filter((row) => row.id !== id));
 
-      // Optimistic UI for invoice-backed requests: show paid immediately.
-      setReceivedInvoices((prev) =>
-        prev.map((row: any) => {
-          if (row.id !== id) return row;
-          return {
-            ...row,
-            status: "paid",
-            invoices: row.invoices
-              ? { ...row.invoices, status: "paid" }
-              : row.invoices,
-          };
-        }),
-      );
-
-      // Only refresh what's actually on screen. History/Invoices tabs reload
-      // themselves when opened, so refreshing them here just forces an extra
-      // full-page repaint (the "screen jump") for views the user can't see.
-      const refresh = () => {
-        void loadRequests(true);
-        if (tab === "invoices") void loadInvoices();
-      };
-      refresh();
-      window.setTimeout(refresh, 1500);
+      if (onInvoices) {
+        // The approve POST returns "processing"; the real payment finalizes in a
+        // backend task. Poll (silently) until the invoice settles so the
+        // "Processing…" indicator stays up for the whole operation.
+        await waitForInvoiceSettled(id);
+      } else {
+        // Requests tab: drop the approved row optimistically and reconcile.
+        dismissedRequestIdsRef.current.add(id);
+        setIncoming((prev) => prev.filter((row) => row.id !== id));
+        await loadRequests(true);
+        window.setTimeout(() => void loadRequests(true), 1500);
+      }
     } catch (e) {
       setOperationsError(e instanceof Error ? e.message : "Approve failed");
     } finally {
+      if (onInvoices) {
+        setSettlingInvoiceIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
       setRequestActionId(null);
       setRequestActionKind(null);
       setPayingRequestId(null);
@@ -1161,7 +1196,7 @@ export default function AgentPayPage() {
                     {sendFlowError}
                   </div>
                 ) : null}
-                {(tab === "requests" || tab === "history" || tab === "scheduled") && operationsError ? (
+                {(tab === "requests" || tab === "history" || tab === "scheduled" || tab === "invoices") && operationsError ? (
                   <div className="mb-4 rounded-xl border border-[#ff716c]/30 bg-[#9f0519]/10 px-4 py-3 text-sm text-[#ffa8a3]">
                     {operationsError}
                   </div>
@@ -1943,6 +1978,7 @@ export default function AgentPayPage() {
                             {receivedInvoices.map((inv: any) => {
                               const detail = inv.invoices as any;
                               if (!detail) return null;
+                              const settling = settlingInvoiceIds.has(inv.id);
                               return (
                                 <div
                                   key={inv.id}
@@ -1968,12 +2004,18 @@ export default function AgentPayPage() {
                                       </div>
                                       <span
                                         className={`text-xs px-2 py-0.5 rounded-full mt-1 inline-block ${
-                                          detail.status === "paid"
-                                            ? "text-green-400 bg-green-400/10"
-                                            : "text-yellow-400 bg-yellow-400/10"
+                                          settling
+                                            ? "text-[#69daff] bg-[#69daff]/10"
+                                            : detail.status === "paid"
+                                              ? "text-green-400 bg-green-400/10"
+                                              : "text-yellow-400 bg-yellow-400/10"
                                         }`}
                                       >
-                                        {detail.status === "paid" ? "✅ Paid" : "⏳ Pending"}
+                                        {settling
+                                          ? "⏳ Processing"
+                                          : detail.status === "paid"
+                                            ? "✅ Paid"
+                                            : "⏳ Pending"}
                                       </span>
                                     </div>
                                   </div>
@@ -2005,41 +2047,38 @@ export default function AgentPayPage() {
                                           Arcscan ↗
                                         </a>
                                       )}
-                                      {detail.status === "pending" && (
+                                      {settling ? (
+                                        <span className="px-3 py-1 rounded-lg text-xs font-medium text-[#69daff] bg-[#69daff]/10 inline-flex items-center gap-1.5">
+                                          <svg
+                                            className="animate-spin h-3 w-3 text-[#69daff]"
+                                            xmlns="http://www.w3.org/2000/svg"
+                                            fill="none"
+                                            viewBox="0 0 24 24"
+                                          >
+                                            <circle
+                                              className="opacity-25"
+                                              cx="12"
+                                              cy="12"
+                                              r="10"
+                                              stroke="currentColor"
+                                              strokeWidth="4"
+                                            />
+                                            <path
+                                              className="opacity-75"
+                                              fill="currentColor"
+                                              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                                            />
+                                          </svg>
+                                          Processing…
+                                        </span>
+                                      ) : detail.status === "pending" ? (
                                         <button
-                                          onClick={() => handleApprove(inv.id)}
-                                          disabled={sendBusy}
+                                          onClick={() => void handleApprove(inv.id)}
                                           className="px-3 py-1 bg-[#69daff] text-black rounded-lg text-xs font-medium hover:bg-[#69daff]/90 transition disabled:opacity-50 inline-flex items-center gap-1.5"
                                         >
-                                          {payingRequestId === inv.id ? (
-                                            <>
-                                              <svg
-                                                className="animate-spin h-3 w-3 text-black"
-                                                xmlns="http://www.w3.org/2000/svg"
-                                                fill="none"
-                                                viewBox="0 0 24 24"
-                                              >
-                                                <circle
-                                                  className="opacity-25"
-                                                  cx="12"
-                                                  cy="12"
-                                                  r="10"
-                                                  stroke="currentColor"
-                                                  strokeWidth="4"
-                                                />
-                                                <path
-                                                  className="opacity-75"
-                                                  fill="currentColor"
-                                                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                                                />
-                                              </svg>
-                                              Paying...
-                                            </>
-                                          ) : (
-                                            "Pay Invoice"
-                                          )}
+                                          Pay Invoice
                                         </button>
-                                      )}
+                                      ) : null}
                                     </div>
                                   </div>
                                 </div>
