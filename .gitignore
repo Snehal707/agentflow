@@ -70,3 +70,6 @@ foundry/lib/openzeppelin-contracts/
 # stray tsx temp dir (unset TMPDIR) and debug artifacts
 undefined/
 agentflow-frontend/debug-chat.png
+
+# dev stack supervisor lock (runtime)
+.dev-stack.lock.json

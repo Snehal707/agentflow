@@ -313,13 +313,29 @@ function startHermes() {
   return proc;
 }
 
+function killTree(child, signal) {
+  if (!child || child.killed || typeof child.pid !== "number") return;
+  if (process.platform === "win32") {
+    const res = spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      windowsHide: true,
+      encoding: "utf8",
+    });
+    if (res.status === 0 || /not found|no running instance/i.test(`${res.stdout}${res.stderr}`)) {
+      return;
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {}
+}
+
 function shutdown(signal) {
   if (shuttingDown) {
     return;
   }
   shuttingDown = true;
   if (currentHermes && !currentHermes.killed) {
-    currentHermes.kill(signal);
+    killTree(currentHermes, signal);
     return;
   }
   process.exit(0);

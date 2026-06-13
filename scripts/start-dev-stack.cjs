@@ -1,5 +1,6 @@
 const path = require("path");
-const { spawn } = require("child_process");
+const fs = require("fs");
+const { spawn, spawnSync } = require("child_process");
 const net = require("net");
 const dotenv = require("dotenv");
 
@@ -8,11 +9,64 @@ const { cleanupExistingStack } = require("./stack-cleanup.cjs");
 const repoRoot = path.resolve(__dirname, "..");
 const repoNodeBin = path.join(repoRoot, "node_modules", ".bin");
 const frontendNodeBin = path.join(repoRoot, "agentflow-frontend", "node_modules", ".bin");
+const supervisorLockPath = path.join(repoRoot, ".dev-stack.lock.json");
 dotenv.config({ path: path.join(repoRoot, ".env") });
 
 const shouldClean =
   /^(1|true|yes|on)$/i.test(String(process.env.AGENTFLOW_STACK_CLEAN || "").trim()) ||
   process.argv.includes("--clean");
+
+function isPidAlive(pid) {
+  if (!pid || Number.isNaN(Number(pid))) return false;
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM"; // exists but not signalable
+  }
+}
+
+/**
+ * Refuse to start a second supervisor. Two `npm run dev:stack` invocations both
+ * respawn all 17 agents, colliding on every port and producing the endless-respawn
+ * / orphan-pileup we used to see. A stale lock (dead PID) is reclaimed automatically.
+ */
+function ensureSingleSupervisor() {
+  try {
+    const raw = fs.readFileSync(supervisorLockPath, "utf8");
+    const lock = JSON.parse(raw);
+    if (lock?.pid && lock.pid !== process.pid && isPidAlive(lock.pid)) {
+      console.error(
+        `[dev:stack] another supervisor is already running (pid ${lock.pid}). ` +
+          `Stop it first, or run \`taskkill /PID ${lock.pid} /T /F\`. Exiting.`,
+      );
+      return false;
+    }
+  } catch {
+    /* no lock or unreadable — fall through and claim it */
+  }
+  try {
+    fs.writeFileSync(
+      supervisorLockPath,
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2),
+      "utf8",
+    );
+  } catch (err) {
+    console.warn("[dev:stack] could not write supervisor lock:", err.message);
+  }
+  return true;
+}
+
+function clearSupervisorLock() {
+  try {
+    const lock = JSON.parse(fs.readFileSync(supervisorLockPath, "utf8"));
+    if (!lock || lock.pid === process.pid) {
+      fs.rmSync(supervisorLockPath, { force: true });
+    }
+  } catch {
+    /* ignore */
+  }
+}
 
 const backendCommands = [
   { name: "facilitator", command: "tsx facilitator/server.ts" },
@@ -146,6 +200,30 @@ async function isTargetResponsive(target) {
   return { ok: false, mode: "down" };
 }
 
+/**
+ * Windows-safe process termination. `child.kill()` calls TerminateProcess on the
+ * DIRECT child only — for our `cmd.exe -> tsx shim -> tsx loader` (and
+ * `node -> npm -> next`) trees that orphans the real server holding the port, which
+ * then survives every shutdown/restart and masquerades as "healthy" on its port.
+ * `taskkill /T` walks the whole tree, so nothing is left behind.
+ */
+function killTree(child, signal = "SIGTERM") {
+  if (!child || child.killed || typeof child.pid !== "number") return;
+  if (process.platform === "win32") {
+    const res = spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      windowsHide: true,
+      encoding: "utf8",
+    });
+    if (res.status === 0 || /not found|no running instance/i.test(`${res.stdout}${res.stderr}`)) {
+      return;
+    }
+    // Fall through to child.kill() if taskkill could not run at all.
+  }
+  try {
+    child.kill(signal);
+  } catch {}
+}
+
 function registerManagedChild(name, child, restartFactory) {
   const target = criticalHealthTargetByName.get(name);
   managedChildren.set(name, {
@@ -260,9 +338,7 @@ async function verifyCriticalServices() {
       console.warn(`[dev:stack] ${target.name} health check failed at ${target.url}; scheduling restart.`);
       const current = managedChildren.get(target.name);
       if (current?.child && !current.child.killed) {
-        try {
-          current.child.kill("SIGTERM");
-        } catch {}
+        killTree(current.child, "SIGTERM");
       } else {
         scheduleRestart(target.name, target.starter);
       }
@@ -323,6 +399,11 @@ let hermesChild = null;
 let backendChildren = [];
 
 async function bootstrap() {
+  if (!ensureSingleSupervisor()) {
+    // Hard-exit: the module-level health-check timers below would otherwise keep
+    // this rejected duplicate alive instead of letting it exit.
+    process.exit(1);
+  }
   if (shouldClean) {
     console.log("[dev:stack] cleaning stale AgentFlow listeners and processes...");
     cleanupExistingStack();
@@ -371,18 +452,23 @@ function shutdown(signal) {
   }
   pendingRestarts.clear();
   if (feChild && !feChild.killed) {
-    feChild.kill(signal);
+    killTree(feChild, signal);
   }
   if (hermesChild && !hermesChild.killed) {
-    hermesChild.kill(signal);
+    killTree(hermesChild, signal);
   }
   for (const child of backendChildren) {
     if (child && !child.killed) {
-      child.kill(signal);
+      killTree(child, signal);
     }
   }
+  clearSupervisorLock();
+  // The health-check setInterval keeps the event loop alive; exit explicitly so
+  // Ctrl+C actually stops the supervisor instead of leaving it hanging.
+  setTimeout(() => process.exit(0), 500);
 }
 
+process.on("exit", clearSupervisorLock);
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 bootstrap().catch((err) => {

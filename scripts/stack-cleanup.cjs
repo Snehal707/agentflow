@@ -76,7 +76,49 @@ function runTaskKill(pid) {
   });
 }
 
+/**
+ * Fast, always-run first pass: free the stack ports via Get-NetTCPConnection (cheap)
+ * and tree-kill their owners. This is what actually unblocks a restart. It is kept
+ * SEPARATE from the slow Win32_Process command-line scan below so that, if that scan
+ * times out under load, the ports have already been freed instead of being left bound.
+ */
+function freeStackPorts() {
+  const portList = STACK_PORTS.join(",");
+  const command = `
+$pids = @()
+foreach ($port in @(${portList})) {
+  try {
+    Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop |
+      Select-Object -ExpandProperty OwningProcess -Unique |
+      ForEach-Object { if ($_) { $pids += [int]$_ } }
+  } catch {}
+}
+$pids | Sort-Object -Unique | ForEach-Object { Write-Output ("PORTPID:{0}" -f $_) }
+`;
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+    { cwd: repoRoot, encoding: "utf8", timeout: 8000, windowsHide: true },
+  );
+
+  const pids = (result.stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^PORTPID:\d+$/.test(line))
+    .map((line) => Number(line.slice("PORTPID:".length)))
+    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+
+  for (const pid of pids) {
+    runTaskKill(pid);
+    process.stdout.write(`STOPPED:${pid} (port owner)\n`);
+  }
+}
+
 function cleanupExistingStack() {
+  // Phase 1: cheap port liberation (always completes, ~<1s).
+  freeStackPorts();
+
+  // Phase 2: best-effort command-line scan to catch orphans not bound to a port.
   const escapedRepoRoot = repoRoot.replace(/'/g, "''");
   const portList = STACK_PORTS.join(",");
   const patternFilter = STACK_PROCESS_PATTERNS.map(
