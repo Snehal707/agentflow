@@ -6177,10 +6177,29 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
 
   const syncToken = `sync:${randomUUID()}`;
   let slotHeld = false;
+  let keepAliveTimer: NodeJS.Timeout | null = null;
   const intermediate: string[] = [];
   const pushStatus = (status: string) => {
     intermediate.push(status);
     res.write(`data: ${JSON.stringify({ delta: status })}\n\n`);
+  };
+  const startKeepAlive = () => {
+    if (keepAliveTimer) return;
+    // Keep the browser SSE connection warm while /run is busy with long
+    // retrieval windows (prediction-market / current-events research can sit
+    // quiet for 30-60s before the next visible step arrives). Use a benign
+    // meta event instead of an SSE comment so every client/proxy path sees
+    // concrete bytes and keeps the stream alive.
+    keepAliveTimer = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ meta: { keepAlive: true } })}\n\n`);
+      }
+    }, 10_000);
+  };
+  const stopKeepAlive = () => {
+    if (!keepAliveTimer) return;
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
   };
 
   try {
@@ -6270,6 +6289,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
       throw new Error(`Research pipeline returned ${pipelineRes.status} ${pipelineRes.statusText}`);
     }
 
+    startKeepAlive();
     const reader = pipelineRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -6343,6 +6363,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
     console.log('[research-consumer] done,', 'got report:', !!report, 'events:', eventCount);
 
     if (!report && pipelineErr) {
+      stopKeepAlive();
       const failureText = `Research pipeline failed: ${pipelineErr}`;
       await appendBrainConversationTurn(memorySessionId, persistUserTurn, failureText, redisActionScopeKey);
       res.write(`data: ${JSON.stringify({ delta: `\n${failureText}` })}\n\n`);
@@ -6351,6 +6372,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
       return;
     }
     if (!report) {
+      stopKeepAlive();
       console.error('[research] no report markdown received');
       res.write(
         `data: ${JSON.stringify({
@@ -6493,9 +6515,11 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
         },
       });
     }
+    stopKeepAlive();
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (researchErr) {
+    stopKeepAlive();
     const msg = researchErr instanceof Error ? researchErr.message : String(researchErr);
     console.warn('[chat/respond] research fast-path failed:', msg);
     const failureReply = buildResearchFailureReply(msg);
@@ -6504,6 +6528,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
     res.write('data: [DONE]\n\n');
     res.end();
   } finally {
+    stopKeepAlive();
     if (slotHeld) {
       await releaseResearchSlot(syncToken);
     }
