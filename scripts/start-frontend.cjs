@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
+const net = require("net");
 
 const repoRoot = path.resolve(__dirname, "..");
 const frontendRoot = path.join(repoRoot, "agentflow-frontend");
@@ -17,6 +18,7 @@ const requestedStaleMode = (
   process.env.AGENTFLOW_FRONTEND_STALE_MODE ||
   "dev"
 ).toLowerCase();
+const FRONTEND_PORT = 3005;
 
 const watchRoots = [
   "app",
@@ -144,6 +146,27 @@ function resolveFrontendPlan(mode) {
   };
 }
 
+function isPortListening(port) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch {}
+      resolve(value);
+    };
+
+    socket.setTimeout(1500);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.connect(port, "127.0.0.1");
+  });
+}
+
 const plan = resolveFrontendPlan(requestedMode);
 
 if (printOnly) {
@@ -162,25 +185,39 @@ if (printOnly) {
   process.exit(0);
 }
 
-console.log(`[frontend] mode: ${plan.mode}`);
-console.log(`[frontend] reason: ${plan.reason}`);
-
-const child = spawn("npm", plan.npmArgs, {
-  cwd: repoRoot,
-  stdio: "inherit",
-  env: plan.env,
-  shell: true,
-});
-
-child.on("exit", (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal);
-    return;
+async function main() {
+  if (await isPortListening(FRONTEND_PORT)) {
+    console.log(
+      `[frontend] port ${FRONTEND_PORT} is already live; skipping duplicate frontend spawn.`,
+    );
+    process.exit(0);
   }
-  process.exit(code ?? 0);
-});
 
-child.on("error", (error) => {
-  console.error(`[frontend] failed to start: ${error.message}`);
+  console.log(`[frontend] mode: ${plan.mode}`);
+  console.log(`[frontend] reason: ${plan.reason}`);
+
+  const child = spawn("npm", plan.npmArgs, {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env: plan.env,
+    shell: true,
+  });
+
+  child.on("exit", (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exit(code ?? 0);
+  });
+
+  child.on("error", (error) => {
+    console.error(`[frontend] failed to start: ${error.message}`);
+    process.exit(1);
+  });
+}
+
+main().catch((error) => {
+  console.error(`[frontend] startup check failed: ${error.message}`);
   process.exit(1);
 });

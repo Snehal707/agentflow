@@ -4092,9 +4092,43 @@ function normalizeBrowserLocale(value: unknown): string | undefined {
   }
 }
 
+function parseServerTimestampUtc(value: unknown): Date | null {
+  if (value == null) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  if (typeof value === 'number') {
+    const direct = new Date(value);
+    return Number.isNaN(direct.getTime()) ? null : direct;
+  }
+  const raw = String(value).trim();
+  if (!raw) return null;
+  if (/(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)) {
+    const direct = new Date(raw);
+    return Number.isNaN(direct.getTime()) ? null : direct;
+  }
+  const iso = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const tagged = new Date(`${iso}Z`);
+  return Number.isNaN(tagged.getTime()) ? null : tagged;
+}
+
 function formatTxHash(hash: unknown): string {
   const text = typeof hash === 'string' ? hash.trim() : '';
   return text.length > 18 ? `${text.slice(0, 10)}...${text.slice(-8)}` : text;
+}
+
+function describeAgentPayHistoryRow(row: Record<string, any>): string {
+  const isIncoming = row.direction === 'in';
+  const isOutgoing = row.direction === 'out';
+  const actionType = typeof row.action_type === 'string' ? row.action_type.trim().toLowerCase() : '';
+  if (actionType === 'agentpay_request') {
+    return isOutgoing ? 'payment request paid' : 'payment request received';
+  }
+  if (actionType === 'agentpay_external') {
+    return isOutgoing ? 'external send recorded' : 'external receive recorded';
+  }
+  if (actionType === 'agentpay_send') {
+    return isOutgoing ? 'direct payment sent' : 'direct payment received';
+  }
+  return isIncoming ? 'incoming' : isOutgoing ? 'outgoing' : 'payment';
 }
 
 function formatAgentPayHistoryForChat(
@@ -4130,15 +4164,14 @@ function formatAgentPayHistoryForChat(
 
   for (const [index, row] of visibleRows.entries()) {
     const amount = row.amount ? `${row.amount} USDC` : 'unknown amount';
-    const direction =
-      row.direction === 'in' ? 'incoming' : row.direction === 'out' ? 'outgoing' : 'payment';
+    const direction = describeAgentPayHistoryRow(row);
     const status = typeof row.status === 'string' && row.status.trim() ? row.status.trim() : 'recorded';
     const counterparty =
       row.direction === 'in'
         ? row.from_wallet || row.from || row.payer || ''
         : row.to_wallet || row.to || row.payee || '';
-    const when = row.created_at ? new Date(String(row.created_at)) : null;
-    const whenText = when && !Number.isNaN(when.getTime()) ? dateFormatter.format(when) : 'recently';
+    const when = parseServerTimestampUtc(row.created_at);
+    const whenText = when ? dateFormatter.format(when) : 'recently';
     const txHash = row.arc_tx_id ? String(row.arc_tx_id) : '';
     const txText = row.explorerLink
       ? `[${formatTxHash(txHash) || 'explorer'}](${row.explorerLink})`
@@ -5471,7 +5504,6 @@ function buildPredmarketResearchPrompt(
   marketAddress: `0x${string}`,
   outcomes: PredictionOutcomeChoice[] = [],
 ): string {
-  void marketAddress;
   const safeTitle = title.trim() || 'this prediction market';
   const outcomeLabels = outcomes
     .map((outcome) => outcome.label.trim())
@@ -5482,6 +5514,7 @@ function buildPredmarketResearchPrompt(
     outcomeLabels.length
       ? `Listed outcomes in AgentFlow: ${outcomeLabels.join(' / ')}.`
       : null,
+    marketAddress ? `Market address for AgentFlow trade routing only: ${marketAddress}.` : null,
     'Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.',
   ]
     .filter(Boolean)
@@ -5526,6 +5559,14 @@ function extractPredmarketResearchContext(
   task: string,
 ) : { marketAddress: `0x${string}` | null; titleHint: string | null } | null {
   const marketAddress = extractPredictionMarketAddress(task);
+  const hasPredmarketCue =
+    /\bprediction market\b/i.test(task) ||
+    /\bListed outcomes in AgentFlow:/i.test(task) ||
+    /\bMarket address for AgentFlow trade routing only:/i.test(task) ||
+    /\b(outcome probabilities|listed outcomes)\b/i.test(task);
+  if (!hasPredmarketCue) {
+    return null;
+  }
   const withoutPrefix = task
     .replace(/^research\s+(?:this\s+)?(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
     .replace(/^research\s+the\s+(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
@@ -6127,6 +6168,12 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
     redisActionScopeKey,
     predmarketResearchContext = null,
   } = opts;
+  const effectivePredmarketResearchContext =
+    predmarketResearchContext ??
+    extractPredmarketResearchContext(researchTask) ??
+    (originalUserMessage && originalUserMessage !== researchTask
+      ? extractPredmarketResearchContext(originalUserMessage)
+      : null);
 
   const syncToken = `sync:${randomUUID()}`;
   let slotHeld = false;
@@ -6397,8 +6444,8 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
     // was actually launched from a prediction-market context. Plain research
     // (e.g. "BTC report") should NOT auto-attach trade buttons just because it
     // mentions a tradeable asset.
-    const researchQuickActionGroups = predmarketResearchContext
-      ? await buildPredmarketResearchQuickActionGroupsFromContext(predmarketResearchContext)
+    const researchQuickActionGroups = effectivePredmarketResearchContext
+      ? await buildPredmarketResearchQuickActionGroupsFromContext(effectivePredmarketResearchContext)
       : undefined;
     res.write(
       `data: ${JSON.stringify({
@@ -6407,6 +6454,9 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
           reportMeta: {
             kind: 'research',
             mode: reasoningMode,
+            ...(effectivePredmarketResearchContext
+              ? { contextKind: 'prediction_market' }
+              : {}),
           },
           ...(researchQuickActionGroups
             ? { quickActionGroups: researchQuickActionGroups }

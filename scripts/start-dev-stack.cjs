@@ -1,5 +1,6 @@
 const path = require("path");
 const { spawn } = require("child_process");
+const net = require("net");
 const dotenv = require("dotenv");
 
 const { cleanupExistingStack } = require("./stack-cleanup.cjs");
@@ -41,38 +42,47 @@ const CRITICAL_HEALTH_TARGETS = [
   {
     name: "frontend",
     url: "http://127.0.0.1:3005/api/health",
+    port: 3005,
     startupGraceMs: 120_000,
+    healthTimeoutMs: 15_000,
+    allowPortLiveness: true,
     starter: () => startFrontend(),
   },
   {
     name: "hermes",
     url: "http://127.0.0.1:8000/health",
+    port: 8000,
     startupGraceMs: 60_000,
     starter: () => startHermes(),
   },
   {
     name: "facilitator",
     url: "http://127.0.0.1:3010/health",
+    port: 3010,
     starter: () => startBackendProcess({ name: "facilitator", command: "tsx facilitator/server.ts" }),
   },
   {
     name: "research",
     url: "http://127.0.0.1:3001/health",
+    port: 3001,
     starter: () => startBackendProcess({ name: "research", command: "tsx agents/research/server.ts" }),
   },
   {
     name: "analyst",
     url: "http://127.0.0.1:3002/health",
+    port: 3002,
     starter: () => startBackendProcess({ name: "analyst", command: "tsx agents/analyst/server.ts" }),
   },
   {
     name: "writer",
     url: "http://127.0.0.1:3003/health",
+    port: 3003,
     starter: () => startBackendProcess({ name: "writer", command: "tsx agents/writer/server.ts" }),
   },
   {
     name: "api",
     url: "http://127.0.0.1:4000/health",
+    port: 4000,
     startupGraceMs: 60_000,
     starter: () => startBackendProcess({ name: "api", command: "tsx server.ts" }),
   },
@@ -85,9 +95,9 @@ let shuttingDown = false;
 const pendingRestarts = new Map();
 const criticalHealthFailures = new Map();
 
-async function probeHealth(url) {
+async function probeHealth(url, timeoutMs = HEALTH_CHECK_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, { signal: controller.signal });
     return response.ok;
@@ -96,6 +106,44 @@ async function probeHealth(url) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function isPortListening(port) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch {}
+      resolve(value);
+    };
+
+    socket.setTimeout(1500);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.connect(port, "127.0.0.1");
+  });
+}
+
+async function isTargetResponsive(target) {
+  const healthOk = await probeHealth(
+    target.url,
+    target.healthTimeoutMs ?? HEALTH_CHECK_TIMEOUT_MS,
+  );
+  if (healthOk) {
+    return { ok: true, mode: "health" };
+  }
+  if (target.allowPortLiveness && target.port) {
+    const portAlive = await isPortListening(target.port);
+    if (portAlive) {
+      return { ok: true, mode: "port" };
+    }
+  }
+  return { ok: false, mode: "down" };
 }
 
 function registerManagedChild(name, child, restartFactory) {
@@ -119,6 +167,23 @@ function registerManagedChild(name, child, restartFactory) {
 
     managedChildren.delete(name);
     if (!shuttingDown) {
+      const target = criticalHealthTargetByName.get(name);
+      if (target) {
+        isTargetResponsive(target)
+          .then((status) => {
+            if (status.ok) {
+              const detail =
+                status.mode === "port"
+                  ? `port ${target.port} is still live`
+                  : `${target.url} is still healthy`;
+              console.log(`[dev:stack] ${name} wrapper exited, but ${detail}; skipping restart.`);
+              return;
+            }
+            scheduleRestart(name, restartFactory);
+          })
+          .catch(() => scheduleRestart(name, restartFactory));
+        return;
+      }
       scheduleRestart(name, restartFactory);
     }
   });
@@ -134,10 +199,14 @@ function scheduleRestart(name, restartFactory) {
     if (shuttingDown) return;
     const target = criticalHealthTargetByName.get(name);
     if (target) {
-      probeHealth(target.url)
-        .then((ok) => {
-          if (ok) {
-            console.log(`[dev:stack] ${name} is already healthy at ${target.url}; skipping restart.`);
+      isTargetResponsive(target)
+        .then((status) => {
+          if (status.ok) {
+            const detail =
+              status.mode === "port"
+                ? `port ${target.port} is already live`
+                : `${target.url} is already healthy`;
+            console.log(`[dev:stack] ${name} ${detail}; skipping restart.`);
             return;
           }
           const child = restartFactory();
@@ -157,9 +226,14 @@ function scheduleRestart(name, restartFactory) {
 
 async function verifyCriticalServices() {
   for (const target of CRITICAL_HEALTH_TARGETS) {
-    const ok = await probeHealth(target.url);
-    if (ok) {
+    const status = await isTargetResponsive(target);
+    if (status.ok) {
       criticalHealthFailures.delete(target.name);
+      if (status.mode === "port") {
+        console.warn(
+          `[dev:stack] ${target.name} port ${target.port} is live but health is still warming up; skipping restart.`,
+        );
+      }
       continue;
     }
     const managed = managedChildren.get(target.name);
@@ -260,8 +334,13 @@ async function bootstrap() {
     "[dev:stack] Frontend: http://localhost:3005 (quick health: http://localhost:3005/api/health)",
   );
 
-  if (await probeHealth("http://127.0.0.1:3005/api/health")) {
-    console.log("[dev:stack] frontend already healthy on :3005; reusing existing process.");
+  const frontendStatus = await isTargetResponsive(criticalHealthTargetByName.get("frontend"));
+  if (frontendStatus.ok) {
+    console.log(
+      frontendStatus.mode === "port"
+        ? "[dev:stack] frontend already owns :3005; letting health warm up without respawn."
+        : "[dev:stack] frontend already healthy on :3005; reusing existing process.",
+    );
   } else {
     const fe = startFrontend();
     fe.on("error", (err) => {
@@ -270,7 +349,7 @@ async function bootstrap() {
     feChild = registerManagedChild("frontend", fe, () => startFrontend());
   }
 
-  if (await probeHealth("http://127.0.0.1:8000/health")) {
+  if ((await isTargetResponsive(criticalHealthTargetByName.get("hermes"))).ok) {
     console.log("[dev:stack] Hermes already healthy on :8000; reusing existing process.");
   } else {
     const hermes = startHermes();

@@ -216,10 +216,10 @@ function QuickAgentPromptStrip({
   disabled: boolean;
   onSelect: (prompt: QuickAgentPrompt) => void;
 }) {
-  // Default to "Start here" so a first-time user sees free discovery prompts,
-  // not a money-moving action.
-  const [activeGroup, setActiveGroup] = useState<StarterGroup>("Start here");
-  const groupPrompts = quickAgentPrompts.filter((item) => item.group === activeGroup);
+  const [activeGroup, setActiveGroup] = useState<StarterGroup | null>(null);
+  const groupPrompts = activeGroup
+    ? quickAgentPrompts.filter((item) => item.group === activeGroup)
+    : [];
 
   return (
     <div className="mx-auto mt-[22px] flex max-w-[1064px] flex-col items-center gap-4">
@@ -233,7 +233,7 @@ function QuickAgentPromptStrip({
               type="button"
               role="tab"
               aria-selected={active}
-              onClick={() => setActiveGroup(group)}
+              onClick={() => setActiveGroup((current) => (current === group ? null : group))}
               className={`rounded-full px-4 py-1.5 text-[10px] font-bold uppercase tracking-[0.18em] transition ${
                 active
                   ? "border border-[#f2ca50]/50 bg-[#211f16] text-[#f2ca50]"
@@ -246,24 +246,32 @@ function QuickAgentPromptStrip({
         })}
       </div>
 
-      {/* Prompts for the active category */}
-      <div
-        className="flex flex-wrap justify-center gap-3"
-        aria-label="AgentFlow prompt starters"
-      >
-        {groupPrompts.map((item) => (
-          <button
-            key={item.label}
-            type="button"
-            disabled={disabled}
-            onClick={() => onSelect(item)}
-            title={item.prompt}
-            className="min-h-[50px] rounded-full border border-white/10 bg-[#202020]/90 px-6 text-[11px] font-black uppercase tracking-[0.2em] text-white/45 shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_12px_30px_rgba(0,0,0,0.28)] transition hover:border-[#f2ca50]/45 hover:bg-[#211f16] hover:text-[#f2ca50] disabled:cursor-not-allowed disabled:opacity-50"
+      {/* Bubble cloud for the active category */}
+      {activeGroup ? (
+        <div className="relative w-full px-2">
+          <div
+            key={activeGroup}
+            className="animate-[starterBubbleCloud_320ms_cubic-bezier(0.2,0.9,0.2,1)_both] px-3 py-2"
+            aria-label="AgentFlow prompt starters"
           >
-            {item.label}
-          </button>
-        ))}
-      </div>
+            <div className="flex flex-wrap justify-center gap-3">
+              {groupPrompts.map((item, index) => (
+                <button
+                  key={item.label}
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => onSelect(item)}
+                  title={item.prompt}
+                  style={{ animationDelay: `${index * 42}ms` }}
+                  className="min-h-[52px] rounded-full border border-white/10 bg-[#202020]/90 px-6 text-[11px] font-black uppercase tracking-[0.2em] text-white/45 opacity-0 shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_12px_30px_rgba(0,0,0,0.28)] transition hover:-translate-y-[1px] hover:border-[#f2ca50]/45 hover:bg-[#211f16] hover:text-[#f2ca50] disabled:cursor-not-allowed disabled:opacity-50 [animation:starterChipPop_440ms_cubic-bezier(0.18,0.88,0.22,1.28)_forwards]"
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -318,7 +326,7 @@ const quickAgentPrompts: QuickAgentPrompt[] = [
   { label: "Send USDC", tab: "AgentPay", group: "Payments", prompt: "Explain how sending USDC works on AgentFlow", routeIntent: "Conversation" },
   { label: "Request & links", tab: "AgentPay", group: "Payments", prompt: "Explain payment requests, links and QR codes on AgentFlow", routeIntent: "Conversation" },
   { label: "Invoices", tab: "AgentPay", group: "Payments", prompt: "Explain how invoices work on AgentFlow", routeIntent: "Conversation" },
-  { label: "Split a bill", tab: "AgentPay", group: "Payments", prompt: "Explain how splitting a bill works on AgentFlow", routeIntent: "Conversation" },
+  { label: "Split a bill", tab: "AgentPay", group: "Payments", prompt: "Explain how split payments work on AgentFlow", routeIntent: "Conversation" },
   { label: "Batch / payroll", tab: "AgentPay", group: "Payments", prompt: "Explain how batch payments and payroll work", routeIntent: "Conversation" },
   { label: "Scheduled pay", tab: "AgentPay", group: "Payments", prompt: "Explain how scheduled and recurring payments work", routeIntent: "Conversation" },
   { label: "Contacts & .arc", tab: "AgentPay", group: "Payments", prompt: "Explain how contacts and .arc handles work", routeIntent: "Conversation" },
@@ -2064,16 +2072,46 @@ function uniqueSources(sources: ReportSource[]): ReportSource[] {
   return Array.from(deduped.values());
 }
 
-function buildResearchSources(research?: ResearchPayload | null): ReportSource[] {
+function buildResearchSources(
+  research?: ResearchPayload | null,
+  liveData?: LiveDataPayload | null,
+): ReportSource[] {
   const rawSources = Array.isArray(research?.sources) ? research.sources : [];
+  const liveSources = Array.isArray(liveData?.sources) ? liveData.sources : [];
+  const coingeckoAssets = Array.isArray(liveData?.coingecko?.assets)
+    ? liveData.coingecko.assets
+    : [];
   return uniqueSources(
-    rawSources
-      .filter((source) => typeof source?.name === "string" && typeof source?.url === "string")
-      .map((source) => ({
-        name: source.name as string,
-        url: source.url as string,
-        usedFor: typeof source.used_for === "string" ? source.used_for : undefined,
-      })),
+    [
+      ...rawSources
+        .filter((source) => typeof source?.name === "string" && typeof source?.url === "string")
+        .map((source) => ({
+          name: source.name as string,
+          url: source.url as string,
+          usedFor: typeof source.used_for === "string" ? source.used_for : undefined,
+        })),
+      ...liveSources
+        .filter((source) => typeof source?.url === "string")
+        .map((source) => ({
+          name:
+            typeof source?.title === "string"
+              ? source.title
+              : typeof source?.domain === "string"
+                ? source.domain
+                : "Retrieved source",
+          url: source.url as string,
+          usedFor:
+            typeof source?.summary === "string"
+              ? source.summary
+              : undefined,
+        })),
+      ...coingeckoAssets
+        .filter((asset) => typeof asset?.coinId === "string" && asset.coinId.trim().length > 0)
+        .map((asset) => ({
+          name: "CoinGecko",
+          url: `https://www.coingecko.com/en/coins/${encodeURIComponent(asset.coinId as string)}`,
+        })),
+    ],
   ).slice(0, 6);
 }
 
@@ -2130,7 +2168,7 @@ function buildResearchReportMeta(reportEvent: Extract<PipelineEvent, { type: "re
       typeof liveData?.premise_check?.note === "string"
         ? liveData.premise_check.note
         : undefined,
-    sources: buildResearchSources(reportEvent.research),
+    sources: buildResearchSources(reportEvent.research, liveData),
   };
 }
 
@@ -5928,8 +5966,42 @@ function ChatPageInner() {
 
 export default function ChatPage() {
   return (
-    <Suspense fallback={<main className="h-screen bg-[#080808] text-white/90" />}>
-      <ChatPageInner />
-    </Suspense>
+    <>
+      <style jsx global>{`
+        @keyframes starterBubbleCloud {
+          0% {
+            opacity: 0;
+            transform: translateY(-10px) scale(0.96);
+            filter: blur(8px);
+          }
+          100% {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+            filter: blur(0);
+          }
+        }
+
+        @keyframes starterChipPop {
+          0% {
+            opacity: 0;
+            transform: translateY(-14px) scale(0.72);
+            filter: blur(10px);
+          }
+          58% {
+            opacity: 1;
+            transform: translateY(2px) scale(1.06);
+            filter: blur(0);
+          }
+          100% {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+            filter: blur(0);
+          }
+        }
+      `}</style>
+      <Suspense fallback={<main className="h-screen bg-[#080808] text-white/90" />}>
+        <ChatPageInner />
+      </Suspense>
+    </>
   );
 }

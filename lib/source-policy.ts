@@ -98,9 +98,9 @@ export function isLowValueSourceForTask(task: string, source: SourceLike): boole
   if (/pdf\.js\/web\/viewer\.html|(?:login|signout).*[?&](?:source|redirect|url)=/i.test(url)) {
     return true;
   }
-  if (/\b(xaut|tether gold)\b/i.test(task)) {
+  if (/\b(xaut|tether[- ]gold)\b/i.test(task)) {
     if (/\btp-link\b/i.test(haystack)) return true;
-    if (!/\b(xaut|tether gold|gold-backed|tokenized gold|gold price)\b/i.test(haystack)) {
+    if (!/\b(xaut|tether[- ]gold|gold-backed|tokenized gold|gold price)\b/i.test(haystack)) {
       return true;
     }
   }
