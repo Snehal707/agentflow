@@ -193,8 +193,35 @@ function parseNaturalLanguageBatchMessage(
     return payments;
   }
 
+  const compactListMatch = message.match(
+    new RegExp(
+      String.raw`(?:^|\b)(?:batch\s*pay(?:ment)?|payroll|bulk\s+pay|pay\s+multiple(?:\s+people)?|pay\s+everyone)\b[\s:,-]*(.+)$`,
+      'i',
+    ),
+  );
+  if (compactListMatch?.[1]) {
+    const compactRemainder = compactListMatch[1]
+      .replace(/\b(?:to|for)\b/gi, ' ')
+      .replace(/\b(?:and|plus)\b/gi, ' ');
+    const pairPattern = new RegExp(
+      String.raw`(${handlePattern})\s+(?:\$?\s*)?(\d+(?:\.\d+)?)\s*(?:usdc|usd|eurc|\$)?`,
+      'gi',
+    );
+    const compactPayments: BatchPaymentRow[] = [];
+    let compactMatch: RegExpExecArray | null;
+    while ((compactMatch = pairPattern.exec(compactRemainder)) !== null) {
+      const to = compactMatch[1]?.trim();
+      const amount = compactMatch[2]?.trim();
+      if (!to || !amount) continue;
+      compactPayments.push({ to, amount });
+    }
+    if (compactPayments.length >= 2) {
+      return compactPayments;
+    }
+  }
+
   const sharedAmountPattern =
-    /\b(?:batch\s*pay(?:ment)?|payroll|bulk\s+pay|pay\s+multiple|pay\s+everyone)\b[\s:,-]*(?:\$?\s*)?(\d+(?:\.\d+)?)\s*(?:usdc|usd|eurc|\$)?(?:\s+each)?\s+(?:(?:to|for)\s+)?(.+)$/i;
+    /\b(?:batch\s*pay(?:ment)?|payroll|bulk\s+pay|pay\s+multiple(?:\s+people)?|pay\s+everyone)\b[\s:,-]*(?:\$?\s*)?(\d+(?:\.\d+)?)\s*(?:usdc|usd|eurc|\$)?(?:\s+each)?\s+(?:(?:to|for)\s+)?(.+)$/i;
   const sharedMatch = message.match(sharedAmountPattern);
   if (!sharedMatch) {
     return null;

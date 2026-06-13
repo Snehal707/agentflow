@@ -902,11 +902,29 @@ function requiredStateToolForStaleAnswer(
     return null;
   }
 
+  const productHelpShapedQuestion =
+    answerMode === 'product_info' ||
+    ((/^(?:explain\b|tell\s+me\b|show\s+me\b|give\s+me\b|how\s+(?:to|do\s+i|does|can\s+i)\b|what\s+(?:is|are|does)\b|do\s+you\s+support\b|can\s+i\s+use\b|which\b)/i.test(
+      userMessage.trim(),
+    ) ||
+      /\b(?:csv|example|examples|sample|template|format)\b/i.test(userMessage)) &&
+      /\b(?:split|batch|schedule|scheduled|invoice|request|payment link|qr|contacts?|\.arc|wallet addresses?|bridge|vault|swap|portfolio|telegram|research|csv|format|template|example|examples|sample)\b/i.test(
+        userMessage,
+      ) &&
+      !/\b(?:my|mine|our)\b/i.test(userMessage) &&
+      !/\b[a-z0-9_.-]+\.arc\b/i.test(userMessage) &&
+      !/0x[a-f0-9]{6,}/i.test(userMessage) &&
+      !/\b\d+(?:\.\d+)?\b/i.test(userMessage));
+  if (productHelpShapedQuestion) {
+    return null;
+  }
+
   const responseHasFinancialStateClaim =
-    /\b(?:current|combined|total|available|wallet|portfolio|holdings|positions|value|worth|balance|balances|reserve)\b/i.test(
+    /\b(?:current|combined|total|available|portfolio|holdings|positions|value|worth|balance|balances|reserve|wallet\s+balance|wallet\s+balances|wallet\s+holdings|wallet\s+value)\b/i.test(
       response,
     ) &&
-    /\b(?:USDC|EURC|USD|dollars?)\b/i.test(response);
+    /\b(?:USDC|EURC|USD|dollars?)\b/i.test(response) &&
+    !/\bwallet addresses?\b/i.test(response);
 
   const userAskedForState =
     /\b(balance|balances|funds|how much|portfolio|holdings|positions|value|worth|status|transaction|payment|scheduled|schedule|contacts?)\b/i.test(
@@ -917,7 +935,7 @@ function requiredStateToolForStaleAnswer(
   }
 
   const responseHasSpecificAmount =
-    /(?:\$|USDC\b|EURC\b|\b\d+(?:\.\d+)?\s*(?:USDC|EURC|USD|dollars?|%|tokens?)\b)/i.test(
+    /(?:\$\s*\d+(?:\.\d+)?|\b\d+(?:\.\d+)?\s*(?:USDC|EURC|USD|dollars?|%|tokens?)\b)/i.test(
       response,
     );
   if (!responseHasSpecificAmount) {
@@ -1003,7 +1021,7 @@ function responseLooksLikeHermesIdentityDrift(text: string): boolean {
 }
 
 function responseLooksLikeFakeCommandOutput(text: string): boolean {
-  return /```(?:bash|sh|python|ruby|properties|markdown)?|agentflow-cli|agentwallet status|opensesame audit|watch "|Hermes direct mode|standalone Hermes CLI|system powers|Reply YES to execute or NO to cancel\.|ssh\b|terminal tool|terminal command|show the next command|verbose logging|I'd use\b|I would show the next command|what terminal command|what specific output/i.test(
+  return /```(?:bash|sh|python|ruby|properties)\b|agentflow-cli|agentwallet status|opensesame audit|watch "|Hermes direct mode|standalone Hermes CLI|system powers|Reply YES to execute or NO to cancel\.|ssh\b|terminal tool|terminal command|show the next command|verbose logging|I'd use\b|I would show the next command|what terminal command|what specific output/i.test(
     text,
   );
 }
@@ -1438,10 +1456,13 @@ function validateAgentFlowBrainReply(
 
   if (toolsStarted.length === 0 && responseLooksLikeFakeCommandOutput(trimmed)) {
     const concise = firstSentences(trimmed, 2);
-    if (/did not run|don't have|do not have|cannot|can't/i.test(concise)) {
+    if (
+      /did not run|don't have|do not have|cannot|can't/i.test(concise) &&
+      !/live terminal|system tools?|terminal commands?/i.test(concise)
+    ) {
       return concise;
     }
-    return 'I did not run any live terminal or system tools for that request. In AgentFlow chat I should only describe the real product actions that are actually available.';
+    return "Something internal leaked into that draft, so I'm not going to show it. Please ask again and I'll answer in normal AgentFlow product language.";
   }
 
   return trimmed;

@@ -114,6 +114,7 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
       'AgentPay can request USDC from a person, .arc handle, or wallet address without moving funds immediately.',
     facts: [
       'Say "request 10 USDC from alice.arc" to create a payment request.',
+      'Example request with remark: "request 10 USDC from alice.arc for dinner".',
       'Payment requests notify the payer and let them approve or decline later.',
       'Payment requests do not move funds immediately and do not need YES confirmation.',
       'If you want a shareable request flow, ask for a payment link or QR code instead.',
@@ -147,11 +148,13 @@ export const PRODUCT_KNOWLEDGE: ProductKnowledgeDoc[] = [
     facts: [
       'Split payments across 2 to 10 recipients.',
       'Say "split 30 USDC between alice.arc and bob.arc" to split equally.',
+      'You can add a shared remark in chat, for example: "split 30 USDC between alice.arc and bob.arc for dinner".',
       'You can run a split directly from chat; CSV is optional when you prefer uploading a recipient list.',
-      'Example chat command: "split 90 USDC between alice.arc, bob.arc, and charlie.arc".',
+      'Example chat command: "split 90 USDC between alice.arc, bob.arc, and charlie.arc for team lunch".',
       'Each recipient gets an equal share by default.',
       'Split payments preview first and require YES confirmation.',
       'For split CSV uploads, provide one total amount to divide, e.g. first line "split,30,dinner", then a recipient header and recipient rows.',
+      'Example Split CSV: first line "split,30,dinner", second line "recipient", then rows like "alice.arc" and "bob.arc".',
       'Do not put per-recipient amounts in split CSV; use BatchPay when each row has its own amount.',
       'Telegram and web detect Split CSV when the filename contains "split" or the first row starts with "split,...". The total amount and optional remark come from the first row, not from the filename.',
     ],
@@ -638,7 +641,9 @@ function scoreDoc(doc: ProductKnowledgeDoc, query: string): number {
   if (/\bcsv\b/.test(normalizedQuery) && !/schedule|scheduled|split/.test(normalizedQuery) && doc.id === 'batch-payments') score += 14;
   if (/payment request|payment requests|request money|request usdc|collect money|\bbill\b|ask .* to pay/.test(normalizedQuery) && doc.id === 'payment-requests') score += 18;
   if (/\brequest\b/.test(normalizedQuery) && doc.id === 'payment-requests') score += 10;
+  if (/\brequest\b.*\b(?:remark|note|notes)\b|\b(?:remark|note|notes)\b.*\brequest\b/.test(normalizedQuery) && doc.id === 'payment-requests') score += 18;
   if (/invoice|bill|receipt/.test(normalizedQuery) && doc.id === 'invoices') score += 14;
+  if (/\b(?:difference|compare|vs\.?|versus)\b.*\brequest\b.*\binvoice\b|\b(?:difference|compare|vs\.?|versus)\b.*\binvoice\b.*\brequest\b|\brequest\b.*\binvoice\b/.test(normalizedQuery) && (doc.id === 'payment-requests' || doc.id === 'invoices')) score += 18;
   if (/contact|address book|alias|save .* as/.test(normalizedQuery) && doc.id === 'contacts') score += 14;
   if (/\.arc|arc handle|handle|username/.test(normalizedQuery) && doc.id === 'arc-handles') score += 14;
   if (/predict|market|bet|outcome|redeem|refund|lmsr/.test(normalizedQuery) && doc.id === 'prediction-markets') score += 14;
@@ -762,9 +767,43 @@ function selectFacts(query: string, docs: ProductKnowledgeDoc[]): string[] {
     ];
   }
 
+  const normalizedQuery = normalize(query);
   const queryTokens = unique(tokenize(query));
   const facts: string[] = [];
   for (const doc of docs) {
+    if (doc.id === 'payment-requests') {
+      if (/\bremark\b|\bnote\b|\bnotes\b/i.test(normalizedQuery)) {
+        facts.push('Payment requests can include a remark or note for context.');
+        facts.push('Example request with remark: "request 10 USDC from alice.arc for dinner".');
+      }
+    }
+
+    if (doc.id === 'schedule-payments') {
+      if (/\bhow\b|\bwork\b|\bworks\b|\bworking\b/i.test(normalizedQuery)) {
+        facts.push('You can create a scheduled payment directly from chat; CSV is optional on web, not required.');
+        facts.push('Example schedule payment chat command: "pay jack.arc 10 USDC every friday" or "send 25 USDC to alice.arc every month".');
+      }
+    }
+
+    if (doc.id === 'split-payments') {
+      if (/\bremark\b|for\s+\w+|\bnote\b/i.test(normalizedQuery)) {
+        facts.push(
+          'You can add a shared remark in chat, for example: "split 30 USDC between alice.arc and bob.arc for dinner".',
+        );
+      }
+      if (/\bcsv\b|\bformat\b|\btemplate\b|\bexample\b|\bsample\b/i.test(normalizedQuery)) {
+        facts.push(
+          'For split CSV uploads, provide one total amount to divide, e.g. first line "split,30,dinner", then a recipient header and recipient rows.',
+        );
+        facts.push(
+          'Example Split CSV: first line "split,30,dinner", second line "recipient", then rows like "alice.arc" and "bob.arc".',
+        );
+        facts.push(
+          'Do not put per-recipient amounts in split CSV; use BatchPay when each row has its own amount.',
+        );
+      }
+    }
+
     const ranked = doc.facts
       .map((fact) => ({
         fact,
@@ -779,6 +818,26 @@ function selectFacts(query: string, docs: ProductKnowledgeDoc[]): string[] {
 }
 
 export function answerProductQuestion(query: string): ProductRagAnswer | null {
+  const normalizedQuery = normalize(query);
+  if (
+    /\b(?:difference|compare|vs|versus)\b/.test(normalizedQuery) &&
+    /\brequest\b/.test(normalizedQuery) &&
+    /\binvoice\b/.test(normalizedQuery)
+  ) {
+    return {
+      answer: [
+        'Payment requests and invoices are similar, but they are used a bit differently.',
+        '',
+        '- Payment request: a lightweight ask to pay, for example "request 10 USDC from alice.arc for dinner".',
+        '- Invoice: a more formal bill with an invoice number, recipient, amount, and description, for example "create invoice for alice.arc 50 USDC for design work".',
+        '- Both do not move funds immediately; the payer handles payment afterward.',
+        '- Use a request for simple collections between people, and use an invoice when you want formal billing and invoice tracking.',
+      ].join('\n'),
+      sources: ['Product KB: Payment requests', 'Product KB: Invoices'],
+      confidence: 0.92,
+    };
+  }
+
   const rankedDocs = retrieveProductKnowledge(query, { limit: isCapabilityQuestion(query) ? 1 : 3 });
   if (!rankedDocs.length) return null;
 

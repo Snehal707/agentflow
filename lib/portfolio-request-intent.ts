@@ -5,6 +5,10 @@ const PORTFOLIO_SUBJECT_RE =
 const PORTFOLIO_REFERENCE_SUBJECT_RE = /\b(?:portfolio|holdings|positions?)\b/i;
 const OTHER_ACTION_RE =
   /\b(?:swap|trade|convert|exchange|bridge|deposit|withdraw|stake|send|pay|invoice|request)\b/i;
+const PRODUCT_CAPABILITY_RE =
+  /\b(?:support|supports|accept|accepts|allow|allows|use|works?|available|difference|compare|vs\.?|versus|what\s+is|how\s+does)\b/i;
+const ADVISORY_SCOPE_RE =
+  /\b(?:manage|run|handle|look after|take care of|be in charge of|invest|allocate|rebalance|optimi[sz]e)\b[\s\S]{0,80}\b(?:my\s+)?(?:funds|portfolio|money|wealth|assets|finances)\b/i;
 const SNAPSHOT_ACTION_RE =
   /\b(?:show|display|list|summarize|scan|review|analy[sz]e|overview|break\s*down|pull\s+up)\b/i;
 const SNAPSHOT_STATE_QUESTION_RE =
@@ -43,6 +47,12 @@ export function classifyPortfolioRequestMode(message: string): PortfolioRequestM
   if (isVaultPositionRequest(normalized)) {
     return null;
   }
+  if (/\bafford\b/i.test(normalized)) {
+    return null;
+  }
+  if (/\bbalances?\b/i.test(normalized) && !PORTFOLIO_REFERENCE_SUBJECT_RE.test(normalized)) {
+    return null;
+  }
   if (
     PORTFOLIO_ANALYSIS_REQUEST_RE.test(normalized) ||
     PORTFOLIO_ANALYSIS_VERB_RE.test(normalized)
@@ -52,6 +62,7 @@ export function classifyPortfolioRequestMode(message: string): PortfolioRequestM
   if (SNAPSHOT_STATE_QUESTION_RE.test(normalized)) return 'snapshot';
   if (!PORTFOLIO_SUBJECT_RE.test(normalized)) return null;
   if (OTHER_ACTION_RE.test(normalized)) return null;
+  if (ADVISORY_SCOPE_RE.test(normalized)) return null;
 
   if (DISCUSSION_RE.test(normalized)) {
     return 'discussion';
@@ -61,12 +72,19 @@ export function classifyPortfolioRequestMode(message: string): PortfolioRequestM
     return 'snapshot';
   }
 
-  if (INFORMATIONAL_OR_REFERENTIAL_QUESTION_RE.test(normalized)) {
-    return 'clarify';
+  if (PRODUCT_CAPABILITY_RE.test(normalized) && !SNAPSHOT_ACTION_RE.test(normalized)) {
+    return null;
   }
 
   if (INDIRECT_REQUEST_RE.test(normalized)) {
+    if (PRODUCT_CAPABILITY_RE.test(normalized)) {
+      return null;
+    }
     return SNAPSHOT_ACTION_RE.test(normalized) ? 'snapshot' : 'clarify';
+  }
+
+  if (INFORMATIONAL_OR_REFERENTIAL_QUESTION_RE.test(normalized)) {
+    return 'clarify';
   }
 
   if (SNAPSHOT_ACTION_RE.test(normalized)) {

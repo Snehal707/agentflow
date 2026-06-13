@@ -42,6 +42,22 @@ export function classifyAnswerMode(message: string): AnswerMode {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return 'general';
 
+  const isProductCapabilityQuestion =
+    /\b(?:what can you do|what can agentflow do|how does agentflow work|what is agentflow|voice notes?|screenshots?|wallet addresses?|\.arc|capabilities|support)\b/i.test(
+      normalized,
+    ) ||
+    ((/^(?:explain\b|tell\s+me\b|show\s+me\b|give\s+me\b|how\s+(?:to|do\s+i|does|can\s+i)\b|what\s+(?:is|are|does)\b|do\s+you\s+support\b|can\s+i\s+use\b|which\b)/i.test(
+      normalized,
+    ) ||
+      /\b(?:csv|example|examples|sample|template|format)\b/i.test(normalized)) &&
+      /\b(?:split|batch|schedule|scheduled|invoice|request|payment link|qr|contacts?|\.arc|bridge|vault|swap|portfolio|telegram|research|csv|format|template|example|examples|sample)\b/i.test(
+        normalized,
+      ) &&
+      !/\b(?:my|mine|our)\b/i.test(normalized) &&
+      !/\b[a-z0-9_.-]+\.arc\b/i.test(normalized) &&
+      !/0x[a-f0-9]{6,}/i.test(normalized) &&
+      !/\b\d+(?:\.\d+)?\b/i.test(normalized));
+
   if (/^(?:hi|hey|hello|yo|sup|thanks?|thank you|ok(?:ay)?|lol|haha)\b/i.test(normalized)) {
     return 'casual_chat';
   }
@@ -65,6 +81,10 @@ export function classifyAnswerMode(message: string): AnswerMode {
     )
   ) {
     return 'financial_advice';
+  }
+
+  if (isProductCapabilityQuestion) {
+    return 'product_info';
   }
 
   if (/\b(?:portfolio|holdings?|positions?|what do i own|wallet breakdown|scan my wallet)\b/i.test(normalized)) {
@@ -101,14 +121,6 @@ export function classifyAnswerMode(message: string): AnswerMode {
     )
   ) {
     return 'action_preview';
-  }
-
-  if (
-    /\b(?:what can you do|what can agentflow do|how does agentflow work|what is agentflow|voice notes?|screenshots?|wallet addresses?|\.arc|capabilities|support)\b/i.test(
-      normalized,
-    )
-  ) {
-    return 'product_info';
   }
 
   return 'general';

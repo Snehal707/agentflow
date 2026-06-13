@@ -614,7 +614,7 @@ function validateScheduleCreate(slots: ScheduleCreateSlots): ValidatorDecision {
       missing.length === 1 && missing[0] === 'schedule.cadence'
         ? 'How often should I send it?'
         : missing.length === 1 && missing[0] === 'amount.value' && recipientHandle
-          ? `How much should I send to ${recipientHandle} each time?`
+          ? `How much USDC should I schedule to ${recipientHandle} each time?`
           : missing.length === 1 && missing[0] === 'recipient' && hasPositiveAmount(slots.amount)
             ? 'Who should receive the scheduled payment?'
             : 'Tell me who to pay, how much, and how often.';

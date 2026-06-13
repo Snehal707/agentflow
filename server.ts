@@ -4520,10 +4520,16 @@ function isPayloadFreeProductQuestion(message: string): boolean {
   if (!m || m.length > 160) return false;
 
   const infoOpener =
-    /^\s*(?:explain\b|how\s+(?:to|do\s+i|does|can\s+i)\b|what\s+(?:is|are|can|does)\b|which\b|where\s+do\s+i\b|do\s+you\s+support\b|tell\s+me\s+about\b)/i.test(
+    /^\s*(?:explain\b|how\s+(?:to|do\s+i|does|can\s+i)\b|what\s+(?:is|are|can|does)\b|which\b|where\s+do\s+i\b|do\s+you\s+support\b|tell\s+me\s+about\b|(?:tell|show|give)\s+me\b)/i.test(
       m,
     );
   if (!infoOpener) return false;
+
+  const exampleLikeQuestion =
+    /\b(?:csv|example|examples|sample|template|format)\b/i.test(m) &&
+    /\b(?:split|batch|schedule|invoice|payment request|request|payment link|qr|contacts?|\.arc|bridge|vault|swap|portfolio|telegram|research)\b/i.test(
+      m,
+    );
 
   // Possessive / live-state queries are not product FAQs — route them normally.
   if (/\b(?:my|mine|our)\b/i.test(m)) return false;
@@ -4533,6 +4539,8 @@ function isPayloadFreeProductQuestion(message: string): boolean {
   if (/\b[a-z0-9_.-]+\.arc\b/i.test(m)) return false;
   if (/0x[a-fA-F0-9]{6,}/.test(m)) return false;
   if (/@[a-z0-9_]+/i.test(m)) return false;
+
+  if (exampleLikeQuestion) return true;
 
   return true;
 }
@@ -10337,6 +10345,119 @@ function createPublicApp(): express.Express {
       return;
     }
 
+    if (
+      walletAddress &&
+      shouldHandleAsBatchPayment(message) &&
+      !shouldHandleAsSplitRequest(message)
+    ) {
+      const parsedBatch = parseBatchMessage(message);
+      if ('error' in parsedBatch) {
+        const responseText =
+          `I see you want to run a batch payment, but I could not parse the recipients.\n` +
+          formatBatchParseError(parsedBatch.error);
+        await appendBrainConversationTurn(memorySessionId, message, responseText);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'deterministic_batch_agent',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('deterministic_batch_agent'),
+          final_response_summary: responseText,
+          outcome: 'validation_error',
+          failure_reason: responseText,
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        streamStaticSseReply(res, responseText, { eventId: brainEventId });
+        return;
+      }
+
+      const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim() || '';
+      try {
+        const batchAgentRes = await fetch(`${BATCH_AGENT_BASE_URL}/run`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(internalKey ? { 'X-Agentflow-Brain-Internal': internalKey } : {}),
+          },
+          body: JSON.stringify({
+            sessionId: actionSessionId,
+            walletAddress,
+            payments: parsedBatch,
+          }),
+        });
+
+        const batchData = (await batchAgentRes.json().catch(() => ({
+          action: 'error',
+          message: 'Batch agent error',
+        }))) as {
+          action?: string;
+          message?: string;
+          confirmId?: string;
+          confirmLabel?: string;
+        };
+
+        const responseText =
+          typeof batchData.message === 'string' ? batchData.message : 'Batch agent error';
+        await appendBrainConversationTurn(memorySessionId, message, responseText);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'deterministic_batch_agent',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('deterministic_batch_agent'),
+          final_response_summary: responseText,
+          outcome: batchData.action === 'error' ? 'tool_error' : 'success',
+          failure_reason: batchData.action === 'error' ? responseText : undefined,
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ meta: { eventId: brainEventId } })}\n\n`);
+        if (batchData.action === 'preview' && batchData.confirmId) {
+          res.write(
+            `data: ${JSON.stringify({
+              meta: {
+                confirmation: {
+                  required: true,
+                  action: 'batch',
+                  confirmId: batchData.confirmId,
+                  confirmLabel: batchData.confirmLabel || 'Send batch',
+                },
+              },
+            })}\n\n`,
+          );
+        }
+        res.write(`data: ${JSON.stringify({ delta: responseText })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      } catch (batchErr) {
+        const msg = batchErr instanceof Error ? batchErr.message : String(batchErr);
+        const responseText = `Batch agent unavailable: ${msg}`;
+        await appendBrainConversationTurn(memorySessionId, message, responseText);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'deterministic_batch_agent',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('deterministic_batch_agent'),
+          final_response_summary: responseText,
+          outcome: 'tool_error',
+          failure_reason: responseText,
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        brainTelemetryFinalized = true;
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        streamStaticSseReply(res, responseText, { eventId: brainEventId });
+        return;
+      }
+    }
+
     const externalPersonUnknownReply = buildExternalPersonUnknownReply(capabilityProbe);
     if (externalPersonUnknownReply) {
       await appendBrainConversationTurn(memorySessionId, message, externalPersonUnknownReply);
@@ -11528,6 +11649,20 @@ function createPublicApp(): express.Express {
         if (!INTENT_ROUTER_ENABLED) {
           return false;
         }
+        if (
+          walletCtx.walletAddress &&
+          shouldHandleAsBatchPayment(message) &&
+          !shouldHandleAsSplitRequest(message)
+        ) {
+          return false;
+        }
+        if (
+          walletCtx.walletAddress &&
+          shouldHandleAsSplitRequest(message) &&
+          !shouldHandleAsBatchPayment(message)
+        ) {
+          return false;
+        }
 
         const tier2StartedAt = Date.now();
         try {
@@ -11557,6 +11692,18 @@ function createPublicApp(): express.Express {
               (validation.intent.intent === AgentFlowIntentName.PredmarketBuy ||
                 validation.intent.intent === AgentFlowIntentName.PredmarketSell) &&
               parseDirectAgentFlowRoute(message, messages)
+            ) {
+              return false;
+            }
+            if (
+              validation.intent.intent === AgentFlowIntentName.SplitExecute &&
+              shouldHandleAsBatchPayment(message)
+            ) {
+              return false;
+            }
+            if (
+              validation.intent.intent === AgentFlowIntentName.BatchExecute &&
+              shouldHandleAsSplitRequest(message)
             ) {
               return false;
             }
@@ -12758,9 +12905,10 @@ function createPublicApp(): express.Express {
 
       // Batch/payroll payment intents — dedicated agent on port 3020. Text-only fast-path.
       if (
-        canUseFastPathForIntents(AgentFlowIntentName.BatchExecute) &&
-        shouldHandleAsBatchPayment(message) &&
-        walletCtx.walletAddress
+        walletCtx.walletAddress &&
+        (routerResolvedIntent?.intent === AgentFlowIntentName.BatchExecute ||
+          shouldHandleAsBatchPayment(message)) &&
+        routerResolvedIntent?.intent !== AgentFlowIntentName.SplitExecute
       ) {
         const parsedBatch =
           extractBatchPaymentsFromIntent(routerResolvedIntent, message) ?? parseBatchMessage(message);
@@ -12844,9 +12992,10 @@ function createPublicApp(): express.Express {
       // Split-payment intents are handled by the dedicated split agent on port 3019.
       // Bypass Hermes entirely to prevent hallucinated previews / fake tx hashes.
       if (
-        canUseFastPathForIntents(AgentFlowIntentName.SplitExecute) &&
-        shouldHandleAsSplitRequest(message) &&
-        walletCtx.walletAddress
+        walletCtx.walletAddress &&
+        (routerResolvedIntent?.intent === AgentFlowIntentName.SplitExecute ||
+          shouldHandleAsSplitRequest(message)) &&
+        routerResolvedIntent?.intent !== AgentFlowIntentName.BatchExecute
       ) {
         const parsed =
           extractSplitRequestFromIntent(routerResolvedIntent, message) ?? parseSplitRequest(message);
