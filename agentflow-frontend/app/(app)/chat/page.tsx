@@ -2868,6 +2868,27 @@ function ChatPageInner() {
     return { address, walletClient, authHeaders };
   };
 
+  const resolveAttachmentSessionContext = async () => {
+    if (!address) {
+      openConnectModal?.();
+      throw new Error("Connect your wallet before attaching files.");
+    }
+
+    let authHeaders = getAuthHeaders();
+    if (!isAuthenticated || !authHeaders) {
+      await signIn();
+      authHeaders = authHeadersForWallet(address);
+    }
+
+    if (!authHeaders) {
+      throw new Error(
+        "The wallet signature completed, but the secure session did not attach correctly. Try again once.",
+      );
+    }
+
+    return { authHeaders };
+  };
+
   const requirePaidAgentContext = async (
     assistantId: string,
     options: { executionTarget: ExecutionTarget },
@@ -2986,7 +3007,7 @@ function ChatPageInner() {
   };
 
   const handleSelectAttachment = async (file: File) => {
-    const { authHeaders } = await resolvePaidClientContext();
+    const { authHeaders } = await resolveAttachmentSessionContext();
     const form = new FormData();
     form.append("file", file, file.name);
 
