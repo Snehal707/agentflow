@@ -311,6 +311,49 @@ function buildSportsPredictionMarketQueries(task: string, cleanedTask: string): 
   return queries.slice(0, 8);
 }
 
+/**
+ * Understand what a prediction market is actually about before searching, instead of
+ * searching the raw "Will X reach $Y by <date>?" wording (which retrieves little and then
+ * falls back to unrelated news). Extracts the subject and the question type and builds a
+ * few focused queries. Sports markets keep their dedicated builder.
+ */
+function buildPredictionMarketSubjectQueries(task: string, cleanedTask: string): string[] {
+  if (!/\bprediction market\b/i.test(task)) return [];
+  if (isSportsPredictionMarketTask(task) || isSportsPredictionMarketTask(cleanedTask)) return [];
+
+  // Strip the forecasting scaffolding to isolate the subject.
+  const subject = (cleanedTask || task)
+    .replace(/^\s*will\s+/i, '')
+    .replace(/\b(?:by|before|after|on|until|reach(?:es)?|hit|cross|exceed|surpass)\b[\s\S]*$/i, ' ')
+    .replace(/\$[\d,]+(?:\.\d+)?[kmbt]?/gi, ' ')
+    .replace(/\b20\d{2}\b/g, ' ')
+    .replace(/[?".,:;()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!subject || subject.length < 2) return [];
+
+  const haystack = `${task} ${cleanedTask}`.toLowerCase();
+  const targetYear = (task.match(/\b(20\d{2})\b/) || [])[1];
+  const queries: string[] = [];
+
+  if (/\breach|hit|price|\$|usd|market cap|all[- ]time high|ath\b/i.test(haystack)) {
+    addUniqueQuery(queries, `${subject} price prediction forecast`);
+    addUniqueQuery(queries, `${subject} price analysis ${targetYear ?? ''}`.trim());
+    addUniqueQuery(queries, `${subject} latest news`);
+  } else if (/\blaunch|release|ship|come out|drop|debut|available\b/i.test(haystack)) {
+    addUniqueQuery(queries, `${subject} release date news`);
+    addUniqueQuery(queries, `${subject} launch delay latest`);
+    addUniqueQuery(queries, `${subject} official announcement`);
+  } else {
+    addUniqueQuery(queries, `${subject} latest news`);
+    addUniqueQuery(queries, `${subject} forecast ${targetYear ?? ''}`.trim());
+    addUniqueQuery(queries, `${subject} analysis prediction`);
+  }
+
+  return queries.slice(0, 5);
+}
+
 function filterCreatorAudienceEvidence(
   snapshots: FirecrawlArticleSnapshot[],
 ): FirecrawlArticleSnapshot[] {
@@ -470,6 +513,9 @@ function buildResearchQueryVariants(task: string): string[] {
     return sportsPredictionQueries;
   }
   const queries: string[] = [];
+  for (const subjectQuery of buildPredictionMarketSubjectQueries(task, cleanedTask)) {
+    addUniqueQuery(queries, subjectQuery);
+  }
   const splitQueries = splitExpandedTaskQueries(cleanedTask);
 
   for (const variant of splitQueries) {
@@ -694,6 +740,12 @@ export function buildPrimaryFirecrawlQueryVariants(task: string): string[] {
   const baseQueries = splitQueries.length > 0 ? splitQueries : [cleanedTask];
   const queries: string[] = [];
 
+  // Lead with subject-scoped queries for non-sports prediction markets so retrieval is
+  // about the market's actual subject, not the literal "Will X by <date>?" phrasing.
+  for (const subjectQuery of buildPredictionMarketSubjectQueries(task, cleanedTask)) {
+    addUniqueQuery(queries, subjectQuery);
+  }
+
   for (const query of baseQueries) {
     const stripped = stripFirecrawlResearchScaffolding(query);
     const expanded = expandFirecrawlCryptoSymbols(stripped || query);
@@ -781,8 +833,20 @@ function sanitizePredictionMarketCurrentEvents(
     !trimLowValueSocial ||
     (!isLowValueSocialSourceUrl(url) && !isLowValueVideoUrl(url));
 
+  // Geopolitical framing signals (conflict/Hormuz/Red Sea route status) are derived
+  // topic-agnostically from whatever current-events articles came back. For a
+  // non-geopolitical market (sports, games, crypto price, etc.) those signals are
+  // contamination — they make the report pipeline inject shipping/conflict claims that
+  // have nothing to do with the market. Only keep framing when the market itself is
+  // genuinely geopolitical.
+  const keepFramingSignals = detectResearchDomain(task) === 'geopolitics';
+  const { framing_signals: _droppedFramingSignals, ...restCurrentEvents } = currentEvents;
+
   return {
-    ...currentEvents,
+    ...restCurrentEvents,
+    ...(keepFramingSignals && currentEvents.framing_signals
+      ? { framing_signals: currentEvents.framing_signals }
+      : {}),
     articles: filteredArticles.filter((article) => socialFilter(article.url)),
     article_snapshots: filteredSnapshots.filter((article) => socialFilter(article.url)),
   };
@@ -3220,6 +3284,17 @@ async function fetchHackerNewsRSS(
   }
 }
 
+const GEOPOLITICAL_ARTICLE_PATTERN =
+  /\b(?:war|conflict|ceasefire|missile|airstrike|air\s?strike|drone\s+strike|troops?|sanctions?|blockade|strait\s+of\s+hormuz|hormuz|red\s+sea|suez|houthi|tankers?|warship|naval|israel|hamas|hezbollah|gaza|iran|iranian|ukraine|russia|taiwan|yemen|lebanon|syria)\b/i;
+
+function articleLooksGeopolitical(
+  title: string | undefined,
+  summary: string | undefined,
+  publisher: string | undefined,
+): boolean {
+  return GEOPOLITICAL_ARTICLE_PATTERN.test(`${title ?? ''} ${summary ?? ''} ${publisher ?? ''}`);
+}
+
 async function fetchCurrentEventsData(
   task: string,
   options?: { bypassCache?: boolean },
@@ -3241,7 +3316,7 @@ async function fetchCurrentEventsData(
   const groups = [...gdeltGroups, ...rssGroups];
   const statusGroups = [...statusGdeltGroups, ...statusRssGroups];
 
-  const relevantFirecrawlSearchSnapshots = firecrawlSearchSnapshots.filter((snapshot) =>
+  let relevantFirecrawlSearchSnapshots = firecrawlSearchSnapshots.filter((snapshot) =>
     isStronglyRelevantCurrentEventArticle(snapshotToCurrentEventArticle(snapshot), task),
   );
   let merged = mergeCurrentEventArticles(groups).filter((article) =>
@@ -3249,6 +3324,19 @@ async function fetchCurrentEventsData(
   );
   if (merged.length === 0 && relevantFirecrawlSearchSnapshots.length > 0) {
     merged = relevantFirecrawlSearchSnapshots.map(snapshotToCurrentEventArticle);
+  }
+
+  // When the research topic is not itself geopolitical, drop conflict/shipping articles.
+  // Thin retrieval (e.g. a sports or games prediction market) otherwise falls back to the
+  // dominant live geopolitical news, which then contaminates the report with off-topic
+  // shipping sources and framing. Stay thin rather than surface unrelated news.
+  if (detectResearchDomain(task) !== 'geopolitics') {
+    relevantFirecrawlSearchSnapshots = relevantFirecrawlSearchSnapshots.filter(
+      (snapshot) => !articleLooksGeopolitical(snapshot.title, snapshot.summary, snapshot.publisher),
+    );
+    merged = merged.filter(
+      (article) => !articleLooksGeopolitical(article.title, undefined, article.publisher),
+    );
   }
 
   if (merged.length === 0) {
@@ -3733,8 +3821,11 @@ export async function fetchLiveData(task: string): Promise<string> {
   const snapshotAt = new Date().toISOString();
   const researchDomain = detectResearchDomain(sourceTask);
   const shouldFetchCurrentEvents = shouldGatherCurrentEvents(sourceTask);
+  // Prediction-market research needs Firecrawl/SearXNG evidence even when current events
+  // are gathered, otherwise a price market collapses to a single CoinGecko snapshot.
+  const isPredictionMarketTask = /\bprediction market\b/i.test(task);
   const shouldAlsoFetchFirecrawl =
-    shouldFetchCurrentEvents && isCreatorAudienceMetricTask(sourceTask);
+    shouldFetchCurrentEvents && (isCreatorAudienceMetricTask(sourceTask) || isPredictionMarketTask);
   const firecrawlQueryVariants = buildPrimaryFirecrawlQueryVariants(task);
   const payload: Record<string, unknown> = {
     snapshot_at: snapshotAt,
@@ -3744,7 +3835,7 @@ export async function fetchLiveData(task: string): Promise<string> {
   if (researchDomain === 'crypto') {
     const [firecrawlEvidence, coingecko, bitcoinOnchain, defillama, wikipedia, currentEvents] =
       await Promise.allSettled([
-        shouldFetchCurrentEvents
+        shouldFetchCurrentEvents && !isPredictionMarketTask
           ? Promise.resolve([] as FirecrawlArticleSnapshot[])
           : fetchFirecrawlSearchSnapshots(firecrawlQueryVariants, sourceTask, {
               bypassCache: bypassCurrentEventCache,

@@ -4,6 +4,7 @@ import {
   isLowValueSourceForTask,
   isLowValueSocialSourceUrl,
   isOfficialCreatorPlatformUrl,
+  isPredictionMarketResearchTask,
   sourceHostname,
   sourcePriority,
 } from './source-policy';
@@ -689,6 +690,18 @@ function framingSignals(liveData: Obj | null): FramingSignals | null {
   return (asObject(currentEvents(liveData)?.framing_signals) as FramingSignals | null) || null;
 }
 
+/**
+ * Conflict / Hormuz / Red Sea framing signals are derived topic-agnostically upstream.
+ * Only let them become report claims when the report's own topic is geopolitical or
+ * shipping-related; otherwise they contaminate unrelated reports (e.g. a FIFA or crypto
+ * prediction market turning into a Strait-of-Hormuz shipping report).
+ */
+function isGeopoliticalShippingReportTask(task: string): boolean {
+  return /\b(?:war|conflict|ceasefire|military|troops?|missile|airstrike|air\s?strike|sanction|blockade|geopolitic|hormuz|strait|red\s+sea|suez|shipping|tankers?|vessels?|maritime|chokepoint|houthi|iran|israel|gaza|hamas|hezbollah|yemen|lebanon|syria|ukraine|russia|taiwan|middle\s+east)\b/i.test(
+    task,
+  );
+}
+
 function routeFromText(text: string): 'hormuz' | 'red_sea' | 'suez' | undefined {
   if (/\bhormuz|strait of hormuz\b/i.test(text)) return 'hormuz';
   if (/\bred sea\b/i.test(text)) return 'red_sea';
@@ -933,7 +946,9 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
     params.task,
     primaryTopicLabel,
   );
-  const framing = framingSignals(params.liveData);
+  const framing = isGeopoliticalShippingReportTask(params.task)
+    ? framingSignals(params.liveData)
+    : null;
   const support = asArray<{
     title?: string;
     source_name?: string;
@@ -1919,6 +1934,46 @@ function buildFallbackSourcesFromLiveData(
   }));
 }
 
+function mergeNormalizedSources(
+  primary: NormalizedReportSource[],
+  supplemental: NormalizedReportSource[],
+  maxItems = 8,
+): NormalizedReportSource[] {
+  const merged = new Map<string, NormalizedReportSource>();
+  for (const source of [...primary, ...supplemental]) {
+    const key = normalizeUrl(source.url) || source.name.toLowerCase();
+    if (!key) continue;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, source);
+      continue;
+    }
+    if (
+      sourcePriority(source.url, source.name) > sourcePriority(existing.url, existing.name)
+    ) {
+      merged.set(key, {
+        ...source,
+        usedFor: source.usedFor ?? existing.usedFor,
+        publishedAt: source.publishedAt ?? existing.publishedAt,
+        accessedAt: source.accessedAt ?? existing.accessedAt,
+      });
+      continue;
+    }
+    merged.set(key, {
+      ...existing,
+      usedFor: existing.usedFor ?? source.usedFor,
+      publishedAt: existing.publishedAt ?? source.publishedAt,
+      accessedAt: existing.accessedAt ?? source.accessedAt,
+    });
+  }
+  return [...merged.values()]
+    .sort(
+      (left, right) =>
+        sourcePriority(right.url, right.name) - sourcePriority(left.url, left.name),
+    )
+    .slice(0, maxItems);
+}
+
 function isSourcesHeadingLine(line: string): boolean {
   if (/^(?:[-*\u2022]\s+)?(?:#{1,6}\s+)?\*\*Sources:?\*\*:?\s*$/i.test(line.trim())) {
     return true;
@@ -1946,8 +2001,11 @@ function replaceSourcesSection(markdown: string, renderedSources: string): strin
     return `${markdown.trim()}\n\n## Sources\n\n${renderedSources}`.trim();
   }
 
+  // Strip EVERY existing Sources section (heading + its body up to the next report
+  // section heading), then append exactly one canonical Sources block at the end. The
+  // previous insert-at-first/skip-rest approach could leave a second Sources section in
+  // place when the writer emitted more than one, producing duplicate "Sources" sections.
   const rebuilt: string[] = [];
-  let insertedSources = false;
 
   for (let index = 0; index < lines.length;) {
     if (!isSourcesHeadingLine(lines[index])) {
@@ -1956,18 +2014,14 @@ function replaceSourcesSection(markdown: string, renderedSources: string): strin
       continue;
     }
 
-    if (!insertedSources) {
-      rebuilt.push('## Sources', '', ...renderedSources.split('\n'));
-      insertedSources = true;
-    }
-
     index += 1;
     while (index < lines.length && !isReportSectionHeadingLine(lines[index])) {
       index += 1;
     }
   }
 
-  return rebuilt.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  const body = rebuilt.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return `${body}\n\n## Sources\n\n${renderedSources}`.trim();
 }
 
 function sanitizeWriterMarkdown(markdown: string): string {
@@ -2289,10 +2343,16 @@ export function finalizeReportMarkdown(params: FinalizeParams): {
   const markdown = shouldUseFallback ? fallbackMarkdown : writerMarkdown;
   const repairedMarkdown = hasMojibakeMarkers(markdown) ? repairMojibake(markdown) : markdown;
   const primaryTopicLabel = inferPrimaryTopicLabel(state.topic, params.research);
-  const effectiveSources =
-    state.sources.length > 0
+  const fallbackSources = buildFallbackSourcesFromLiveData(
+    params.liveData,
+    params.task,
+    primaryTopicLabel,
+  );
+  const effectiveSources = isPredictionMarketResearchTask(params.task)
+    ? mergeNormalizedSources(state.sources, fallbackSources)
+    : state.sources.length > 0
       ? state.sources
-      : buildFallbackSourcesFromLiveData(params.liveData, params.task, primaryTopicLabel);
+      : fallbackSources;
   const renderedSources = buildSourcesSection(
     effectiveSources,
     primaryTopicLabel,

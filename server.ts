@@ -1539,6 +1539,9 @@ function maybeLogInputFilterDebug(message: string): void {
 
 function maybeLowConfidenceClarify(message: string): string | null {
   const normalized = message.trim();
+  if (isExplicitResearchRequest(normalized)) {
+    return null;
+  }
   if (!/\b(?:swap|trade|exchange|convert)\b/i.test(normalized)) {
     if (
       /\bwithdraw\b/i.test(normalized) &&
@@ -1563,6 +1566,9 @@ function maybeLowConfidenceClarify(message: string): string | null {
 
 function buildLowConfidenceClarifyRoute(message: string): DirectAgentFlowRoute | null {
   const normalized = message.trim();
+  if (isExplicitResearchRequest(normalized)) {
+    return null;
+  }
 
   if (/\b(?:swap|trade|exchange|convert)\b/i.test(normalized)) {
     const hasGenericHelpCue =
@@ -5514,7 +5520,7 @@ function buildPredmarketResearchPrompt(
     outcomeLabels.length
       ? `Listed outcomes in AgentFlow: ${outcomeLabels.join(' / ')}.`
       : null,
-    marketAddress ? `Market address for AgentFlow trade routing only: ${marketAddress}.` : null,
+    marketAddress ? `AgentFlow market address reference: ${marketAddress}.` : null,
     'Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.',
   ]
     .filter(Boolean)
@@ -5851,11 +5857,20 @@ async function buildPredmarketResearchQuickActionGroupsFromContext(
     context.marketAddress ?? (await resolvePredmarketAddressFromTitle(context.titleHint));
   const tradeTitle = context.titleHint ? `Trade ${context.titleHint}` : 'Trade this market';
   if (!resolvedMarketAddress) {
+    // Address could not be resolved from the title. Still give the user a path to betting
+    // by searching for the specific market, instead of only a generic "Show all" button.
     return [
       {
         title: tradeTitle,
         actions: [
-          { label: 'Show prediction markets', prompt: 'show prediction markets' },
+          ...(context.titleHint
+            ? [{ label: 'Find this market to trade', prompt: `show prediction markets ${context.titleHint}` }]
+            : []),
+          {
+            label: 'Show prediction markets',
+            prompt: 'show prediction markets',
+            tone: context.titleHint ? ('secondary' as const) : undefined,
+          },
         ],
       },
     ];
@@ -11702,10 +11717,13 @@ function createPublicApp(): express.Express {
         if (!validation) {
           return false;
         }
+        const shouldForcePredmarketResearchExecution =
+          validation.intent.intent === AgentFlowIntentName.ResearchReport &&
+          Boolean(extractPredmarketResearchContext(message));
         const threshold = getFastpathExecutionConfidenceThreshold(validation.intent.intent);
         return (
           validation.severity === 'pass' &&
-          validation.intent.confidence >= threshold &&
+          (shouldForcePredmarketResearchExecution || validation.intent.confidence >= threshold) &&
           STRICT_ROUTER_APPROVAL_INTENTS.has(validation.intent.intent)
         );
       };
