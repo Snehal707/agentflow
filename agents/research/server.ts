@@ -6,6 +6,11 @@ import path from 'node:path';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { callHermesFast } from '../../lib/hermes';
+import {
+  understandMarketResearch,
+  understandingToExpandedTask,
+  understandingToSubjectFraming,
+} from '../../lib/market-understanding';
 import { RESEARCH_SYSTEM_PROMPT } from '../../lib/agentPrompts';
 import {
   detectForecastingIntent,
@@ -458,7 +463,25 @@ const runHandler = async (req: express.Request, res: express.Response) => {
         });
       }
     }
-    const expandedTask = expandQuery(task);
+    let expandedTask = expandQuery(task);
+    // For prediction markets, understand the real-world subject first (LLM) so retrieval
+    // targets the actual thing — gold for XAUT, the game for GTA 6, the tournament for a
+    // World Cup market — instead of the literal "prediction market" wording. Falls back to
+    // the deterministic expansion above if understanding fails.
+    let subjectFraming = '';
+    if (/\bprediction market\b/i.test(task)) {
+      const understanding = await understandMarketResearch(task).catch(() => null);
+      if (understanding) {
+        const understoodExpansion = understandingToExpandedTask(understanding);
+        if (understoodExpansion) {
+          expandedTask = understoodExpansion;
+          subjectFraming = understandingToSubjectFraming(understanding);
+          console.log(
+            `[Research ${requestId}] market understanding subject="${understanding.subject}" underlying="${understanding.underlying ?? ''}" type=${understanding.questionType}`,
+          );
+        }
+      }
+    }
     const reasoningMode = inferResearchReasoningMode({
       task,
       explicitMode: req.body?.reasoningMode ?? req.query.reasoningMode,
@@ -622,7 +645,7 @@ const runHandler = async (req: express.Request, res: express.Response) => {
       : '';
     pushTimingTrace(timingTrace, traceStart, 'before_user_message_construction');
     const userMessage = liveData
-      ? `AS OF ${asOf}\nCURRENT DATE: ${asOf.slice(0, 10)}\n\nLIVE DATA JSON:\n${liveData}${contextBlock}${walletContextBlock}\n\nUSER TASK:\n${task}\n\nSEARCH QUERY VARIANTS:\n${expandedTask}\n\nUse the LIVE DATA JSON above for current figures and dated evidence. Do not cite or mention any date after CURRENT DATE as if it has happened. When present, cite concrete titles and URLs from current_events.articles, current_events.article_snapshots, dynamic_sources.articles, wikipedia.pages, coingecko, defillama, and bitcoin_onchain; do not invent outlets. Retrieval layers are not evidence and must not be cited as sources.${geopoliticalEvidenceInstruction} When creator_audience_metrics is present, treat current_subscribers/current_subscribers_display and observed_at as direct evidence for the latest available audience count and mention that figure explicitly in the answer. When bitcoin_onchain is present, treat it as primary evidence for Bitcoin network transaction counts, block counts, fees, and on-chain activity windows; do not substitute market trading volume for on-chain transaction volume. When PORTFOLIO_CONTEXT is present, classify the user's exposure and explain impact through that exposure profile without revealing raw balances, full addresses, or PnL unless explicitly requested. Prefer official APIs, reputable publishers, Mempool.space for Bitcoin block/on-chain metrics, CoinGecko for token market data, DefiLlama for chain TVL and stablecoin liquidity, current-event article snapshots for recent developments, and Wikipedia for factual background. Use the SEARCH QUERY VARIANTS as additional source-planning angles when the topic is broad or ecosystem-focused.`
+      ? `AS OF ${asOf}\nCURRENT DATE: ${asOf.slice(0, 10)}\n\nLIVE DATA JSON:\n${liveData}${contextBlock}${walletContextBlock}\n\n${subjectFraming ? `${subjectFraming}\n\n` : ''}USER TASK:\n${task}\n\nSEARCH QUERY VARIANTS:\n${expandedTask}\n\nUse the LIVE DATA JSON above for current figures and dated evidence. Do not cite or mention any date after CURRENT DATE as if it has happened. When present, cite concrete titles and URLs from current_events.articles, current_events.article_snapshots, dynamic_sources.articles, wikipedia.pages, coingecko, defillama, and bitcoin_onchain; do not invent outlets. Retrieval layers are not evidence and must not be cited as sources.${geopoliticalEvidenceInstruction} When creator_audience_metrics is present, treat current_subscribers/current_subscribers_display and observed_at as direct evidence for the latest available audience count and mention that figure explicitly in the answer. When bitcoin_onchain is present, treat it as primary evidence for Bitcoin network transaction counts, block counts, fees, and on-chain activity windows; do not substitute market trading volume for on-chain transaction volume. When PORTFOLIO_CONTEXT is present, classify the user's exposure and explain impact through that exposure profile without revealing raw balances, full addresses, or PnL unless explicitly requested. Prefer official APIs, reputable publishers, Mempool.space for Bitcoin block/on-chain metrics, CoinGecko for token market data, DefiLlama for chain TVL and stablecoin liquidity, current-event article snapshots for recent developments, and Wikipedia for factual background. Use the SEARCH QUERY VARIANTS as additional source-planning angles when the topic is broad or ecosystem-focused.`
       : `${task}${contextBlock}${walletContextBlock}`;
     pushTimingTrace(timingTrace, traceStart, 'after_user_message_construction', {
       userMessageChars: userMessage.length,

@@ -104,17 +104,37 @@ export function isLowValueSourceForTask(task: string, source: SourceLike): boole
       return true;
     }
   }
+  // For a price-target prediction market ("will X reach $Y by <date>"), forecast and
+  // price-prediction analysis from reputable platforms IS the evidence a bettor needs —
+  // do not blanket-drop it (that previously left only CoinGecko). Still drop forecast
+  // spam from low-quality domains.
+  const isPriceTargetMarket =
+    isPredictionMarketResearchTask(task) && /\b(price|market cap|valuation|target|reach|hit)\b/i.test(task);
+  const mentionsForecast = /\b(?:kaufen|kurs|price prediction|predictions?|forecast|outlook)\b/i.test(haystack);
   if (
     isPredictionMarketResearchTask(task) &&
     /\b(price|market cap|valuation|target)\b/i.test(task) &&
-    /\b(price prediction|forecast|predictions?|outlook)\b/i.test(haystack)
+    /\b(price prediction|forecast|predictions?|outlook)\b/i.test(haystack) &&
+    !isReputableForecastSource(domain)
   ) {
     return true;
   }
   if (/\bbitcoin\.de\b|\bbisonapp\.com\b/i.test(domain)) return true;
-  if (/\b(?:kaufen|kurs|price prediction|predictions?|forecast|outlook)\b/i.test(haystack)) return true;
+  if (mentionsForecast) {
+    if (isPriceTargetMarket && isReputableForecastSource(domain)) {
+      return false;
+    }
+    return true;
+  }
 
   return false;
+}
+
+const REPUTABLE_FORECAST_DOMAINS =
+  /\b(?:coinbase|kraken|binance|kucoin|crypto\.com|gemini|bitstamp|okx|bybit|coindesk|cointelegraph|theblock|decrypt|messari|coinmarketcap|coingecko|tradersunion|changelly|weareblox|forbes|bloomberg|reuters|cnbc|wsj|ft\.com|financialtimes|investing\.com|nasdaq|marketwatch|benzinga|yahoo)\b/i;
+
+function isReputableForecastSource(domain: string): boolean {
+  return REPUTABLE_FORECAST_DOMAINS.test(domain);
 }
 
 export function sourcePriority(url: string, name?: string): number {

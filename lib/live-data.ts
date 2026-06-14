@@ -334,12 +334,20 @@ function buildPredictionMarketSubjectQueries(task: string, cleanedTask: string):
   if (!subject || subject.length < 2) return [];
 
   const haystack = `${task} ${cleanedTask}`.toLowerCase();
-  const targetYear = (task.match(/\b(20\d{2})\b/) || [])[1];
+  const targetYear = (task.match(/\b(20\d{2})\b/) || [])[1] ?? String(new Date().getUTCFullYear());
   const queries: string[] = [];
 
   if (/\breach|hit|price|\$|usd|market cap|all[- ]time high|ath\b/i.test(haystack)) {
-    addUniqueQuery(queries, `${subject} price prediction forecast`);
-    addUniqueQuery(queries, `${subject} price analysis ${targetYear ?? ''}`.trim());
+    // Lead with the ticker + year ("XAUT price prediction 2026"): self-hosted search
+    // returns far better asset-specific results for that phrasing than the full name
+    // (e.g. "Tether Gold XAUT ..." collapses into generic Tether/USDT results).
+    const ticker = (task.match(/\(([A-Z]{2,6})\)/) || [])[1];
+    if (ticker) {
+      addUniqueQuery(queries, `${ticker} price prediction ${targetYear}`);
+      addUniqueQuery(queries, `${ticker} price forecast`);
+    }
+    addUniqueQuery(queries, `${subject} price prediction ${targetYear}`);
+    addUniqueQuery(queries, `${subject} price forecast`);
     addUniqueQuery(queries, `${subject} latest news`);
   } else if (/\blaunch|release|ship|come out|drop|debut|available\b/i.test(haystack)) {
     addUniqueQuery(queries, `${subject} release date news`);
@@ -645,6 +653,17 @@ export function detectForecastingIntent(task: string): ForecastingIntent {
     /\bforecast\b/.test(lower) ||
     /\bprojection\b/.test(lower)
   ) {
+    return { forecasting: true };
+  }
+
+  // Price-target / dated questions are forecasts even without an explicit year, e.g.
+  // "will X reach $4,750 by July 31st" or "hit $100k". The previous logic only matched
+  // "by <year>", so these were treated as plain news and restricted to last-week results.
+  const priceTarget = /\b(reach|hit|exceed|surpass|cross|climb to|rise to|fall to|drop to|top)\b[^.]*\$?\d/.test(lower);
+  const datedDeadline =
+    /\bby\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/.test(lower) ||
+    /\b(?:before|after)\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/.test(lower);
+  if (priceTarget || datedDeadline) {
     return { forecasting: true };
   }
 
@@ -1907,6 +1926,9 @@ function hasRequiredFirecrawlTopicAnchor(
   const haystack = `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase();
   const anchors: RegExp[] = [];
 
+  // Tether Gold (XAUT) must not collapse into generic "Tether" (USDT) results — require a
+  // gold-specific anchor so the topic-relevant forecast pages survive ranking.
+  if (/\bxaut\b|\btether[- ]gold\b/i.test(task)) anchors.push(/\bxaut\b|\btether[- ]gold\b|\bgold\b/i);
   if (/\bbitcoin\b|\bbtc\b/i.test(task)) anchors.push(/\bbitcoin\b|\bbtc\b/i);
   if (/\bethereum\b|\beth\b/i.test(task)) anchors.push(/\bethereum\b|\beth\b/i);
   if (/\bsolana\b|\bsol\b/i.test(task)) anchors.push(/\bsolana\b|\bsol\b/i);
@@ -2226,7 +2248,8 @@ async function fetchFirecrawlSearchSnapshots(
       );
 
       searchFirecrawlNews(query, 6, {
-        recency: forecastingIntent.forecasting ? 'all' : 'week',
+        recency:
+          forecastingIntent.forecasting || /\bprediction market\b/i.test(task) ? 'all' : 'week',
       })
         .then((results) => {
           clearTimeout(timer);
