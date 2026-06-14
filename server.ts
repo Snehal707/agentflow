@@ -5578,6 +5578,7 @@ function extractPredmarketResearchContext(
     .replace(/^research\s+the\s+(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
     .replace(/\bListed outcomes in AgentFlow:[^\n]*/gi, '')
     .replace(/\bMarket address for AgentFlow trade routing only:[^\n]*/gi, '')
+    .replace(/\bAgentFlow market address reference:[^\n]*/gi, '')
     .replace(/\bDo not research the contract address itself[^\n]*/gi, '')
     .replace(/\bFocus on the real-world event[^\n]*/gi, '')
     .replace(/\(\s*0x[a-fA-F0-9]{40}\s*\)/g, '')
@@ -6190,6 +6191,18 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
       ? extractPredmarketResearchContext(originalUserMessage)
       : null);
 
+  // The intent router's extracted task slot is lossy for prediction markets — it can
+  // collapse "Will GTA 6 launch before Nov 30" into "prediction market research" or
+  // "prediction_market_analysis", which then gets researched as the wrong subject. When
+  // we still have the full original market prompt (question + listed outcomes), research
+  // THAT so the subject-understanding layer in the research agent sees the real question.
+  const effectiveResearchTask =
+    originalUserMessage &&
+    originalUserMessage !== researchTask &&
+    /\bprediction market\b/i.test(originalUserMessage)
+      ? originalUserMessage
+      : researchTask;
+
   const syncToken = `sync:${randomUUID()}`;
   let slotHeld = false;
   let keepAliveTimer: NodeJS.Timeout | null = null;
@@ -6219,7 +6232,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
 
   try {
     const reasoningMode = inferResearchReasoningMode({
-      task: researchTask,
+      task: effectiveResearchTask,
       explicitMode: requestedReasoningMode,
       defaultMode: 'fast',
     });
@@ -6229,7 +6242,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
       const { jobId, position } = await enqueueResearch({
         sessionId: memorySessionId,
         walletAddress,
-        query: researchTask,
+        query: effectiveResearchTask,
         mode: 'fast',
         reasoningMode,
       });
@@ -6292,7 +6305,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        task: researchTask,
+        task: effectiveResearchTask,
         userAddress: walletAddress,
         portfolioImpact,
         reasoningMode,
@@ -6511,7 +6524,9 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
         liveData: reportPayload?.liveData ?? null,
       })}\n\n`,
     );
-    res.write(`data: ${JSON.stringify({ delta: finalText })}\n\n`);
+    // Note: do NOT also emit the report as a `delta`. The frontend appends both the
+    // `report` event markdown AND delta text to the same message, so sending both
+    // rendered the entire report twice. The `report` event above is the single source.
     if (brainEventId) {
       await updateBrainEvent(brainEventId, {
         intent_label: 'research',
