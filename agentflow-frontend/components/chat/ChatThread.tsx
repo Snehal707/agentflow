@@ -653,6 +653,21 @@ export function ChatThread({
             isAssistant
               ? parsePredmarketInlineBlocks(markdownContent, message.quickActionGroups)
               : null;
+          const isPredictionMarketReportFooter = message.reportMeta?.contextKind === "prediction_market";
+          const visibleQuickActionGroups =
+            isPredictionMarketReportFooter && message.quickActionGroups?.length
+              ? message.quickActionGroups
+                  .map((group) => ({
+                    ...group,
+                    actions: group.actions.filter(
+                      (action) =>
+                        !/^(?:research|details|show\b|find this market to trade|trade)$/i.test(
+                          action.label.trim(),
+                        ),
+                    ),
+                  }))
+                  .filter((group) => group.actions.length > 0)
+              : message.quickActionGroups;
           const progressLines = reportParts.hasReport
             ? formatProgressLines(reportParts.progress)
             : [];
@@ -1319,11 +1334,11 @@ export function ChatThread({
                     )}
                   </div>
                 ) : null}
-                {isAssistant && message.quickActionGroups?.length && !predmarketInlineBlocks ? (
+                {isAssistant && visibleQuickActionGroups?.length && !predmarketInlineBlocks ? (
                   <div className="space-y-3">
-                    {message.quickActionGroups.map((group, groupIndex) => (
+                    {visibleQuickActionGroups.map((group, groupIndex) => (
                       <div key={`${message.id}-quick-actions-${groupIndex}`} className="space-y-2">
-                        {group.title ? (
+                        {group.title && !isPredictionMarketReportFooter ? (
                           <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/45">
                             {group.title}
                           </div>

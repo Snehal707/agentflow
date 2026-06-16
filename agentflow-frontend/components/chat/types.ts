@@ -18,6 +18,8 @@ export type ReportEvidenceSummary = {
 
 export type ReportMeta = {
   kind: "research" | "portfolio" | "execution";
+  contextKind?: "prediction_market";
+  mode?: string;
   freshness?: ReportFreshness;
   evidence?: ReportEvidenceSummary;
   premiseNote?: string;

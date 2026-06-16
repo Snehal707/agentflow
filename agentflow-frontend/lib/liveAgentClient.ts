@@ -19,6 +19,7 @@ export type ResearchSource = {
   name?: string;
   url?: string;
   used_for?: string;
+  usedFor?: string;
 };
 
 export type ResearchFact = {
@@ -32,6 +33,25 @@ export type ResearchPayload = {
 };
 
 export type LiveDataPayload = {
+  dynamic_sources?: {
+    articles?: Array<{
+      title?: string;
+      url?: string;
+      publisher?: string;
+      summary?: string;
+    }>;
+  };
+  sources?: Array<{
+    title?: string;
+    domain?: string;
+    url?: string;
+    summary?: string;
+  }>;
+  coingecko?: {
+    assets?: Array<{
+      coinId?: string;
+    }>;
+  };
   current_events?: {
     freshness?: "fresh" | "stale_or_thin";
     has_recent_articles?: boolean;
@@ -71,6 +91,7 @@ export type PipelineEvent =
       research?: ResearchPayload | null;
       analysis?: Record<string, unknown> | null;
       liveData?: LiveDataPayload | null;
+      sources?: ResearchSource[] | null;
     }
   | { type: "error"; message: string; step?: PipelineStepKey };
 

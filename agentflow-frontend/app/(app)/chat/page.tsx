@@ -2062,9 +2062,20 @@ function buildExecutionBlockResult(input: {
 }
 
 function uniqueSources(sources: ReportSource[]): ReportSource[] {
+  const normalizeSourceUrl = (value: string): string => {
+    try {
+      const url = new URL(value);
+      url.hash = "";
+      const normalizedPath = url.pathname.replace(/\/+$/, "") || "/";
+      return `${url.origin}${normalizedPath}${url.search}`.toLowerCase();
+    } catch {
+      return value.trim().replace(/\/+$/, "").toLowerCase();
+    }
+  };
+
   const deduped = new Map<string, ReportSource>();
   for (const source of sources) {
-    const key = `${source.name}|${source.url}`.toLowerCase();
+    const key = normalizeSourceUrl(source.url) || source.name.trim().toLowerCase();
     if (!deduped.has(key)) {
       deduped.set(key, source);
     }
@@ -2073,22 +2084,39 @@ function uniqueSources(sources: ReportSource[]): ReportSource[] {
 }
 
 function buildResearchSources(
+  reportSources?: ReportSource[] | null,
   research?: ResearchPayload | null,
   liveData?: LiveDataPayload | null,
 ): ReportSource[] {
+  const finalSources = Array.isArray(reportSources) ? reportSources : [];
   const rawSources = Array.isArray(research?.sources) ? research.sources : [];
   const liveSources = Array.isArray(liveData?.sources) ? liveData.sources : [];
+  const dynamicSources = Array.isArray(liveData?.dynamic_sources?.articles)
+    ? liveData.dynamic_sources.articles
+    : [];
   const coingeckoAssets = Array.isArray(liveData?.coingecko?.assets)
     ? liveData.coingecko.assets
     : [];
   return uniqueSources(
     [
+      ...finalSources
+        .filter((source) => typeof source?.name === "string" && typeof source?.url === "string")
+        .map((source) => ({
+          name: source.name,
+          url: source.url,
+          usedFor: typeof source.usedFor === "string" ? source.usedFor : undefined,
+        })),
       ...rawSources
         .filter((source) => typeof source?.name === "string" && typeof source?.url === "string")
         .map((source) => ({
           name: source.name as string,
           url: source.url as string,
-          usedFor: typeof source.used_for === "string" ? source.used_for : undefined,
+          usedFor:
+            typeof source.usedFor === "string"
+              ? source.usedFor
+              : typeof source.used_for === "string"
+                ? source.used_for
+                : undefined,
         })),
       ...liveSources
         .filter((source) => typeof source?.url === "string")
@@ -2098,6 +2126,21 @@ function buildResearchSources(
               ? source.title
               : typeof source?.domain === "string"
                 ? source.domain
+                : "Retrieved source",
+          url: source.url as string,
+          usedFor:
+            typeof source?.summary === "string"
+              ? source.summary
+              : undefined,
+        })),
+      ...dynamicSources
+        .filter((source) => typeof source?.url === "string")
+        .map((source) => ({
+          name:
+            typeof source?.publisher === "string" && source.publisher.trim().length > 0
+              ? source.publisher
+              : typeof source?.title === "string" && source.title.trim().length > 0
+                ? source.title
                 : "Retrieved source",
           url: source.url as string,
           usedFor:
@@ -2168,7 +2211,7 @@ function buildResearchReportMeta(reportEvent: Extract<PipelineEvent, { type: "re
       typeof liveData?.premise_check?.note === "string"
         ? liveData.premise_check.note
         : undefined,
-    sources: buildResearchSources(reportEvent.research, liveData),
+    sources: buildResearchSources(reportEvent.sources as ReportSource[] | null | undefined, reportEvent.research, liveData),
   };
 }
 
@@ -5046,7 +5089,10 @@ function ChatPageInner() {
                 ...message,
                 content: combined,
                 status: "complete",
-                reportMeta: buildResearchReportMeta(event),
+                reportMeta: {
+                  ...(message.reportMeta || {}),
+                  ...buildResearchReportMeta(event),
+                },
               };
             });
           },
@@ -5184,7 +5230,10 @@ function ChatPageInner() {
               trace: nextTrace ? [...(message.trace || []), nextTrace] : message.trace,
               reportMeta:
                 streamEvent.type === "report"
-                  ? buildResearchReportMeta(streamEvent)
+                  ? {
+                      ...(message.reportMeta || {}),
+                      ...buildResearchReportMeta(streamEvent),
+                    }
                   : message.reportMeta,
               paymentMeta:
                 streamEvent.type === "receipt" && streamEvent.entries?.length

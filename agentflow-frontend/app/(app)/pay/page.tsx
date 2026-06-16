@@ -60,6 +60,21 @@ function formatUsd(value: number | null | undefined): string {
   }).format(value);
 }
 
+function describeHistoryAction(row: PayHistoryRow): string {
+  const direction = row.direction === "in" ? "in" : "out";
+  const actionType = String(row.action_type ?? "").trim().toLowerCase();
+  if (actionType === "agentpay_request") {
+    return direction === "out" ? "request paid" : "request received";
+  }
+  if (actionType === "agentpay_external") {
+    return direction === "out" ? "external send" : "external receive";
+  }
+  if (actionType === "agentpay_send") {
+    return direction === "out" ? "direct send" : "direct receive";
+  }
+  return direction === "out" ? "out" : "in";
+}
+
 function escapeCsvCell(value: unknown): string {
   const text = String(value ?? "");
   if (/[",\n]/.test(text)) {
@@ -1491,7 +1506,7 @@ export default function AgentPayPage() {
                                   Your Payment Link
                                 </div>
                                 <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-black px-3 py-2">
-                                  <span className="flex-1 truncate font-mono text-xs text-[#69daff]">
+                                  <span className="flex-1 truncate font-mono text-xs text-[#f2ca50]">
                                     {chainArcPayLink}
                                   </span>
                                   <button
@@ -1700,7 +1715,7 @@ export default function AgentPayPage() {
                                   To {shortenAddress(r.to_wallet)} · {r.remark || "—"}
                                 </div>
                                 {r.invoices && (
-                                  <div className="mt-1 text-xs text-[#69daff]">
+                                  <div className="mt-1 text-xs text-[#f2ca50]">
                                     Invoice {r.invoices.invoice_number ?? ""}
                                     {r.invoices.vendor_name ? ` · ${r.invoices.vendor_name}` : ""}
                                   </div>
@@ -1837,7 +1852,7 @@ export default function AgentPayPage() {
                                       {formatUsd(Number(row.amount))}
                                     </div>
                                     <div className="mt-1 text-xs uppercase tracking-[0.16em] text-white/40/70">
-                                      {row.direction} · {row.status || "processed"}
+                                      {describeHistoryAction(row)} · {row.status || "processed"}
                                     </div>
                                   </div>
                                   <div className="text-right text-xs text-white/40">
@@ -2005,7 +2020,7 @@ export default function AgentPayPage() {
                                       <span
                                         className={`text-xs px-2 py-0.5 rounded-full mt-1 inline-block ${
                                           settling
-                                            ? "text-[#69daff] bg-[#69daff]/10"
+                                            ? "text-[#f2ca50] bg-[#f2ca50]/10"
                                             : detail.status === "paid"
                                               ? "text-green-400 bg-green-400/10"
                                               : "text-yellow-400 bg-yellow-400/10"
@@ -2042,15 +2057,15 @@ export default function AgentPayPage() {
                                           href={`https://testnet.arcscan.app/tx/${detail.arc_tx_id}`}
                                           target="_blank"
                                           rel="noopener noreferrer"
-                                          className="text-xs text-[#69daff]"
+                                          className="text-xs text-[#f2ca50]"
                                         >
                                           Arcscan ↗
                                         </a>
                                       )}
                                       {settling ? (
-                                        <span className="px-3 py-1 rounded-lg text-xs font-medium text-[#69daff] bg-[#69daff]/10 inline-flex items-center gap-1.5">
+                                        <span className="inline-flex items-center gap-1.5 rounded-lg bg-[#f2ca50]/10 px-3 py-1 text-xs font-medium text-[#f2ca50]">
                                           <svg
-                                            className="animate-spin h-3 w-3 text-[#69daff]"
+                                            className="h-3 w-3 animate-spin text-[#f2ca50]"
                                             xmlns="http://www.w3.org/2000/svg"
                                             fill="none"
                                             viewBox="0 0 24 24"
@@ -2074,7 +2089,7 @@ export default function AgentPayPage() {
                                       ) : detail.status === "pending" ? (
                                         <button
                                           onClick={() => void handleApprove(inv.id)}
-                                          className="px-3 py-1 bg-[#69daff] text-black rounded-lg text-xs font-medium hover:bg-[#69daff]/90 transition disabled:opacity-50 inline-flex items-center gap-1.5"
+                                          className="burnished-gold inline-flex items-center gap-1.5 rounded-lg px-3 py-1 text-xs font-bold text-[#1a1200] transition hover:opacity-95 disabled:opacity-50"
                                         >
                                           Pay Invoice
                                         </button>
@@ -2100,7 +2115,7 @@ export default function AgentPayPage() {
                               <div className="text-sm text-[#aaabb0]">
                                 No invoices yet.
                               </div>
-                              <div className="text-xs text-[#69daff]">
+                              <div className="text-xs text-[#f2ca50]">
                                 Try: &quot;create invoice for alice.arc 50 USDC for design work&quot;
                               </div>
                             </div>
@@ -2154,7 +2169,7 @@ export default function AgentPayPage() {
                                       href={`https://testnet.arcscan.app/tx/${inv.arc_tx_id}`}
                                       target="_blank"
                                       rel="noopener noreferrer"
-                                      className="text-xs text-[#69daff]"
+                                      className="text-xs text-[#f2ca50]"
                                     >
                                       Arcscan ↗
                                     </a>
@@ -2166,11 +2181,11 @@ export default function AgentPayPage() {
                         </div>
                       </>
                     )}
-                    <div className="rounded-2xl border border-[#69daff]/20 bg-[#111318] p-4 text-center">
+                    <div className="rounded-2xl border border-[#f2ca50]/20 bg-[#111318] p-4 text-center">
                       <div className="text-xs text-[#aaabb0]">
                         Create invoices via chat:
                       </div>
-                      <div className="text-xs text-[#69daff] mt-1 font-mono">
+                      <div className="mt-1 text-xs font-mono text-[#f2ca50]">
                         &quot;create invoice for alice.arc 50 USDC for design&quot;
                       </div>
                     </div>

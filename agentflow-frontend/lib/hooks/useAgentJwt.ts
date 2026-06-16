@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useAccount, useSignMessage } from "wagmi";
 import { buildAuthMessage } from "@/lib/authMessage";
 import {
+  authSessionEventName,
   authHeadersForWallet,
   clearAuthSession,
   loadAuthSession,
@@ -45,11 +46,11 @@ export function useAgentJwt() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const syncSessionForWallet = useCallback(() => {
     if (!isConnected || !address) {
       setSession(null);
       setError(null);
-      return;
+      return () => {};
     }
 
     let cancelled = false;
@@ -86,6 +87,19 @@ export function useAgentJwt() {
       cancelled = true;
     };
   }, [address, isConnected]);
+
+  useEffect(() => syncSessionForWallet(), [syncSessionForWallet]);
+
+  useEffect(() => {
+    const eventName = authSessionEventName();
+    const handleSessionChange = () => {
+      void syncSessionForWallet();
+    };
+    window.addEventListener(eventName, handleSessionChange);
+    return () => {
+      window.removeEventListener(eventName, handleSessionChange);
+    };
+  }, [syncSessionForWallet]);
 
   const signIn = useCallback(async () => {
     if (!address) {
