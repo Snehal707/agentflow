@@ -3,6 +3,7 @@ import {
   isCircularResearchSourceUrl,
   isLowValueSourceForTask,
   isLowValueSocialSourceUrl,
+  isLowValueVideoUrl,
   isOfficialCreatorPlatformUrl,
   isPredictionMarketResearchTask,
   sourceHostname,
@@ -76,8 +77,10 @@ type FramingSignals = {
 type GroundedSourceHint = {
   name: string;
   url: string;
+  usedFor?: string;
   publishedAt?: string;
   accessedAt?: string;
+  trustedLiveData?: boolean;
 };
 
 type LiveDataSourceGrounding = {
@@ -130,6 +133,20 @@ const MONTH_INDEX: Record<string, number> = {
   november: 10,
   december: 11,
 };
+const MONTH_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
 
 function asDate(value?: string | null): string | undefined {
   if (!value) return undefined;
@@ -171,6 +188,18 @@ function isFutureDateValue(value: string, now = new Date()): boolean {
     return Number.isFinite(candidate) && candidate > currentMonth;
   }
 
+  const monthDayYear = trimmed.match(
+    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*|\s+)(20\d{2})\b/i,
+  );
+  if (monthDayYear) {
+    const month = MONTH_INDEX[monthDayYear[1].toLowerCase()];
+    const day = Number(monthDayYear[2]);
+    const year = Number(monthDayYear[3]);
+    const candidate = Date.UTC(year, month, day);
+    const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    return Number.isFinite(candidate) && candidate > today;
+  }
+
   return false;
 }
 
@@ -202,6 +231,140 @@ function shortenText(value: string, maxLength = 220): string {
   return normalized.length > maxLength
     ? `${normalized.slice(0, maxLength - 3).trimEnd()}...`
     : normalized;
+}
+
+function normalizeNarrativeText(value: string): string {
+  return stripHtmlTags(value).replace(/\s+/g, ' ').trim();
+}
+
+function cleanPredictionMarketTopicLabel(task: string): string {
+  return task
+    .replace(/\r?\n+/g, ' ')
+    .replace(/^research\s+(?:the\s+)?(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
+    .replace(/\bListed outcomes in AgentFlow:[\s\S]*?(?=\bFocus on the real-world event\b|$)/i, ' ')
+    .replace(/\bFocus on the real-world event[\s\S]*$/i, ' ')
+    .replace(/\bthe\s+prediction\s+market\s+topic\b[:\s-]*/i, ' ')
+    .replace(/\bprediction\s+market\s+topic\b[:\s-]*/i, ' ')
+    .replace(/\bmarket\s+topic\b[:\s-]*/i, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractPredictionMarketQuestion(task: string): string {
+  const match = task.match(/research the prediction market topic:\s*([^\n]+)/i);
+  return (match?.[1] || cleanPredictionMarketTopicLabel(task) || task).replace(/\s+/g, ' ').trim();
+}
+
+function extractAllowedPredictionMarketFutureDates(task: string, liveData: Obj | null): Set<string> {
+  if (!isPredictionMarketResearchTask(task)) return new Set<string>();
+
+  const allowed = new Set<string>();
+  const addIfPresent = (value: string | null | undefined) => {
+    const normalized = value?.trim();
+    if (!normalized) return;
+    allowed.add(normalized);
+  };
+
+  const understanding = asObject(liveData?.prediction_market_understanding);
+  const resolutionDate = asString(understanding?.resolutionDate);
+  addIfPresent(resolutionDate);
+  if (resolutionDate && /^\d{4}-\d{2}-\d{2}$/.test(resolutionDate)) {
+    addIfPresent(resolutionDate.slice(0, 7));
+    const [year, month, day] = resolutionDate.split('-').map((part) => Number(part));
+    if (year && month && day) {
+      addIfPresent(`${MONTH_NAMES[month - 1]} ${day}, ${year}`);
+      addIfPresent(`${MONTH_NAMES[month - 1]} ${day} ${year}`);
+    }
+  }
+
+  const question = extractPredictionMarketQuestion(task);
+  for (const match of question.matchAll(/\b20\d{2}-\d{2}(?:-\d{2})?\b/g)) {
+    addIfPresent(match[0]);
+  }
+  for (const match of question.matchAll(
+    /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b/gi,
+  )) {
+    addIfPresent(match[0]);
+    const monthYear = match[0].match(
+      /\b(January|February|March|April|May|June|July|August|September|October|November|December)\b[\s\d,]*(20\d{2})\b/i,
+    );
+    if (monthYear) {
+      addIfPresent(`${monthYear[1]} ${monthYear[2]}`);
+    }
+  }
+  for (const match of question.matchAll(
+    /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}\b/gi,
+  )) {
+    addIfPresent(match[0]);
+  }
+
+  return allowed;
+}
+
+function addPredictionMarketToken(tokens: Set<string>, value: string | null | undefined): void {
+  const candidate = value?.trim().toLowerCase();
+  if (!candidate) return;
+  tokens.add(candidate);
+}
+
+function predictionMarketEntityTokens(task: string): string[] {
+  const question = extractPredictionMarketQuestion(task);
+  const taskLower = task.toLowerCase();
+  const questionLower = question.toLowerCase();
+  const ticker = question.match(/\(([A-Z]{2,6})\)/)?.[1]?.toLowerCase();
+  const tokens = new Set<string>();
+  addPredictionMarketToken(tokens, ticker);
+
+  if (/\b(bitcoin|btc)\b/i.test(question)) {
+    addPredictionMarketToken(tokens, 'bitcoin');
+    addPredictionMarketToken(tokens, 'btc');
+  }
+  if (/\b(ethereum|eth)\b/i.test(question)) {
+    addPredictionMarketToken(tokens, 'ethereum');
+    addPredictionMarketToken(tokens, 'eth');
+  }
+  if (/\b(solana|sol)\b/i.test(question)) {
+    addPredictionMarketToken(tokens, 'solana');
+    addPredictionMarketToken(tokens, 'sol');
+  }
+  if (/\b(xaut|tether gold)\b/i.test(question)) {
+    addPredictionMarketToken(tokens, 'xaut');
+    addPredictionMarketToken(tokens, 'tether gold');
+    addPredictionMarketToken(tokens, 'gold');
+  }
+  if (/\bgta\s*6\b|\bgrand theft auto\b/i.test(question)) {
+    addPredictionMarketToken(tokens, 'gta');
+    addPredictionMarketToken(tokens, 'gta 6');
+    addPredictionMarketToken(tokens, 'grand theft auto');
+    addPredictionMarketToken(tokens, 'rockstar');
+  }
+  if (
+    /\bPrediction market category in AgentFlow:\s*Crypto\b/i.test(task) &&
+    /\barc\b/i.test(questionLower) &&
+    /\b(mainnet|launch|testnet)\b/i.test(taskLower)
+  ) {
+    addPredictionMarketToken(tokens, 'arc');
+    addPredictionMarketToken(tokens, 'arc network');
+    addPredictionMarketToken(tokens, 'blockchain');
+  }
+  if (/\b(world cup|fifa)\b/i.test(questionLower)) {
+    addPredictionMarketToken(tokens, 'fifa');
+    addPredictionMarketToken(tokens, 'world cup');
+  }
+
+  const cleaned = question
+    .replace(/\(([A-Z]{2,6})\)/g, ' ')
+    .replace(/\bwill\b/gi, ' ')
+    .replace(/\b(before|after|by|reach|hit|launch|mainnet|win|winner|its|the|a|an|of|market|cap|close|closes|outcomes|category|provider|network|project)\b/gi, ' ')
+    .replace(/\b20\d{2}\b/g, ' ')
+    .replace(/\$[\d,]+(?:\.\d+)?/g, ' ')
+    .replace(/[?.,:;/]/g, ' ')
+    .split(/\s+/)
+    .map((token) => token.trim().toLowerCase())
+    .filter((token) => token.length >= 3)
+    .filter((token) => !['prediction', 'market', 'topic', 'june', 'july', 'november', 'september', 'france', 'argentina', 'brazil', 'other', 'yes', 'no'].includes(token));
+  for (const token of cleaned) addPredictionMarketToken(tokens, token);
+  return [...tokens].slice(0, 8);
 }
 
 function inferPrimaryTopicLabel(task: string, research: Obj | null): string | null {
@@ -260,10 +423,157 @@ function articleMatchesPrimaryTopic(
   return new RegExp(`\\b${escapeRegExp(primaryTopicLabel)}\\b`, 'i').test(articleText);
 }
 
+function isPredictionMarketOffTopicSource(task: string, text: string): boolean {
+  if (!isPredictionMarketResearchTask(task)) return false;
+  const haystack = text.toLowerCase();
+  if (
+    /\bPrediction market category in AgentFlow:\s*Crypto\b/i.test(task) &&
+    /\barc\b/i.test(task) &&
+    /\b(mainnet|launch|testnet)\b/i.test(task)
+  ) {
+    if (
+      /\b(arc\.net|chip\.de|arc browser|webbrowser|arc games|clinic|arcofopportunity\.org|browser company|arc-network\.com)\b/i.test(
+        haystack,
+      )
+    ) {
+      return true;
+    }
+    if (
+      /\barc\b/i.test(haystack) &&
+      !/\b(blockchain|crypto|mainnet|testnet|validator|onchain|chain|web3|roadmap|smart contract|stablecoin|layer[- ]?1|l1)\b/i.test(
+        haystack,
+      )
+    ) {
+      return true;
+    }
+  }
+  if (/\b(xaut|tether gold)\b/i.test(task) && /\btether\b/i.test(haystack) && !/\b(xaut|tether gold|gold)\b/i.test(haystack)) {
+    return true;
+  }
+  return false;
+}
+
+function matchesPredictionMarketSourceTokens(task: string, text: string): boolean {
+  if (!isPredictionMarketResearchTask(task)) return true;
+  if (isPredictionMarketOffTopicSource(task, text)) return false;
+  if (
+    /\bPrediction market category in AgentFlow:\s*Games\b/i.test(task) ||
+    /\bgta\s*6\b|\bgrand theft auto\b/i.test(task)
+  ) {
+    if (/\b(rockstargames\.com|take2games\.com|ign\.com|gamespot\.com|polygon\.com|eurogamer\.net|businesswire\.com|reuters\.com|playstation\.com|xbox\.com|store\.playstation\.com|news\.xbox\.com|steamcommunity\.com|steampowered\.com)\b/i.test(text)) return true;
+  }
+  if (/\bPrediction market category in AgentFlow:\s*Sports\b/i.test(task)) {
+    if (/\b(fifa\.com|uefa\.com|bbc\.com|cbssports\.com|theanalyst\.com|oddschecker|espn\.com|sportingnews\.com|actionnetwork\.com|foxsports\.com|nba\.com|nfl\.com|mlb\.com|nhl\.com)\b/i.test(text)) {
+      return true;
+    }
+  }
+  const haystack = text.toLowerCase();
+  const tokens = predictionMarketEntityTokens(task);
+  if (/\b(xaut|tether gold)\b/i.test(task)) {
+    return /\b(xaut|tether gold|gold|kitco|lbma|bullion)\b/i.test(text);
+  }
+  if (/\b(bitcoin|btc)\b/i.test(task)) {
+    return /\b(bitcoin|btc)\b/i.test(text);
+  }
+  if (
+    /\bPrediction market category in AgentFlow:\s*Crypto\b/i.test(task) &&
+    /\barc\b/i.test(task) &&
+    /\b(mainnet|launch|testnet)\b/i.test(task)
+  ) {
+    return (
+      /\barc\b|\barc network\b|\barc\.network\b|\barc\.io\b|\bcircle\.com\b|\bdocs\.arc\.io\b/i.test(text) &&
+      /\b(blockchain|crypto|mainnet|testnet|validator|onchain|chain|web3|roadmap|smart contract|stablecoin|layer[- ]?1|l1)\b/i.test(
+        text,
+      )
+    );
+  }
+  if (tokens.length === 0) return true;
+  return tokens.some((token) => token && haystack.includes(token.toLowerCase()));
+}
+
+function shouldPreservePredictionMarketSource(task: string, text: string): boolean {
+  if (!isPredictionMarketResearchTask(task)) return false;
+  if (/https?:\/\/news\.google\.com\/rss\/articles\//i.test(text)) return false;
+  if (isPredictionMarketOffTopicSource(task, text)) return false;
+  return matchesPredictionMarketSourceTokens(task, text);
+}
+
+function isPredictionMarketSourceGoodEnoughForNarrative(
+  task: string,
+  source: NormalizedReportSource,
+): boolean {
+  if (!isPredictionMarketResearchTask(task)) return false;
+  const text = `${source.name} ${source.url} ${source.usedFor || ''}`;
+  if (isPredictionMarketOffTopicSource(task, text)) return false;
+  if (/https?:\/\/news\.google\.com\/rss\/articles\//i.test(text)) return false;
+  if (shouldPreservePredictionMarketSource(task, text)) return true;
+  return sourcePriority(source.url, source.name) >= 18;
+}
+
+function shouldSuppressGenericPredictionMarketLiveSources(
+  task: string,
+  liveData: Obj | null,
+): boolean {
+  if (!isPredictionMarketResearchTask(task)) return false;
+  const diagnostics = asObject(liveData?.source_diagnostics);
+  if (diagnostics?.unresolved_entity === true) return true;
+  const understanding = asObject(liveData?.prediction_market_understanding);
+  const entity = asObject(understanding?.entity);
+  const ambiguity = asString(entity?.ambiguity)?.toLowerCase();
+  const dynamicArticles = asArray(asObject(liveData?.dynamic_sources)?.articles);
+  if (dynamicArticles.length > 0) return false;
+  return ambiguity === 'high';
+}
+
+function shouldSuppressPredictionMarketStructuredApiSource(
+  task: string,
+  sourceName: 'coingecko' | 'defillama' | 'mempool',
+): boolean {
+  if (!isPredictionMarketResearchTask(task)) return false;
+
+  const explicitMetricRequest =
+    /\b(defillama|tvl|total value locked|stablecoins?|liquidity|defi|on[-\s]?chain|mempool|transaction|transactions|fees?)\b/i.test(
+      task,
+    );
+  if (explicitMetricRequest) return false;
+
+  const launchOrMainnet = /\b(mainnet|testnet|launch date|launch before|pre[-\s]?mainnet)\b/i.test(task);
+  const priceTarget = /\b(reach|hit|market cap|valuation|price target|\$\d)\b/i.test(task);
+
+  if (sourceName === 'defillama' && (launchOrMainnet || priceTarget)) {
+    return true;
+  }
+  if (sourceName === 'mempool' && !/\bbitcoin|btc\b/i.test(task)) {
+    return true;
+  }
+  if (sourceName === 'coingecko' && launchOrMainnet) {
+    return true;
+  }
+  return false;
+}
+
 function normalizeUrl(value: string | null): string | null {
   if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const httpMatches = trimmed.match(/https?:\/\//gi);
+  if (httpMatches && httpMatches.length > 1) return null;
+  if (/,?\s*https?:\/\//i.test(trimmed.replace(/^https?:\/\//i, ''))) return null;
+  if (/%20https?:\/\//i.test(trimmed)) return null;
   try {
-    const url = new URL(value);
+    const url = new URL(trimmed);
+    if (/^news\.google\.com$/i.test(url.hostname) && /^\/rss\/articles\//i.test(url.pathname)) {
+      return `${url.origin}${url.pathname}`;
+    }
+    url.hash = '';
+    for (const key of [...url.searchParams.keys()]) {
+      if (
+        /^utm_/i.test(key) ||
+        /^(msockid|oc|hl|gl|ceid|cmpid|guccounter|guce_referrer|guce_referrer_sig)$/i.test(key)
+      ) {
+        url.searchParams.delete(key);
+      }
+    }
     return /^https?:$/i.test(url.protocol) ? url.toString() : null;
   } catch {
     return null;
@@ -311,14 +621,32 @@ function pushGroundedSource(
   const url = normalizeUrl(hint.url);
   const name = hint.name.trim();
   if (!url || !name) return;
+  if (isPredictionMarketResearchTask(task) && isGoogleNewsRssUrl(url)) return;
   if (isLowValueSocialSourceUrl(url)) return;
+  if (isLowValueVideoUrl(url)) return;
   if (isCircularResearchSourceUrl(task, url)) return;
-  if (isLowValueSourceForTask(task, { url, title: hint.name, publisher: hint.name })) return;
+  const sourceText = `${hint.name} ${url} ${hint.usedFor || ''}`;
+  if (hint.trustedLiveData === true) {
+    if (isPredictionMarketOffTopicSource(task, sourceText)) {
+      return;
+    }
+  } else if (
+    !shouldPreservePredictionMarketSource(task, sourceText) &&
+    isLowValueSourceForTask(task, {
+      url,
+      title: hint.name,
+      publisher: hint.name,
+      summary: hint.usedFor,
+    })
+  ) {
+    return;
+  }
 
   const normalizedName = normalizeSourceName(name, url);
   const entry: GroundedSourceHint = {
     name: normalizedName,
     url,
+    ...(hint.usedFor ? { usedFor: hint.usedFor } : {}),
     ...(hint.publishedAt ? { publishedAt: asDate(hint.publishedAt) } : {}),
     ...(hint.accessedAt ? { accessedAt: asDate(hint.accessedAt) } : {}),
   };
@@ -344,32 +672,52 @@ function buildLiveDataSourceGrounding(
   };
 
   const snapshotAt = grounding.snapshotAt;
+  const suppressGenericPredictionMarketLiveSources = shouldSuppressGenericPredictionMarketLiveSources(
+    task,
+    liveData,
+  );
   const coingecko = asObject(liveData?.coingecko);
-  for (const entry of asArray(coingecko?.assets)) {
-    const asset = asObject(entry);
-    const coinId = asString(asset?.coinId);
-    if (!coinId) continue;
-    pushGroundedSource(grounding, task, {
-      name: 'CoinGecko',
-      url: `https://www.coingecko.com/en/coins/${encodeURIComponent(coinId)}`,
-      ...(asString(asset?.last_updated_at) ? { publishedAt: asString(asset?.last_updated_at)! } : {}),
-      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
-    });
+  if (
+    !suppressGenericPredictionMarketLiveSources &&
+    !shouldSuppressPredictionMarketStructuredApiSource(task, 'coingecko')
+  ) {
+    for (const entry of asArray(coingecko?.assets)) {
+      const asset = asObject(entry);
+      const coinId = asString(asset?.coinId);
+      if (!coinId) continue;
+      if (!matchesPredictionMarketSourceTokens(task, coinId)) continue;
+      pushGroundedSource(grounding, task, {
+        name: 'CoinGecko',
+        url: `https://www.coingecko.com/en/coins/${encodeURIComponent(coinId)}`,
+        ...(asString(asset?.last_updated_at) ? { publishedAt: asString(asset?.last_updated_at)! } : {}),
+        ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+      });
+    }
   }
 
   const defillama = asObject(liveData?.defillama);
-  for (const entry of asArray(defillama?.chains)) {
-    const chain = asString(asObject(entry)?.chain);
-    if (!chain) continue;
-    pushGroundedSource(grounding, task, {
-      name: 'DefiLlama',
-      url: `https://defillama.com/chain/${encodeURIComponent(chain)}`,
-      ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
-    });
+  if (
+    !suppressGenericPredictionMarketLiveSources &&
+    !shouldSuppressPredictionMarketStructuredApiSource(task, 'defillama')
+  ) {
+    for (const entry of asArray(defillama?.chains)) {
+      const chain = asString(asObject(entry)?.chain);
+      if (!chain) continue;
+      if (!matchesPredictionMarketSourceTokens(task, chain)) continue;
+      pushGroundedSource(grounding, task, {
+        name: 'DefiLlama',
+        url: `https://defillama.com/chain/${encodeURIComponent(chain)}`,
+        ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
+      });
+    }
   }
 
   const bitcoinOnchain = asObject(liveData?.bitcoin_onchain);
-  if (bitcoinOnchain) {
+  if (
+    bitcoinOnchain &&
+    !suppressGenericPredictionMarketLiveSources &&
+    !shouldSuppressPredictionMarketStructuredApiSource(task, 'mempool')
+  ) {
     pushGroundedSource(grounding, task, {
       name: 'Mempool.space',
       url: 'https://mempool.space/blocks',
@@ -385,6 +733,8 @@ function buildLiveDataSourceGrounding(
     const page = asObject(entry);
     const url = normalizeUrl(asString(page?.url));
     if (!url) continue;
+    const titleOrUrl = `${asString(page?.title) || ''} ${url}`;
+    if (!matchesPredictionMarketSourceTokens(task, titleOrUrl)) continue;
     pushGroundedSource(grounding, task, {
       name: 'Wikipedia',
       url,
@@ -412,7 +762,12 @@ function buildLiveDataSourceGrounding(
     if (!url) continue;
     pushGroundedSource(grounding, task, {
       name: asString(article?.publisher) ?? asString(article?.title) ?? 'Current event source',
+      usedFor:
+        asString(article?.summary) ??
+        asString(article?.title) ??
+        'Current event article snapshot',
       url,
+      trustedLiveData: true,
       ...(asString(article?.seen_at) ? { publishedAt: asString(article?.seen_at)! } : {}),
       ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
     });
@@ -423,7 +778,12 @@ function buildLiveDataSourceGrounding(
     if (!url) continue;
     pushGroundedSource(grounding, task, {
       name: asString(article?.publisher) ?? asString(article?.domain) ?? asString(article?.title) ?? 'Current event source',
+      usedFor:
+        asString(article?.summary) ??
+        asString(article?.title) ??
+        'Current event article evidence',
       url,
+      trustedLiveData: true,
       ...(asString(article?.seen_at) ? { publishedAt: asString(article?.seen_at)! } : {}),
       ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
     });
@@ -447,7 +807,12 @@ function buildLiveDataSourceGrounding(
     if (!url) continue;
     pushGroundedSource(grounding, task, {
       name: asString(article?.publisher) ?? asString(article?.title) ?? 'Dynamic source',
+      usedFor:
+        asString(article?.summary) ??
+        asString(article?.title) ??
+        'Live Data article snapshot',
       url,
+      trustedLiveData: true,
       ...(asString(article?.seen_at) ? { publishedAt: asString(article?.seen_at)! } : {}),
       ...(snapshotAt ? { accessedAt: snapshotAt } : {}),
     });
@@ -524,9 +889,21 @@ function createSourceRegistry(task: string) {
       const publishedAt = asDate(asString(dateMeta?.publishedAt));
       const accessedAt = asDate(asString(dateMeta?.accessedAt));
       if (!rawUrl) return [];
+      if (isPredictionMarketResearchTask(task) && isGoogleNewsRssUrl(rawUrl)) return [];
       if (isLowValueSocialSourceUrl(rawUrl)) return [];
+      if (isLowValueVideoUrl(rawUrl)) return [];
       if (isCircularResearchSourceUrl(task, rawUrl)) return [];
-      if (isLowValueSourceForTask(task, { url: rawUrl, title: rawName ?? undefined, publisher: rawName ?? undefined })) {
+      const sourceText = `${rawName ?? ''} ${rawUrl} ${usedFor ?? ''}`;
+      const preservePredictionMarketSource = shouldPreservePredictionMarketSource(task, sourceText);
+      if (
+        !preservePredictionMarketSource &&
+        isLowValueSourceForTask(task, {
+          url: rawUrl,
+          title: rawName ?? undefined,
+          publisher: rawName ?? undefined,
+          summary: usedFor,
+        })
+      ) {
         return [];
       }
 
@@ -599,6 +976,10 @@ function addSupplementalLiveEvidenceSources(
   primaryTopicLabel?: string | null,
 ): void {
   const snapshotAt = asDate(asString(liveData?.snapshot_at)) ?? todayDateString();
+  const suppressGenericPredictionMarketLiveSources = shouldSuppressGenericPredictionMarketLiveSources(
+    task,
+    liveData,
+  );
   const add = (
     name: unknown,
     url: unknown,
@@ -616,27 +997,41 @@ function addSupplementalLiveEvidenceSources(
   };
 
   const coingecko = asObject(liveData?.coingecko);
-  for (const entry of asArray(coingecko?.assets)) {
-    const asset = asObject(entry);
-    const coinId = asString(asset?.coinId);
-    if (!coinId) continue;
-    add(
-      'CoinGecko',
-      `https://www.coingecko.com/en/coins/${encodeURIComponent(coinId)}`,
-      'live market data',
-      asset?.last_updated_at,
-    );
+  if (
+    !suppressGenericPredictionMarketLiveSources &&
+    !shouldSuppressPredictionMarketStructuredApiSource(task, 'coingecko')
+  ) {
+    for (const entry of asArray(coingecko?.assets)) {
+      const asset = asObject(entry);
+      const coinId = asString(asset?.coinId);
+      if (!coinId) continue;
+      add(
+        'CoinGecko',
+        `https://www.coingecko.com/en/coins/${encodeURIComponent(coinId)}`,
+        'live market data',
+        asset?.last_updated_at,
+      );
+    }
   }
 
   const defillama = asObject(liveData?.defillama);
-  for (const entry of asArray(defillama?.chains)) {
-    const chain = asString(asObject(entry)?.chain);
-    if (!chain) continue;
-    add('DefiLlama', `https://defillama.com/chain/${encodeURIComponent(chain)}`, 'TVL data');
+  if (
+    !suppressGenericPredictionMarketLiveSources &&
+    !shouldSuppressPredictionMarketStructuredApiSource(task, 'defillama')
+  ) {
+    for (const entry of asArray(defillama?.chains)) {
+      const chain = asString(asObject(entry)?.chain);
+      if (!chain) continue;
+      add('DefiLlama', `https://defillama.com/chain/${encodeURIComponent(chain)}`, 'TVL data');
+    }
   }
 
   const bitcoinOnchain = asObject(liveData?.bitcoin_onchain);
-  if (bitcoinOnchain) {
+  if (
+    bitcoinOnchain &&
+    !suppressGenericPredictionMarketLiveSources &&
+    !shouldSuppressPredictionMarketStructuredApiSource(task, 'mempool')
+  ) {
     add(
       'Mempool.space',
       'https://mempool.space/blocks',
@@ -936,7 +1331,19 @@ function addClaim(map: Map<string, NormalizedClaim>, claim: NormalizedClaim): vo
 }
 
 function buildRawClaims(params: FinalizeParams): RawClaimState {
-  const topic = asString(params.research?.topic) || params.task || 'AgentFlow';
+  const researchTopic = asString(params.research?.topic);
+  const predictionMarketTopic = isPredictionMarketResearchTask(params.task)
+    ? extractPredictionMarketQuestion(params.task)
+    : null;
+  const topic =
+    (researchTopic
+      ? isPredictionMarketResearchTask(params.task)
+        ? extractPredictionMarketQuestion(researchTopic)
+        : researchTopic
+      : null) ||
+    predictionMarketTopic ||
+    params.task ||
+    'AgentFlow';
   const primaryTopicLabel = inferPrimaryTopicLabel(params.task, params.research);
   const sources = createSourceRegistry(params.task);
   const rawClaims = new Map<string, NormalizedClaim>();
@@ -967,6 +1374,18 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
     const rawName = asString(nameValue);
 
     if (sourceGrounding.hasEvidenceInventory && !grounded) {
+      if (
+        isPredictionMarketResearchTask(params.task) &&
+        rawUrl &&
+        shouldPreservePredictionMarketSource(
+          params.task,
+          `${rawName ?? ''} ${rawUrl} ${asString(usedForValue) ?? ''}`,
+        )
+      ) {
+        return sources.add(rawName, rawUrl, usedForValue, {
+          accessedAt: sourceGrounding.snapshotAt || todayDateString(),
+        });
+      }
       const descriptor = rawName || rawUrl || 'unknown source';
       issues.push(`Unsupported source omitted from final source list: ${descriptor}`);
       return [];
@@ -975,7 +1394,7 @@ function buildRawClaims(params: FinalizeParams): RawClaimState {
     return sources.add(
       grounded?.name ?? rawName,
       grounded?.url ?? rawUrl,
-      usedForValue,
+      usedForValue ?? grounded?.usedFor,
       {
         publishedAt: grounded?.publishedAt,
         accessedAt:
@@ -1805,7 +2224,8 @@ function buildConclusionSection(claims: NormalizedClaim[]): string {
 
 function extractStructuredSummary(research: Obj | null): string | null {
   const summary = asString(research?.executive_summary);
-  return summary ? sentence(shortenText(summary, 320)) : null;
+  const normalized = summary ? normalizeNarrativeText(summary) : '';
+  return normalized ? sentence(normalized) : null;
 }
 
 function extractStructuredKeyEvidence(analysis: Obj | null): string[] {
@@ -1814,7 +2234,9 @@ function extractStructuredKeyEvidence(analysis: Obj | null): string[] {
     .filter((entry): entry is Obj => Boolean(entry))
     .map((entry) => asString(entry.insight))
     .filter((value): value is string => Boolean(value))
-    .map((value) => `- ${sentence(shortenText(value, 220))}`)
+    .map((value) => normalizeNarrativeText(value))
+    .filter(Boolean)
+    .map((value) => `- ${sentence(value)}`)
     .slice(0, 4);
 
   return insights;
@@ -1829,7 +2251,9 @@ function extractStructuredDevelopments(research: Obj | null, primaryTopicLabel: 
       const date = asString(entry.date_or_period);
       if (!event) return null;
       if (!isRelevantToPrimaryTopic(primaryTopicLabel, event)) return null;
-      return `- ${shortenText(event, 200)}${date ? ` (${date})` : ''}`;
+      const normalizedEvent = normalizeNarrativeText(event);
+      if (!normalizedEvent) return null;
+      return `- ${normalizedEvent}${date ? ` (${date})` : ''}`;
     })
     .filter((value): value is string => Boolean(value))
     .slice(0, 3);
@@ -1841,7 +2265,9 @@ function extractStructuredRisks(research: Obj | null): string | null {
   const risks = asArray(research?.risks_or_caveats)
     .map((entry) => asString(entry))
     .filter((value): value is string => Boolean(value))
-    .map((value) => `- ${sentence(shortenText(value, 220))}`)
+    .map((value) => normalizeNarrativeText(value))
+    .filter(Boolean)
+    .map((value) => `- ${sentence(value)}`)
     .slice(0, 3);
 
   return risks.length ? risks.join('\n') : null;
@@ -1849,12 +2275,14 @@ function extractStructuredRisks(research: Obj | null): string | null {
 
 function extractStructuredConclusion(analysis: Obj | null): string | null {
   const conclusion = asString(analysis?.decision_relevant_conclusion);
-  return conclusion ? sentence(shortenText(conclusion, 320)) : null;
+  const normalized = conclusion ? normalizeNarrativeText(conclusion) : '';
+  return normalized ? sentence(normalized) : null;
 }
 
 function formatSourceUsageForDisplay(
   usedFor?: string,
   primaryTopicLabel?: string | null,
+  task?: string,
 ): string | null {
   if (!usedFor) return null;
 
@@ -1873,12 +2301,30 @@ function formatSourceUsageForDisplay(
   const cleaned = cleanedSegments.join('; ').trim();
 
   if (!cleaned) return null;
+  if (isPredictionMarketResearchTask(task || '')) {
+    if (
+      /\b(?:live data json|prediction_market_understanding|current_events|dynamic_sources|article_snapshots|source_diagnostics|research_brief|entity\.rationale|simple price api|chains api|rest summary api|opens(?:earch)? api|retrieved source set|firecrawl article snapshot|live data article snapshot)\b/i.test(
+        cleaned,
+      )
+    ) {
+      return null;
+    }
+  }
   if (/\bstatus active\b|\b24h volume\b|\boracle\b/i.test(cleaned)) {
     return null;
   }
 
   const normalized = cleaned.replace(/^(fact|metric|development):\s*/i, '').trim();
   if (!normalized) return null;
+  if (isPredictionMarketResearchTask(task || '')) {
+    if (
+      /^(?:the current|current |live |this source|research supports|prediction market|official page\b)/i.test(
+        normalized,
+      )
+    ) {
+      return null;
+    }
+  }
   if (normalized.length > 80 || normalized.split(/\s+/).length > 12) return null;
 
   return normalized;
@@ -1894,12 +2340,13 @@ function buildSourcesSection(
   sources: NormalizedReportSource[],
   primaryTopicLabel?: string | null,
   fallbackAccessDate?: string,
+  task?: string,
 ): string {
-  return sources.length
-    ? sources
-        .slice(0, 6)
+  const dedupedSources = mergeNormalizedSources(sources, [], 6);
+  return dedupedSources.length
+    ? dedupedSources
         .map((source) => {
-          const usage = formatSourceUsageForDisplay(source.usedFor, primaryTopicLabel);
+          const usage = formatSourceUsageForDisplay(source.usedFor, primaryTopicLabel, task);
           const publishedAt = asDate(source.publishedAt);
           const accessedAt = asDate(source.accessedAt) ?? fallbackAccessDate;
           const dateLabel = publishedAt
@@ -1927,7 +2374,7 @@ function buildFallbackSourcesFromLiveData(
     id: `fallback_source_${index + 1}`,
     name: normalizeSourceName(entry.name, entry.url),
     url: entry.url,
-    usedFor: undefined,
+    usedFor: entry.usedFor,
     canonical: !isGoogleNewsRssUrl(entry.url),
     publishedAt: entry.publishedAt,
     accessedAt: entry.accessedAt,
@@ -2031,6 +2478,20 @@ function sanitizeWriterMarkdown(markdown: string): string {
   }
 
   const withoutBlockedQuotes = normalized
+    .replace(/^research the prediction market topic:[^\n]*$/gim, '')
+    .replace(/^listed outcomes in agentflow:[^\n]*$/gim, '')
+    .replace(/^prediction market category in agentflow:[^\n]*$/gim, '')
+    .replace(/^prediction market provider in agentflow:[^\n]*$/gim, '')
+    .replace(/^agentflow market address reference:[^\n]*$/gim, '')
+    .replace(/^use the market category to disambiguate the subject before searching[^\n]*$/gim, '')
+    .replace(/^focus on the real-world event, relevant stats\/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes\.[^\n]*$/gim, '')
+    .replace(/^numbered sources\s*$/gim, '')
+    .replace(/^activating topical detection from source feed:?\s*$/gim, '')
+    .replace(/^research pipeline\s*$/gim, '')
+    .replace(/^research agent started\s*$/gim, '')
+    .replace(/^research agent complete\s*$/gim, '')
+    .replace(/^analyst agent started\s*$/gim, '')
+    .replace(/^writer agent started\s*$/gim, '')
     .replace(/<a\s+[^>]*href="([^"]+)"[^>]*>/gi, '$1')
     .replace(/<\/a>/gi, '')
     .replace(/<((?:https?:\/\/)[^>\s]+)>/gi, '$1')
@@ -2039,7 +2500,17 @@ function sanitizeWriterMarkdown(markdown: string): string {
     .replace(/\(\s*announcement available at:\s*<?((?:https?:\/\/)[^)>\s]+)>?\s*\)/gi, '(announcement available at: $1)')
     .replace(/\(\s*source URL:\s*<?((?:https?:\/\/)[^)>\s]+)>?\s*\)/gi, '(source URL: $1)')
     .split('\n')
-    .filter((line) => !line.trim().startsWith('>'))
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (trimmed.startsWith('>')) return false;
+      if (/^research agent is running firecrawl \+ searxng live retrieval/i.test(trimmed)) return false;
+      if (/^research agent is paying analyst agent/i.test(trimmed)) return false;
+      if (/^research agent paid analyst agent/i.test(trimmed)) return false;
+      if (/^analyst agent is paying writer agent/i.test(trimmed)) return false;
+      if (/^analyst agent paid writer agent/i.test(trimmed)) return false;
+      return true;
+    })
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -2049,6 +2520,77 @@ function sanitizeWriterMarkdown(markdown: string): string {
   }
 
   return withoutBlockedQuotes.trim();
+}
+
+function normalizePredictionMarketMarkdown(markdown: string, task: string): string {
+  const cleanTopic = cleanPredictionMarketTopicLabel(task) || 'Prediction market research';
+  const precleaned = markdown
+    .replace(
+      /#?\s*research the prediction market topic:\s*[\s\S]*?(?=(?:\n|^)\s*##\s+|(?:\n|^)\s*#\s+|$)/i,
+      `# ${cleanTopic}\n\n`,
+    )
+    .replace(/\bListed outcomes in AgentFlow:[\s\S]*?(?=(?:\n|^)\s*##\s+|$)/i, '')
+    .replace(/\bPrediction market category in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bPrediction market provider in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bAgentFlow market address reference:[^\n]*/gi, '')
+    .replace(
+      /\bUse the market category to disambiguate the subject before searching[\s\S]*?(?=(?:\n|^)\s*##\s+|$)/gi,
+      '',
+    )
+    .replace(
+      /\bFocus on the real-world event, relevant stats\/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes\.[\s\S]*?(?=(?:\n|^)\s*##\s+|$)/gi,
+      '',
+    );
+  const lines = precleaned.replace(/\r\n/g, '\n').split('\n');
+  const rebuilt: string[] = [];
+  let headingReplaced = false;
+
+  for (const originalLine of lines) {
+    const line = originalLine.trim();
+    if (!line) {
+      rebuilt.push(originalLine);
+      continue;
+    }
+    if (
+      /\bPrediction market category in AgentFlow:/i.test(line) ||
+      /\bPrediction market provider in AgentFlow:/i.test(line) ||
+      /\bAgentFlow market address reference:/i.test(line) ||
+      /\bListed outcomes in AgentFlow:/i.test(line)
+    ) {
+      continue;
+    }
+    if (
+      /\bUse the market category to disambiguate the subject before searching\b/i.test(line) ||
+      /\bFocus on the real-world event, relevant stats\/news, timing, outcome probabilities\b/i.test(line)
+    ) {
+      continue;
+    }
+    if (/^#\s+research the prediction market topic:/i.test(line)) {
+      rebuilt.push(`# ${cleanTopic}`);
+      headingReplaced = true;
+      continue;
+    }
+    if (!headingReplaced && /^research the prediction market topic:/i.test(line)) {
+      rebuilt.push(`# ${cleanTopic}`);
+      headingReplaced = true;
+      continue;
+    }
+    rebuilt.push(originalLine);
+  }
+
+  const normalized = rebuilt
+    .join('\n')
+    .replace(/\bresearch the prediction market topic:[^\n]*/gi, '')
+    .replace(/\bListed outcomes in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bPrediction market category in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bPrediction market provider in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bAgentFlow market address reference:[^\n]*/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (!headingReplaced && normalized && !/^#\s+/m.test(normalized)) {
+    return `# ${cleanTopic}\n\n${normalized}`.trim();
+  }
+  return normalized;
 }
 
 function isLinkOnlySourceBullet(line: string): boolean {
@@ -2205,6 +2747,244 @@ export function buildGeneralReportMarkdown(
   ].join('\n').trim();
 }
 
+function buildPredictionMarketSparseFallback(
+  task: string,
+  sources: NormalizedReportSource[],
+  liveData: Obj | null,
+): string {
+  const topic = extractPredictionMarketQuestion(task) || cleanPredictionMarketTopicLabel(task) || 'Prediction market research';
+  const understanding = asObject(liveData?.prediction_market_understanding);
+  const resolvedSubject =
+    typeof understanding?.subject === 'string' && understanding.subject.trim()
+      ? understanding.subject.trim()
+      : topic;
+  const diagnostics = asObject(liveData?.source_diagnostics);
+  const unresolvedEntity = diagnostics?.unresolved_entity === true || sources.length === 0;
+  const searchBackendUnhealthy = diagnostics?.search_backend_unhealthy === true;
+  const backendFailures = asArray(diagnostics?.search_backend_failures)
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .slice(0, 3);
+  const sourceLines =
+    sources.length > 0
+      ? buildSourcesSection(sources, null, todayDateString(), task)
+      : '- No public source passed the retrieval and relevance filters in this run.';
+
+  return [
+    `# ${topic}`,
+    '',
+    '## Overview',
+    '',
+    searchBackendUnhealthy
+      ? 'Current live retrieval infrastructure failed in this run, so the system could not gather enough public evidence for a decision-grade report.'
+      : unresolvedEntity
+      ? `Current independent retrieval could not verify the subject itself (${resolvedSubject}) well enough to support a confident current report.`
+      : 'Live retrieval did not return enough relevant public evidence in this run to support a confident current report.',
+    '',
+    '## Key Evidence',
+    '',
+    searchBackendUnhealthy
+      ? `- The configured search backends failed during retrieval${backendFailures.length > 0 ? `: ${backendFailures.join('; ')}.` : '.'}`
+      : unresolvedEntity
+      ? '- The subject itself could not be verified against current independent sources after entity-relevance filtering removed homonyms and adjacent-topic drift.'
+      : '- The resolved subject could not be supported by enough relevant, sourceable evidence after retrieval filtering.',
+    '- This run should be treated as an evidence gap, not as confirmation of either market outcome.',
+    '',
+    '## What Changed',
+    '',
+    'No sufficiently relevant new evidence was retained in the final source set for this run.',
+    '',
+    '## Evidence and Data',
+    '',
+    '- Exact quantitative metrics are limited in the current retrieved source set.',
+    '',
+    '## Why It Matters',
+    '',
+    searchBackendUnhealthy
+      ? 'When live search infrastructure is unavailable, a thin report is a retrieval failure rather than proof that the web lacks relevant evidence.'
+      : unresolvedEntity
+      ? 'When the subject itself is not independently verifiable, the safe conclusion is uncertainty rather than substituting a nearby or same-named topic.'
+      : 'When retrieval is this thin, the safe conclusion is uncertainty rather than substituting a nearby or homonym topic.',
+    '',
+    '## Risks and Tradeoffs',
+    '',
+    'The main risk in this run is source drift: ambiguous or low-signal search results can create a plausible-looking but misleading report.',
+    '',
+    '## Sources',
+    '',
+    sourceLines,
+    '',
+    '## Takeaway',
+    '',
+    'No decision-grade conclusion should be drawn from this run without better subject-specific sources.',
+  ].join('\n').trim();
+}
+
+function isGenericPredictionMarketDataSource(source: NormalizedReportSource): boolean {
+  return /\b(coingecko|coinmarketcap|defillama|wikipedia|binance|coinbase|kraken|nomics|coinpaprika|coincodex|cryptorank|tradingview)\b/i.test(
+    `${source.name} ${source.url} ${source.usedFor || ''}`,
+  );
+}
+
+function predictionMarketSourceMatchesResolvedEntity(
+  source: NormalizedReportSource,
+  liveData: Obj | null,
+): boolean {
+  const understanding = asObject(liveData?.prediction_market_understanding);
+  const entity = asObject(understanding?.entity);
+  const phrases = [
+    typeof entity?.canonicalName === 'string' ? entity.canonicalName : '',
+    ...(asArray(entity?.aliases).filter((value): value is string => typeof value === 'string')),
+    typeof understanding?.subject === 'string' ? understanding.subject : '',
+  ]
+    .map((value) => value.replace(/\s+/g, ' ').trim().toLowerCase())
+    .filter(Boolean);
+  if (phrases.length === 0) return false;
+
+  const haystack = `${source.name} ${source.url} ${source.usedFor || ''}`.toLowerCase();
+  for (const phrase of phrases) {
+    if (phrase.length >= 4 && haystack.includes(phrase)) return true;
+    const tokens = phrase
+      .replace(/[()'",.:;/?-]/g, ' ')
+      .split(/\s+/)
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => value.length >= 4);
+    if (tokens.some((token) => new RegExp(`\\b${escapeRegExp(token)}\\b`, 'i').test(haystack))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function shouldForcePredictionMarketSparseFallback(
+  task: string,
+  liveData: Obj | null,
+  sources: NormalizedReportSource[],
+): boolean {
+  if (!isPredictionMarketResearchTask(task)) return false;
+  if (sources.length === 0) return true;
+
+  const effectiveSourceHost = (source: NormalizedReportSource): string => {
+    const host = sourceHostname(source.url);
+    if (host && host !== 'news.google.com') return host;
+    return (source.name || '')
+      .toLowerCase()
+      .replace(/^www\./, '')
+      .replace(/\s+/g, ' ')
+      .trim() || host;
+  };
+  const dynamicSources = asArray(asObject(liveData?.dynamic_sources)?.articles);
+  const diagnostics = asObject(liveData?.source_diagnostics);
+  const searchBackendUnhealthy = diagnostics?.search_backend_unhealthy === true;
+  const understanding = asObject(liveData?.prediction_market_understanding);
+  const entity = asObject(understanding?.entity);
+  const ambiguity = typeof entity?.ambiguity === 'string' ? entity.ambiguity.toLowerCase() : '';
+  const questionType =
+    typeof understanding?.questionType === 'string' ? understanding.questionType.toLowerCase() : '';
+  const officialDomains = asArray(entity?.officialDomains)
+    .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+    .filter(Boolean);
+  const sourceHaystack = sources
+    .map((source) => `${source.name} ${source.url} ${source.usedFor || ''}`.toLowerCase())
+    .join(' \n ');
+  const hasOfficialMatch =
+    officialDomains.length > 0 &&
+    officialDomains.some((domain) => sourceHaystack.includes(domain));
+  const hasSubjectSpecificSource = sources.some((source) =>
+    predictionMarketSourceMatchesResolvedEntity(source, liveData),
+  );
+  const allGeneric = sources.length > 0 && sources.every(isGenericPredictionMarketDataSource);
+  const strongNarrativeSources = sources.filter((source) =>
+    !isGenericPredictionMarketDataSource(source) &&
+    isPredictionMarketSourceGoodEnoughForNarrative(task, source),
+  );
+  const strongNarrativeDomains = new Set(
+    strongNarrativeSources
+      .map((source) => effectiveSourceHost(source))
+      .filter(Boolean),
+  );
+  const isOfficialDomainSource = (source: NormalizedReportSource): boolean => {
+    if (officialDomains.length === 0) return false;
+    const haystack = `${source.name} ${source.url} ${source.usedFor || ''}`.toLowerCase();
+    return officialDomains.some((domain) => haystack.includes(domain));
+  };
+  const nonOfficialStrongNarrativeSources = strongNarrativeSources.filter(
+    (source) => !isOfficialDomainSource(source),
+  );
+  const nonOfficialStrongNarrativeDomains = new Set(
+    nonOfficialStrongNarrativeSources
+      .map((source) => effectiveSourceHost(source))
+      .filter(Boolean),
+  );
+  const hasAuthoritativeCategoryEvidence = sources.some((source) => {
+    const haystack = `${source.name} ${source.url} ${source.usedFor || ''}`;
+    if (/\bPrediction market category in AgentFlow:\s*Sports\b/i.test(task) || /\b(world cup|fifa|champions league|nba|nfl|mlb|nhl|tennis)\b/i.test(task)) {
+      return /\b(fifa\.com|uefa\.com|espn\.com|sportingnews\.com|actionnetwork\.com|oddschecker\.com|theanalyst\.com|cbssports\.com|foxsports\.com|bbc\.com|nba\.com|nfl\.com|mlb\.com|nhl\.com)\b/i.test(
+        haystack,
+      );
+    }
+    if (/\bPrediction market category in AgentFlow:\s*(Games|Gaming)\b/i.test(task) || /\bgta\s*6\b|\bgrand theft auto\b/i.test(task)) {
+      return /\b(rockstargames\.com|take2games\.com|ign\.com|gamespot\.com|polygon\.com|eurogamer\.net|businesswire\.com|reuters\.com|playstation\.com|xbox\.com|steampowered\.com)\b/i.test(
+        haystack,
+      );
+    }
+    if (/\bPrediction market category in AgentFlow:\s*Crypto\b/i.test(task)) {
+      return /\b(coindesk\.com|cointelegraph\.com|decrypt\.co|theblock\.co|kitco\.com|lbma\.org\.uk|cmegroup\.com|circle\.com|arc\.io|arc\.network|coingecko\.com|coinmarketcap\.com|defillama\.com)\b/i.test(
+        haystack,
+      );
+    }
+    return false;
+  });
+  const hasMultipleLiveDynamicSources = dynamicSources.length >= 2;
+
+  if (hasMultipleLiveDynamicSources && diagnostics?.unresolved_entity !== true) {
+    return false;
+  }
+
+  if (strongNarrativeDomains.size >= 2 || strongNarrativeSources.length >= 3) {
+    return false;
+  }
+
+  if (
+    searchBackendUnhealthy &&
+    nonOfficialStrongNarrativeDomains.size < 2 &&
+    nonOfficialStrongNarrativeSources.length < 2
+  ) {
+    return true;
+  }
+
+  if (
+    diagnostics?.unresolved_entity === true &&
+    !hasSubjectSpecificSource &&
+    !hasAuthoritativeCategoryEvidence
+  ) {
+    return true;
+  }
+
+  if (dynamicSources.length === 0 && allGeneric) {
+    return true;
+  }
+  if (!hasOfficialMatch && dynamicSources.length === 0 && (ambiguity === 'high' || ambiguity === 'medium')) {
+    return true;
+  }
+  if (
+    questionType === 'price_target' &&
+    !/\b(xaut|tether[- ]gold)\b/i.test(task) &&
+    dynamicSources.length === 0 &&
+    !hasSubjectSpecificSource
+  ) {
+    return true;
+  }
+  if (
+    /\b(xaut|tether[- ]gold)\b/i.test(task) &&
+    dynamicSources.length === 0 &&
+    !/\b(gold|kitco|lbma|reuters|cmegroup|bullion)\b/i.test(sourceHaystack)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 function duplicateNarrativeIssues(markdown: string): string[] {
   const issues: string[] = [];
   const narrativeLines = markdown
@@ -2234,6 +3014,193 @@ function duplicateNarrativeIssues(markdown: string): string[] {
   return issues;
 }
 
+function predictionMarketValidationIssues(
+  task: string,
+  markdown: string,
+  sources: NormalizedReportSource[],
+): string[] {
+  if (!isPredictionMarketResearchTask(task)) return [];
+
+  const issues: string[] = [];
+  const effectiveSourceHost = (source: NormalizedReportSource): string => {
+    const host = sourceHostname(source.url);
+    if (host && host !== 'news.google.com') return host;
+    return (source.name || '')
+      .toLowerCase()
+      .replace(/^www\./, '')
+      .replace(/\s+/g, ' ')
+      .trim() || host;
+  };
+  const hosts = [...new Set(sources.map((source) => effectiveSourceHost(source)).filter(Boolean))];
+  const sourceHaystack = sources
+    .map((source) => `${source.name} ${source.url} ${source.usedFor || ''}`.toLowerCase())
+    .join(' \n ');
+  const normalizedTask = task.toLowerCase();
+  const normalizedMarkdown = markdown.toLowerCase();
+  const entityTokens = predictionMarketEntityTokens(task);
+  const hasAuthoritativeCategoryEvidence = sources.some((source) => {
+    const host = sourceHostname(source.url) || '';
+    const haystack = `${source.name} ${source.url}`.toLowerCase();
+    if (/\bPrediction market category in AgentFlow:\s*Sports\b/i.test(task) || /\b(world cup|fifa|champions league|nba|nfl|mlb|nhl|tennis)\b/i.test(task)) {
+      return /\b(espn\.com|sportingnews\.com|actionnetwork\.com|oddschecker\.com|cbssports\.com|foxsports\.com|nba\.com|nfl\.com|mlb\.com|nhl\.com|fifa\.com|uefa\.com|theanalyst\.com)\b/i.test(
+        `${host} ${haystack}`,
+      );
+    }
+    if (/\bPrediction market category in AgentFlow:\s*(Games|Gaming)\b/i.test(task) || /\bgta\s*6\b|\bgrand theft auto\b/i.test(task)) {
+      return /\b(rockstargames\.com|take2games\.com|ign\.com|gamespot\.com|polygon\.com|eurogamer\.net|businesswire\.com|reuters\.com|playstation\.com|xbox\.com|steampowered\.com)\b/i.test(
+        `${host} ${haystack}`,
+      );
+    }
+    if (/\bPrediction market category in AgentFlow:\s*Crypto\b/i.test(task)) {
+      return /\b(arc\.network|arc\.io|coingecko\.com|coinmarketcap\.com|defillama\.com|coindesk\.com|cointelegraph\.com|decrypt\.co|theblock\.co|reuters\.com|bloomberg\.com|wsj\.com|ft\.com|kitco\.com|lbma\.org\.uk|cmegroup\.com)\b/i.test(
+        `${host} ${haystack}`,
+      );
+    }
+    return false;
+  });
+
+  if (sources.length < 2 || hosts.length < 2) {
+    issues.push('Prediction-market report has insufficient source diversity.');
+  }
+
+  if (
+    entityTokens.length > 0 &&
+    !entityTokens.some((token) => new RegExp(`\\b${escapeRegExp(token)}\\b`, 'i').test(sourceHaystack)) &&
+    !/\btoo thin\b|\blimited evidence\b|\binsufficient evidence\b|\bnot enough\b/i.test(normalizedMarkdown)
+  ) {
+    issues.push('Prediction-market report lacks subject-specific source evidence.');
+  }
+
+  if (/\b(xaut|tether[- ]gold)\b/i.test(task)) {
+    const hasUnderlyingGoldEvidence = sources.some((source) =>
+      /\b(xaut|tether[- ]gold|gold|kitco|lbma|bullion|reuters|bloomberg|wsj|ft\.com|cmegroup)\b/i.test(
+        `${source.name} ${source.url} ${source.usedFor || ''}`,
+      ),
+    );
+    const onlyGenericAssetData =
+      sources.length > 0 &&
+      sources.every((source) =>
+        /\b(coingecko|coinmarketcap|defillama|wikipedia)\b/i.test(`${source.name} ${source.url}`),
+      );
+    if (!hasUnderlyingGoldEvidence || onlyGenericAssetData) {
+      issues.push('XAUT market report lacks underlying gold-market evidence.');
+    }
+  }
+
+  if (/\b(world cup|fifa|winner|champions league|nba|nfl|mlb|nhl|tennis)\b/i.test(task)) {
+    const hasProbabilityEvidence =
+      /\b(odds|probability|probabilities|favorite|favorites|implied)\b/i.test(sourceHaystack) ||
+      /\b(oddschecker|actionnetwork|theanalyst|foxsports|covers|draftkings|fanduel|vegasinsider|cbssports)\b/i.test(
+        sourceHaystack,
+      );
+    if (!hasProbabilityEvidence) {
+      issues.push('Sports winner market report lacks odds or probability evidence.');
+    }
+  }
+
+  if (/\b(launch|release|ship|mainnet)\b/i.test(task)) {
+    const hasOfficialEvidence = sources.some((source) =>
+      /\b(rockstargames\.com|take2games\.com|fifa\.com|arc\.network|arc\.io|docs\.arc\.io|circle\.com|newsroom|press release|developer update|steam)\b/i.test(
+        `${source.name} ${source.url}`,
+      ),
+    );
+    const hasStrongStatusCoverage = hasOfficialEvidence || (hasAuthoritativeCategoryEvidence && sources.length >= 3);
+    if (!hasStrongStatusCoverage && (sources.length < 3 || !/\btoo thin\b|\blimited evidence\b|\buncertain\b/i.test(normalizedMarkdown))) {
+      issues.push('Launch or mainnet market report lacks official or sufficiently strong status evidence.');
+    }
+  }
+
+  return issues;
+}
+
+function predictionMarketEntityResolutionIssues(
+  task: string,
+  markdown: string,
+  liveData: Obj | null,
+  sources: NormalizedReportSource[],
+): string[] {
+  if (!isPredictionMarketResearchTask(task)) return [];
+
+  const understanding = asObject(liveData?.prediction_market_understanding);
+  const entity = asObject(understanding?.entity);
+  if (!entity) return [];
+
+  const officialDomains = asArray(entity.officialDomains)
+    .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+    .filter(Boolean);
+  const avoidTerms = asArray(entity.avoidTerms)
+    .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+    .filter(Boolean);
+  const ambiguity =
+    typeof entity.ambiguity === 'string' ? entity.ambiguity.toLowerCase() : 'medium';
+  const canonicalName =
+    typeof entity.canonicalName === 'string' ? entity.canonicalName.trim() : '';
+  const questionType =
+    typeof understanding?.questionType === 'string' ? understanding.questionType.toLowerCase() : '';
+  const sourceHaystack = sources
+    .map((source) => `${source.name} ${source.url} ${source.usedFor || ''}`.toLowerCase())
+    .join(' \n ');
+  const normalizedMarkdown = markdown.toLowerCase();
+  const hasAuthoritativeSportsEvidence = sources.some((source) =>
+    /\b(fifa\.com|espn\.com|cbssports\.com|sportingnews\.com|theanalyst\.com|oddschecker\.com|actionnetwork\.com|bbc\.com|sky sports)\b/i.test(
+      `${source.name} ${source.url} ${source.usedFor || ''}`,
+    ),
+  );
+  const hasAuthoritativeGamesEvidence = sources.some((source) =>
+    /\b(rockstargames\.com|take2games\.com|ign\.com|gamespot\.com|polygon\.com|eurogamer\.net|businesswire\.com|reuters\.com|playstation\.com|xbox\.com|steampowered\.com)\b/i.test(
+      `${source.name} ${source.url} ${source.usedFor || ''}`,
+    ),
+  );
+  const hasAuthoritativeCryptoEvidence = sources.some((source) =>
+    /\b(arc\.network|arc\.io|docs\.arc\.io|circle\.com|coingecko\.com|coinmarketcap\.com|coindesk\.com|cointelegraph\.com|decrypt\.co|theblock\.co|reuters\.com|bloomberg\.com|wsj\.com|ft\.com|kitco\.com|lbma\.org\.uk|cmegroup\.com|gold\.org|tether\.to)\b/i.test(
+      `${source.name} ${source.url} ${source.usedFor || ''}`,
+    ),
+  );
+  const allowsAuthoritativeNonOfficialEvidence =
+    (/\bPrediction market category in AgentFlow:\s*Sports\b/i.test(task) &&
+      hasAuthoritativeSportsEvidence) ||
+    ((/\bPrediction market category in AgentFlow:\s*(Games|Gaming)\b/i.test(task) ||
+      /\bgta\s*6\b|\bgrand theft auto\b/i.test(task)) &&
+      ambiguity !== 'high' &&
+      hasAuthoritativeGamesEvidence) ||
+    (/\bPrediction market category in AgentFlow:\s*Crypto\b/i.test(task) &&
+      ambiguity !== 'high' &&
+      hasAuthoritativeCryptoEvidence &&
+      /^(price_target|metric_threshold|event_outcome)$/.test(questionType));
+  const issues: string[] = [];
+
+  if (
+    officialDomains.length > 0 &&
+    !officialDomains.some((domain) => sourceHaystack.includes(domain)) &&
+    !allowsAuthoritativeNonOfficialEvidence &&
+    !/\btoo thin\b|\blimited evidence\b|\binsufficient evidence\b|\bnot enough\b|\buncertain\b/i.test(
+      normalizedMarkdown,
+    )
+  ) {
+    issues.push('Prediction-market report lacks evidence from the resolved entity or its expected official domains.');
+  }
+
+  if (
+    avoidTerms.length > 0 &&
+    avoidTerms.some((term) => term && sourceHaystack.includes(term)) &&
+    !/\bambigu(?:ous|ity)\b|\bhomonym\b|\bunrelated\b/i.test(normalizedMarkdown)
+  ) {
+    issues.push('Prediction-market report used known homonym evidence without clearly flagging the mismatch.');
+  }
+
+  if (
+    ambiguity === 'high' &&
+    canonicalName &&
+    !/\btoo thin\b|\blimited evidence\b|\binsufficient evidence\b|\buncertain\b|\bunresolved\b/i.test(
+      normalizedMarkdown,
+    )
+  ) {
+    issues.push('High-ambiguity prediction-market entity produced a report without an explicit unresolved-entity caveat.');
+  }
+
+  return issues;
+}
+
 export function collectPreferredReportSources(params: {
   research: Obj | null;
   liveData: Obj | null;
@@ -2247,16 +3214,55 @@ export function collectPreferredReportSources(params: {
   }).sources;
 }
 
-export function validateReportMarkdown(markdown: string, liveData: Obj | null): string[] {
+export function validateReportMarkdown(
+  task: string,
+  markdown: string,
+  liveData: Obj | null,
+): string[] {
   const framing = framingSignals(liveData);
   const issues: string[] = [];
+  const allowedPredictionMarketFutureDates = extractAllowedPredictionMarketFutureDates(
+    task,
+    liveData,
+  );
+  if (/\bresearch the prediction market topic:/i.test(markdown)) {
+    issues.push('Report leaked prompt scaffolding into final markdown.');
+  }
+  if (
+    /\bPrediction market category in AgentFlow:/i.test(markdown) ||
+    /\bPrediction market provider in AgentFlow:/i.test(markdown) ||
+    /\bAgentFlow market address reference:/i.test(markdown)
+  ) {
+    issues.push('Report leaked prompt scaffolding into final markdown.');
+  }
+  if (
+    /\bResearch Pipeline\b/i.test(markdown) ||
+    /\bresearch agent started\b/i.test(markdown) ||
+    /\bResearch Agent is running Firecrawl \+ SearXNG live retrieval\b/i.test(markdown) ||
+    /\banalyst agent started\b/i.test(markdown)
+  ) {
+    issues.push('Report leaked pipeline status text into final markdown.');
+  }
+  if (
+    /\bNumbered Sources\b/i.test(markdown) ||
+    /\bActivating topical detection from source feed\b/i.test(markdown)
+  ) {
+    issues.push('Report leaked raw source-feed scaffolding into final markdown.');
+  }
+  if (/\bREADME\.md\b/i.test(markdown) && /\bhttps?:\/\/\S+/i.test(markdown)) {
+    issues.push('Report leaked malformed source-reference text into final markdown.');
+  }
   const futureMatches = [
     ...markdown.matchAll(/\b20\d{2}-\d{2}(?:-\d{2})?\b/g),
+    ...markdown.matchAll(
+      /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)20\d{2}\b/gi,
+    ),
     ...markdown.matchAll(
       /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}\b/gi,
     ),
   ]
     .map((match) => match[0])
+    .filter((value) => !allowedPredictionMarketFutureDates.has(value.trim()))
     .filter((value) => isFutureDateValue(value));
 
   for (const value of [...new Set(futureMatches)]) {
@@ -2269,6 +3275,22 @@ export function validateReportMarkdown(markdown: string, liveData: Obj | null): 
 
   if (!asObject(liveData?.coingecko) && /\bCoinGecko\b/i.test(markdown)) {
     issues.push('Report cites CoinGecko even though CoinGecko data was not retrieved.');
+  }
+
+  if (/\b(xaut|tether[- ]gold)\b/i.test(task)) {
+    if (/\bxauth\b/i.test(markdown)) {
+      issues.push('XAUT report misspelled the asset ticker as XAUTH.');
+    }
+    const inflatedGoldAmount =
+      /\b(?:gold|xaut|tether gold|lbma|spot)[^.\n]{0,100}\$\s*(?:[2-9]\d,\d{3}|[2-9]\d{4,})\b[^.\n]{0,100}\b(?:per\s+(?:troy\s+)?ounce|\/ozt|\/oz|price|benchmark)?/i.test(
+        markdown,
+      ) ||
+      /\$\s*(?:[2-9]\d,\d{3}|[2-9]\d{4,})\b[^.\n]{0,100}\b(?:per\s+(?:troy\s+)?ounce|\/ozt|\/oz|gold|xaut|tether gold|lbma|spot)\b/i.test(
+        markdown,
+      );
+    if (inflatedGoldAmount) {
+      issues.push('XAUT report contains an implausibly inflated gold or XAUT price.');
+    }
   }
 
   if (
@@ -2315,12 +3337,25 @@ export function validateReportMarkdown(markdown: string, liveData: Obj | null): 
 function isBlockingValidationIssue(issue: string): boolean {
   return (
     /future date/i.test(issue) ||
+    /prompt scaffolding/i.test(issue) ||
+    /pipeline status text/i.test(issue) ||
+    /source-feed scaffolding/i.test(issue) ||
+    /malformed source-reference text/i.test(issue) ||
     /retrieval tooling/i.test(issue) ||
     /CoinGecko data was not retrieved/i.test(issue) ||
+    /XAUT report/i.test(issue) ||
     /conflict is inactive/i.test(issue) ||
     /shipping strike/i.test(issue) ||
     /fully blocked/i.test(issue) ||
-    /insurance spikes/i.test(issue)
+    /insurance spikes/i.test(issue) ||
+    /insufficient source diversity/i.test(issue) ||
+    /subject-specific source evidence/i.test(issue) ||
+    /resolved entity or its expected official domains/i.test(issue) ||
+    /known homonym evidence/i.test(issue) ||
+    /high-ambiguity prediction-market entity/i.test(issue) ||
+    /lacks underlying gold-market evidence/i.test(issue) ||
+    /lacks odds or probability evidence/i.test(issue) ||
+    /lacks official or sufficiently strong status evidence/i.test(issue)
   );
 }
 
@@ -2331,57 +3366,213 @@ export function finalizeReportMarkdown(params: FinalizeParams): {
   claims: NormalizedClaim[];
 } {
   const state = buildFinalState(params);
-  const fallbackMarkdown = currentEvents(params.liveData)
-    ? buildCurrentEventReportMarkdown(state)
-    : buildGeneralReportMarkdown(state, params.research, params.analysis);
-  const writerMarkdown = sanitizeWriterMarkdown(params.writerMarkdown);
-  const writerValidationIssues = writerMarkdown
-    ? validateReportMarkdown(writerMarkdown, params.liveData)
-    : [];
-  const shouldUseFallback =
-    !writerMarkdown || writerValidationIssues.some(isBlockingValidationIssue);
-  const markdown = shouldUseFallback ? fallbackMarkdown : writerMarkdown;
-  const repairedMarkdown = hasMojibakeMarkers(markdown) ? repairMojibake(markdown) : markdown;
   const primaryTopicLabel = inferPrimaryTopicLabel(state.topic, params.research);
   const fallbackSources = buildFallbackSourcesFromLiveData(
     params.liveData,
     params.task,
     primaryTopicLabel,
   );
-  const effectiveSources = isPredictionMarketResearchTask(params.task)
+  const mergedSources = isPredictionMarketResearchTask(params.task)
     ? mergeNormalizedSources(state.sources, fallbackSources)
     : state.sources.length > 0
       ? state.sources
       : fallbackSources;
+  const nonLowValueSources = mergedSources.filter(
+    (source) => {
+      const sourceText = `${source.name} ${source.url} ${source.usedFor || ''}`;
+      if (shouldPreservePredictionMarketSource(params.task, sourceText)) {
+        return true;
+      }
+      return !isLowValueSourceForTask(params.task, {
+        url: source.url,
+        title: source.name,
+        publisher: source.name,
+        summary: source.usedFor,
+      });
+    },
+  );
+  const effectiveSources = isPredictionMarketResearchTask(params.task)
+    ? [
+        ...nonLowValueSources.filter(
+          (source) =>
+            !isPredictionMarketOffTopicSource(
+              params.task,
+              `${source.name} ${source.url} ${source.usedFor || ''}`,
+            ),
+        ).filter((source) =>
+          matchesPredictionMarketSourceTokens(
+            params.task,
+            `${source.name} ${source.url} ${source.usedFor || ''}`,
+          ),
+        ),
+        ...nonLowValueSources.filter(
+          (source) =>
+            !isPredictionMarketOffTopicSource(
+              params.task,
+              `${source.name} ${source.url} ${source.usedFor || ''}`,
+            ) &&
+            !matchesPredictionMarketSourceTokens(
+              params.task,
+              `${source.name} ${source.url} ${source.usedFor || ''}`,
+            ),
+        ),
+      ].filter(
+        (source, index, collection) =>
+          collection.findIndex((candidate) => candidate.id === source.id) === index,
+      )
+    : nonLowValueSources;
+  const survivingSourceIds = new Set(effectiveSources.map((source) => source.id));
+  const effectiveClaims = state.claims
+    .map((claim) => ({
+      ...claim,
+      evidence_source_ids: claim.evidence_source_ids.filter((id) => survivingSourceIds.has(id)),
+    }))
+    .filter((claim) => claim.evidence_source_ids.length > 0);
+  const effectiveState: FinalClaimState = {
+    ...state,
+    sources: effectiveSources,
+    claims: effectiveClaims,
+  };
+  const useCurrentEventFallback =
+    Boolean(currentEvents(params.liveData)) &&
+    asString(params.liveData?.research_domain)?.toLowerCase() === 'geopolitics';
+  const fallbackMarkdown = useCurrentEventFallback
+    ? buildCurrentEventReportMarkdown(effectiveState)
+    : buildGeneralReportMarkdown(
+        effectiveState,
+        params.research,
+        params.analysis,
+      );
+  const writerMarkdown = sanitizeWriterMarkdown(params.writerMarkdown);
+  const writerValidationIssues = writerMarkdown
+      ? [
+        ...validateReportMarkdown(params.task, writerMarkdown, params.liveData),
+        ...predictionMarketValidationIssues(params.task, writerMarkdown, effectiveSources),
+        ...predictionMarketEntityResolutionIssues(
+          params.task,
+          writerMarkdown,
+          params.liveData,
+          effectiveSources,
+        ),
+      ]
+    : [];
+  const predictionMarketNoEvidenceFallback = shouldForcePredictionMarketSparseFallback(
+    params.task,
+    params.liveData,
+    effectiveSources,
+  );
+  const shouldUseFallback =
+    predictionMarketNoEvidenceFallback ||
+    !writerMarkdown ||
+    writerValidationIssues.some(isBlockingValidationIssue);
+  const markdown = predictionMarketNoEvidenceFallback
+    ? buildPredictionMarketSparseFallback(params.task, effectiveSources, params.liveData)
+    : shouldUseFallback
+      ? fallbackMarkdown
+      : writerMarkdown;
+  const repairedMarkdown = repairMojibake(markdown);
   const renderedSources = buildSourcesSection(
     effectiveSources,
     primaryTopicLabel,
     todayDateString(),
+    params.task,
   );
   const markdownWithDeterministicSources = replaceSourcesSection(repairedMarkdown, renderedSources);
-  const cleanedMarkdown = removeRedundantPreSourcesLinkList(markdownWithDeterministicSources);
-  if (repairedMarkdown !== markdown) {
+  const normalizedPredictionMarketMarkdown = isPredictionMarketResearchTask(params.task)
+    ? normalizePredictionMarketMarkdown(markdownWithDeterministicSources, params.task)
+    : markdownWithDeterministicSources;
+  let cleanedMarkdown = removeRedundantPreSourcesLinkList(normalizedPredictionMarketMarkdown);
+  if (repairedMarkdown !== markdown || hasMojibakeMarkers(markdown)) {
     console.warn('[reportPipeline] repaired mojibake in final markdown');
   }
-  const validationIssues = shouldUseFallback
+  let validationIssues = shouldUseFallback
     ? [
         ...new Set([
           ...state.issues,
-          ...validateReportMarkdown(cleanedMarkdown, params.liveData),
+          ...validateReportMarkdown(params.task, cleanedMarkdown, params.liveData),
+          ...predictionMarketValidationIssues(params.task, cleanedMarkdown, effectiveSources),
+          ...predictionMarketEntityResolutionIssues(
+            params.task,
+            cleanedMarkdown,
+            params.liveData,
+            effectiveSources,
+          ),
         ]),
       ]
     : [
         ...new Set([
           ...state.issues,
           ...writerValidationIssues,
-          ...validateReportMarkdown(cleanedMarkdown, params.liveData),
+          ...validateReportMarkdown(params.task, cleanedMarkdown, params.liveData),
+          ...predictionMarketValidationIssues(params.task, cleanedMarkdown, effectiveSources),
+          ...predictionMarketEntityResolutionIssues(
+            params.task,
+            cleanedMarkdown,
+            params.liveData,
+            effectiveSources,
+          ),
         ]),
       ];
+  const predictionMarketDiagnostics = asObject(params.liveData?.source_diagnostics);
+  const predictionMarketDynamicSources = asArray(asObject(params.liveData?.dynamic_sources)?.articles);
+  const predictionMarketDynamicDomains = new Set(
+    predictionMarketDynamicSources
+      .map((entry) => {
+        const url = asString(asObject(entry)?.url);
+        return url ? sourceHostname(url) : null;
+      })
+      .filter((value): value is string => Boolean(value && value !== 'news.google.com')),
+  );
+  const predictionMarketStrongEvidence =
+    isPredictionMarketResearchTask(params.task) &&
+    !predictionMarketNoEvidenceFallback &&
+    predictionMarketDiagnostics?.unresolved_entity !== true &&
+    (predictionMarketDiagnostics?.has_sufficient_diversity === true ||
+      Number(predictionMarketDiagnostics?.unique_source_domains ?? 0) >= 2) &&
+    (
+      effectiveSources.length >= 3 ||
+      predictionMarketDynamicSources.length >= 3 ||
+      predictionMarketDynamicDomains.size >= 2
+    ) &&
+    asString(predictionMarketDiagnostics?.drift_risk)?.toLowerCase() !== 'high';
+
+  if (
+    isPredictionMarketResearchTask(params.task) &&
+    !predictionMarketNoEvidenceFallback &&
+    !predictionMarketStrongEvidence &&
+    validationIssues.some(isBlockingValidationIssue)
+  ) {
+    const sparseMarkdown = buildPredictionMarketSparseFallback(
+      params.task,
+      effectiveSources,
+      params.liveData,
+    );
+    const sparseWithSources = replaceSourcesSection(
+      repairMojibake(sparseMarkdown),
+      renderedSources,
+    );
+    cleanedMarkdown = removeRedundantPreSourcesLinkList(
+      normalizePredictionMarketMarkdown(sparseWithSources, params.task),
+    );
+    validationIssues = [
+      ...new Set([
+        ...state.issues,
+        ...validateReportMarkdown(params.task, cleanedMarkdown, params.liveData),
+        ...predictionMarketValidationIssues(params.task, cleanedMarkdown, effectiveSources),
+        ...predictionMarketEntityResolutionIssues(
+          params.task,
+          cleanedMarkdown,
+          params.liveData,
+          effectiveSources,
+        ),
+      ]),
+    ];
+  }
 
   return {
     markdown: cleanedMarkdown,
     sources: effectiveSources,
     validationIssues,
-    claims: state.claims,
+    claims: effectiveClaims,
   };
 }

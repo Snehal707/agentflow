@@ -3,6 +3,7 @@ import {
   collectPreferredReportSources,
   finalizeReportMarkdown,
 } from '../lib/reportPipeline';
+import { buildPrimaryFirecrawlQueryVariants } from '../lib/live-data';
 
 const badWriterMarkdown = `# Iran-US Tensions Research Report
 
@@ -389,6 +390,433 @@ const bitcoinTransactionsWithOnchainSource = finalizeReportMarkdown({
 });
 assert.match(bitcoinTransactionsWithOnchainSource.markdown, /Mempool\.space/);
 assert.match(bitcoinTransactionsWithOnchainSource.markdown, /https:\/\/mempool\.space\/blocks/);
+
+const predmarketWithMergedFallbackSources = finalizeReportMarkdown({
+  task: 'research the prediction market topic: Will ARC launch its Mainnet before June 30, 2026?',
+  writerMarkdown: `## Summary
+
+ARC launch timing remains uncertain.
+
+## Sources
+
+- [MEXC](https://www.mexc.com/news/1144042) - live exchange article (accessed 2026-06-13)`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-13T00:00:00.000Z',
+    dynamic_sources: {
+      articles: [
+        {
+          title: 'Arc roadmap update',
+          publisher: 'Circle',
+          url: 'https://www.circle.com/blog/arc-mainnet-roadmap',
+          summary: 'Circle discusses the Arc roadmap and 2026 launch plan.',
+          seen_at: '2026-06-13T00:00:00.000Z',
+        },
+        {
+          title: 'Arc progress update',
+          publisher: 'MEXC',
+          url: 'https://www.mexc.com/news/1144042',
+          summary: 'MEXC covers Arc progress and upcoming milestones.',
+          seen_at: '2026-06-13T00:00:00.000Z',
+        },
+      ],
+    },
+  },
+});
+assert.match(predmarketWithMergedFallbackSources.markdown, /https:\/\/www\.mexc\.com\/news\/1144042/);
+assert.match(predmarketWithMergedFallbackSources.markdown, /https:\/\/www\.circle\.com\/blog\/arc-mainnet-roadmap/);
+
+const predmarketExpandedQueries = buildPrimaryFirecrawlQueryVariants(
+  'GTA 6 release date news | GTA 6 launch delay latest | GTA 6 official announcement',
+  'research the prediction market topic: Will GTA 6 launch before November 30, 2026?',
+);
+assert.ok(
+  predmarketExpandedQueries.some((query) => /gta 6 release date news/i.test(query)),
+  'Expected prediction-market query builder to preserve subject-specific GTA 6 release queries.',
+);
+assert.ok(
+  predmarketExpandedQueries.some((query) => /rockstar games gta 6 launch confirmed launch timeline|official announcement/i.test(query)),
+  'Expected prediction-market query builder to preserve an official GTA release-status query.',
+);
+
+const predmarketPromptOnlyQueries = buildPrimaryFirecrawlQueryVariants(
+  `research the prediction market topic: Will ARC launch its Mainnet before June 30, 2026?
+Listed outcomes in AgentFlow: Yes / No.
+Prediction market category in AgentFlow: Crypto.
+Prediction market provider in AgentFlow: achmarket.
+AgentFlow market address reference: 0xe1F30dd444A8A85cD8C7882e06abA26dBA894B96.
+Use the market category to disambiguate the subject before searching. For example: crypto markets should be researched as crypto/blockchain topics, sports markets as teams/tournaments, and macro/commodity markets by their real-world underlying drivers.
+Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.`,
+  `research the prediction market topic: Will ARC launch its Mainnet before June 30, 2026?
+Listed outcomes in AgentFlow: Yes / No.
+Prediction market category in AgentFlow: Crypto.
+Prediction market provider in AgentFlow: achmarket.
+AgentFlow market address reference: 0xe1F30dd444A8A85cD8C7882e06abA26dBA894B96.
+Use the market category to disambiguate the subject before searching. For example: crypto markets should be researched as crypto/blockchain topics, sports markets as teams/tournaments, and macro/commodity markets by their real-world underlying drivers.
+Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.`,
+);
+assert.ok(
+  predmarketPromptOnlyQueries.some((query) => /site:arc\.network ARC Network mainnet/i.test(query)),
+  'Expected prompt-only ARC prediction-market queries to still generate ARC-specific site queries.',
+);
+assert.ok(
+  predmarketPromptOnlyQueries.every((query) => !/Prediction market category in AgentFlow|AgentFlow market address reference|Focus on the real-world event/i.test(query)),
+  'Expected prompt-only prediction-market queries to strip AgentFlow scaffolding instead of searching the whole prompt.',
+);
+assert.ok(
+  predmarketPromptOnlyQueries.every((query) => !/long term forecast|future outlook|growth potential/i.test(query)),
+  'Expected launch-deadline prediction markets to avoid generic forecast variants and stay on status/roadmap queries.',
+);
+
+const worldCupWinnerQueries = buildPrimaryFirecrawlQueryVariants(
+  `research the prediction market topic: Who Will Win the FIFA World Cup 2026?
+Listed outcomes in AgentFlow: France / Argentina / Brazil / Other.
+Prediction market category in AgentFlow: Sports.
+Prediction market provider in AgentFlow: achmarket.
+Use the market category to disambiguate the subject before searching.
+Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.`,
+  `research the prediction market topic: Who Will Win the FIFA World Cup 2026?
+Listed outcomes in AgentFlow: France / Argentina / Brazil / Other.
+Prediction market category in AgentFlow: Sports.
+Prediction market provider in AgentFlow: achmarket.
+Use the market category to disambiguate the subject before searching.
+Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.`,
+);
+assert.ok(
+  worldCupWinnerQueries.some((query) => /winner odds|favorites odds|outright odds|power rankings|opta prediction/i.test(query)),
+  'Expected sports winner markets to generate outright-odds or ranking queries.',
+);
+assert.ok(
+  worldCupWinnerQueries.every((query) => !/world cup 2026 latest(?: news)?/i.test(query)),
+  'Expected sports winner markets to avoid generic latest-news queries that pull live match chatter.',
+);
+
+const gtaPredmarketFiltersLowValueSources = finalizeReportMarkdown({
+  task: 'research the prediction market topic: Will GTA 6 launch before November 30, 2026?',
+  writerMarkdown: `## Summary
+
+Evidence remains mixed.
+
+## Sources
+
+- [dict.leo.org](https://dict.leo.org/englisch-deutsch/grand) - dictionary result
+- [speisekartenweb.de](https://www.speisekartenweb.de/restaurants/mannheim/grand-luise-12345) - menu page
+- [grandcityproperty.de](https://grandcityproperty.de/) - property page
+- [apps.microsoft.com](https://apps.microsoft.com/detail/9NTL0GZ6C1Q2?hl=en-us&gl=US) - Grand Theft Auto V Legacy app listing
+- [Rockstar Games](https://www.rockstargames.com/VI) - Grand Theft Auto VI official game page`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-14T00:00:00.000Z',
+    dynamic_sources: {
+      articles: [
+        {
+          title: 'Grand Theft Auto VI official page',
+          publisher: 'Rockstar Games',
+          url: 'https://www.rockstargames.com/VI',
+          summary: 'Official Rockstar Games page for Grand Theft Auto VI.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+      ],
+    },
+  },
+});
+assert.match(gtaPredmarketFiltersLowValueSources.markdown, /rockstargames\.com\/VI/i);
+assert.doesNotMatch(
+  gtaPredmarketFiltersLowValueSources.markdown,
+  /\b(?:dict\.leo\.org|speisekartenweb\.de|grandcityproperty\.de|apps\.microsoft\.com)\b/i,
+);
+
+const predmarketPromptLeakFallsBack = finalizeReportMarkdown({
+  task: 'research the prediction market topic: Will GTA 6 launch before November 30, 2026?',
+  writerMarkdown: `Research Pipeline
+research agent started
+research the prediction market topic: Will GTA 6 launch before November 30, 2026?
+Prediction market category in AgentFlow: Games.
+
+## Overview
+
+Thin evidence.`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-14T00:00:00.000Z',
+    dynamic_sources: {
+      articles: [
+        {
+          title: 'Grand Theft Auto VI official page',
+          publisher: 'Rockstar Games',
+          url: 'https://www.rockstargames.com/VI',
+          summary: 'Official Rockstar Games page for Grand Theft Auto VI.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+        {
+          title: 'Take-Two confirms GTA VI release timing',
+          publisher: 'Take-Two Interactive',
+          url: 'https://www.take2games.com/ir/news/gta-vi-release-timing',
+          summary: 'Corporate release-timing update for GTA VI.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+      ],
+    },
+  },
+});
+assert.doesNotMatch(
+  predmarketPromptLeakFallsBack.markdown,
+  /\bresearch the prediction market topic:|Prediction market category in AgentFlow:|Research Pipeline|research agent started/i,
+);
+
+const arcPredmarketDropsBrowserHomonyms = finalizeReportMarkdown({
+  task: `research the prediction market topic: Will ARC launch its Mainnet before June 30, 2026?
+Listed outcomes in AgentFlow: Yes / No.
+Prediction market category in AgentFlow: Crypto.
+Prediction market provider in AgentFlow: achmarket.
+AgentFlow market address reference: 0xe1F30dd444A8A85cD8C7882e06abA26dBA894B96.
+Use the market category to disambiguate the subject before searching.`,
+  writerMarkdown: `# ARC mainnet launch before June 30, 2026
+
+## Overview
+
+Thin evidence.
+
+## Sources
+
+- [arc.net](https://arc.net/download)
+- [chip.de](https://www.chip.de/downloads/Arc-Browser_185256830.html)
+- [DefiLlama](https://defillama.com/chain/Arc)`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-14T00:00:00.000Z',
+    dynamic_sources: {
+      articles: [
+        {
+          title: 'Arc browser download',
+          publisher: 'arc.net',
+          url: 'https://arc.net/download',
+          summary: 'Browser page.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+        {
+          title: 'Arc Browser download',
+          publisher: 'chip.de',
+          url: 'https://www.chip.de/downloads/Arc-Browser_185256830.html',
+          summary: 'Browser listing.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+      ],
+    },
+    defillama: {
+      source: 'DefiLlama chains API + stablecoins API',
+      chains: [{ chain: 'Arc', tvl: 7.77, stablecoins: 0 }],
+    },
+  },
+});
+assert.doesNotMatch(
+  arcPredmarketDropsBrowserHomonyms.markdown,
+  /\barc\.net\b|\bchip\.de\b/i,
+);
+
+const arcLaunchPredmarketOmitsDefiLlamaSource = finalizeReportMarkdown({
+  task: `research the prediction market topic: Will ARC launch its Mainnet before June 30, 2026?
+Listed outcomes in AgentFlow: Yes / No.
+Prediction market category in AgentFlow: Crypto.
+Prediction market provider in AgentFlow: achmarket.
+AgentFlow market address reference: 0xe1F30dd444A8A85cD8C7882e06abA26dBA894B96.
+Use the market category to disambiguate the subject before searching.`,
+  writerMarkdown: `# ARC mainnet launch before June 30, 2026
+
+## Overview
+
+ARC remains in a pre-mainnet stage.
+
+## Sources
+
+- [DefiLlama](https://defillama.com/chain/Arc)`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-15T00:00:00.000Z',
+    prediction_market_understanding: {
+      subject: 'ARC Network mainnet launch',
+      underlying: null,
+      questionType: 'launch_milestone',
+      resolutionDate: '2026-06-30',
+      searchQueries: ['ARC Network mainnet'],
+      entity: {
+        canonicalName: 'ARC Network',
+        aliases: ['ARC', 'ARC Network'],
+        officialDomains: ['arc.io', 'circle.com'],
+        avoidTerms: ['arc browser'],
+        ambiguity: 'medium',
+        rationale: 'Crypto category plus mainnet wording points to a blockchain project.',
+      },
+    },
+    dynamic_sources: {
+      articles: [
+        {
+          title: 'ARC Network official page',
+          publisher: 'arc.io',
+          url: 'https://arc.io/',
+          summary: 'Arc L1 blockchain official page.',
+          seen_at: '2026-06-15T00:00:00.000Z',
+        },
+      ],
+    },
+  },
+});
+assert.doesNotMatch(
+  arcLaunchPredmarketOmitsDefiLlamaSource.markdown,
+  /defillama\.com\/chain\/Arc/i,
+);
+
+const predmarketMarkdownNormalizerStripsPromptLines = finalizeReportMarkdown({
+  task: `research the prediction market topic: Who Will Win the FIFA World Cup 2026?
+Listed outcomes in AgentFlow: France / Argentina / Brazil / Other.
+Prediction market category in AgentFlow: Sports.
+Prediction market provider in AgentFlow: achmarket.
+Use the market category to disambiguate the subject before searching.
+Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.`,
+  writerMarkdown: `# research the prediction market topic: Who Will Win the FIFA World Cup 2026?
+Listed outcomes in AgentFlow: France / Argentina / Brazil / Other.
+Prediction market category in AgentFlow: Sports.
+Prediction market provider in AgentFlow: achmarket.
+Use the market category to disambiguate the subject before searching.
+Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.
+
+## Summary
+
+Thin evidence.`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-14T00:00:00.000Z',
+    dynamic_sources: {
+      articles: [
+        {
+          title: '2026 FIFA World Cup official information',
+          publisher: 'FIFA',
+          url: 'https://www.fifa.com/fifaplus/en/tournaments/mens/worldcup/canadamexicousa2026',
+          summary: 'Tournament format and official information.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+      ],
+    },
+  },
+});
+assert.doesNotMatch(
+  predmarketMarkdownNormalizerStripsPromptLines.markdown,
+  /\bresearch the prediction market topic:|Prediction market category in AgentFlow:|Prediction market provider in AgentFlow:|Listed outcomes in AgentFlow:/i,
+);
+
+const xautPredmarketRequiresUnderlyingEvidence = finalizeReportMarkdown({
+  task: 'research the prediction market topic: Will Tether Gold (XAUT) reach $4,750 by July 31st?',
+  writerMarkdown: `## Summary
+
+XAUT may rise if momentum improves.
+
+## Sources
+
+- [CoinGecko](https://www.coingecko.com/en/coins/tether-gold) - live market data (accessed 2026-06-14)`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-14T00:00:00.000Z',
+    coingecko: {
+      assets: [{ coinId: 'tether-gold', last_updated_at: '2026-06-14T00:00:00.000Z' }],
+    },
+  },
+});
+assert.match(
+  xautPredmarketRequiresUnderlyingEvidence.validationIssues.join('\n'),
+  /underlying gold-market evidence/i,
+);
+
+const worldCupPredmarketRequiresProbabilityEvidence = finalizeReportMarkdown({
+  task: 'research the prediction market topic: Who Will Win the FIFA World Cup 2026?',
+  writerMarkdown: `## Summary
+
+France, Argentina, and Brazil remain strong teams.
+
+## Sources
+
+- [FIFA](https://www.fifa.com/fifaplus/en/tournaments/mens/worldcup/canadamexicousa2026) - tournament structure
+- [Sporting News](https://www.sportingnews.com/us/soccer/news/world-cup-2026-schedule-teams/xyz) - schedule and teams`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-14T00:00:00.000Z',
+    dynamic_sources: {
+      articles: [
+        {
+          title: 'World Cup 2026 schedule and teams',
+          publisher: 'Sporting News',
+          url: 'https://www.sportingnews.com/us/soccer/news/world-cup-2026-schedule-teams/xyz',
+          summary: 'Schedule and participating teams.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+        {
+          title: '2026 FIFA World Cup official information',
+          publisher: 'FIFA',
+          url: 'https://www.fifa.com/fifaplus/en/tournaments/mens/worldcup/canadamexicousa2026',
+          summary: 'Tournament format and official information.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+      ],
+    },
+  },
+});
+assert.match(
+  worldCupPredmarketRequiresProbabilityEvidence.validationIssues.join('\n'),
+  /odds or probability evidence/i,
+);
+
+const sportsPredmarketRetainsNonWhitelistedSources = finalizeReportMarkdown({
+  task: 'research the prediction market topic: Who Will Win the FIFA World Cup 2026?',
+  writerMarkdown: `## Summary
+
+France, Argentina, and Brazil remain the main contenders.
+
+## Sources
+
+- [ESPN](https://www.espn.com/soccer/story/_/id/12345) - contender analysis
+- [ABC News](https://abcnews.go.com/Sports/story?id=12345) - squad update
+- [USA Today](https://www.usatoday.com/story/sports/soccer/2026/06/14/example/12345/) - tournament watch list`,
+  research: null,
+  analysis: null,
+  liveData: {
+    snapshot_at: '2026-06-14T00:00:00.000Z',
+    dynamic_sources: {
+      articles: [
+        {
+          title: 'Contender analysis',
+          publisher: 'ESPN',
+          url: 'https://www.espn.com/soccer/story/_/id/12345',
+          summary: 'Team form analysis.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+        {
+          title: 'Squad update',
+          publisher: 'ABC News',
+          url: 'https://abcnews.go.com/Sports/story?id=12345',
+          summary: 'Roster and injury update.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+        {
+          title: 'Tournament watch list',
+          publisher: 'USA Today',
+          url: 'https://www.usatoday.com/story/sports/soccer/2026/06/14/example/12345/',
+          summary: 'Team watch list.',
+          seen_at: '2026-06-14T00:00:00.000Z',
+        },
+      ],
+    },
+  },
+});
+assert.match(sportsPredmarketRetainsNonWhitelistedSources.markdown, /espn\.com\/soccer\/story/i);
+assert.match(sportsPredmarketRetainsNonWhitelistedSources.markdown, /abcnews\.go\.com\/sports/i);
+assert.match(sportsPredmarketRetainsNonWhitelistedSources.markdown, /usatoday\.com\/story\/sports\/soccer/i);
 
 console.log('Before example:');
 console.log(badWriterMarkdown.split('\n').slice(0, 12).join('\n'));

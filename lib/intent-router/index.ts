@@ -1347,9 +1347,21 @@ function classifyIntentHeuristically(
   }
 
   if (
-    explicitResearchRequest &&
-    !/\b(?:image|screenshot|photo|audio|voice\s+note|attached|attachment)\b/i.test(trimmed)
+    (explicitResearchRequest && looksLikePredictionMarketResearch(trimmed)) ||
+    (explicitResearchRequest && looksLikeSwapResearch(trimmed) && capabilityRouting.swap.routeToResearch) ||
+    (explicitResearchRequest && looksLikeBridgeResearch(trimmed) && capabilityRouting.bridge.routeToResearch) ||
+    (explicitResearchRequest && looksLikeComparativeResearchQuery(trimmed))
   ) {
+    return buildHeuristicIntent(
+      AgentFlowDomain.Research,
+      AgentFlowIntentName.ResearchReport,
+      message,
+      looksLikePredictionMarketResearch(trimmed) ? 0.96 : 0.88,
+      { task: trimmed },
+    );
+  }
+
+  if (explicitResearchRequest && capabilityRouting.predmarket.routeToResearch) {
     return buildHeuristicIntent(
       AgentFlowDomain.Research,
       AgentFlowIntentName.ResearchReport,
@@ -1361,21 +1373,8 @@ function classifyIntentHeuristically(
 
   if (
     explicitResearchRequest &&
-    looksLikePredictionMarketResearch(trimmed) ||
-    (explicitResearchRequest && looksLikeSwapResearch(trimmed) && capabilityRouting.swap.routeToResearch) ||
-    (explicitResearchRequest && looksLikeBridgeResearch(trimmed) && capabilityRouting.bridge.routeToResearch) ||
-    (explicitResearchRequest && looksLikeComparativeResearchQuery(trimmed))
+    !/\b(?:image|screenshot|photo|audio|voice\s+note|attached|attachment)\b/i.test(trimmed)
   ) {
-    return buildHeuristicIntent(
-      AgentFlowDomain.Research,
-      AgentFlowIntentName.ResearchReport,
-      message,
-      0.88,
-      { task: trimmed },
-    );
-  }
-
-  if (explicitResearchRequest && capabilityRouting.predmarket.routeToResearch) {
     return buildHeuristicIntent(
       AgentFlowDomain.Research,
       AgentFlowIntentName.ResearchReport,

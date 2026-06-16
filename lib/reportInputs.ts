@@ -34,6 +34,7 @@ export function buildAnalystModelInput(params: {
       instructions: [
         'Base the analysis only on the provided research payload and live source state.',
         'If liveData.research_brief exists, treat it as the topic contract. Evaluate whether the research answered its query, scope, must_answer, and avoid_drift constraints.',
+        'If liveData.prediction_market_understanding exists, use it as the resolved entity contract: subject, underlying, official domains, ambiguity, and avoidTerms should override narrower side-topic interpretations from individual sources.',
         'For prediction-market research, if the task includes a market address marked as trade-routing metadata, treat the title and listed outcomes as the research subject. Do not evaluate whether the contract address is publicly documented unless the user explicitly asks about the contract.',
         'For creator, channel, subscriber, follower, or audience milestone topics, prefer the freshest official platform metric available over older article baselines when both exist.',
         'If liveData.source_diagnostics indicates medium or high drift risk, flag that explicitly and do not let a narrow retrieved article redefine the user topic.',
@@ -83,6 +84,7 @@ export function buildWriterModelInput(params: {
       instructions: [
         'Write only from the provided research, analysis, and live source state.',
         'If liveData.research_brief exists, structure the answer around that topic contract: query, scope, must_answer, and avoid_drift.',
+        'If liveData.prediction_market_understanding exists, keep the final report anchored to that resolved entity. Use the underlying driver when present, favor expected official domains, and explicitly call out unresolved ambiguity instead of drifting to a homonym topic.',
         'For prediction-market research, if the task includes a market address marked as trade-routing metadata, write about the market topic, event, listed outcomes, evidence, and decision-relevant uncertainty. Do not frame the answer around whether the contract address is documented unless the user explicitly asks about the contract.',
         'For creator, channel, subscriber, follower, or audience milestone topics, prefer the freshest official platform metric available over older article baselines when both exist.',
         'If liveData.source_diagnostics says source diversity is insufficient or drift risk is medium/high, include a concise Coverage Limits note and avoid a confident full-scope conclusion.',

@@ -743,9 +743,13 @@ function isRelevantToBrief(source: Source, brief: ResearchBrief): boolean {
 
   if (isArcNetworkQuery(brief.query)) {
     return (
-      /\barc\b/.test(haystack) ||
       haystack.includes('arc.network') ||
-      haystack.includes('circle.com')
+      haystack.includes('arc.io') ||
+      haystack.includes('circle.com') ||
+      (/\barc\b/.test(haystack) &&
+        /\b(blockchain|mainnet|testnet|stablecoin|l1|layer 1|ecosystem|defi|circle|launch)\b/i.test(
+          haystack,
+        ))
     );
   }
 

@@ -96,7 +96,7 @@ const RULES: Array<{
   },
   {
     pattern:
-      /\b(health|medical|drug|trial|clinical|disease|cdc|who|fda)\b/i,
+      /\b(health|medical|drug|trial|clinical|disease|cdc|fda)\b|\bworld health organization\b|\bwho\s+(?:pandemic|health|disease|outbreak|vaccine)\b/i,
     labels: ['health', 'medical'],
     intent: 'research',
   },

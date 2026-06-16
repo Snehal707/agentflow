@@ -10,6 +10,7 @@ import {
   understandMarketResearch,
   understandingToExpandedTask,
   understandingToSubjectFraming,
+  type MarketUnderstanding,
 } from '../../lib/market-understanding';
 import { RESEARCH_SYSTEM_PROMPT } from '../../lib/agentPrompts';
 import {
@@ -17,6 +18,7 @@ import {
   fetchLiveData,
   shouldGatherCurrentEvents,
 } from '../../lib/live-data';
+import { looksLikePredictionMarketResearch } from '../../lib/prediction-market-intent';
 import { isCreatorAudienceMetricTask } from '../../lib/source-policy';
 import {
   detectInternalCapabilities,
@@ -36,6 +38,8 @@ import {
   type CounterpartyRiskAssessment,
 } from '../../lib/counterparty-risk';
 import { detectProtocolQueryShape } from '../../lib/protocol-query-shape';
+import { sourceHostname } from '../../lib/source-policy';
+import type { ResearchBrief, SourceDiagnostics } from './types';
 
 dotenv.config();
 
@@ -54,6 +58,9 @@ const LIVE_DATA_TIMEOUT_MS_CREATOR_AUDIENCE = Number(
 );
 const LIVE_DATA_TIMEOUT_MS_CURRENT_EVENTS = Number(
   process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS_CURRENT_EVENTS || 60_000,
+);
+const LIVE_DATA_TIMEOUT_MS_PREDICTION_MARKET = Number(
+  process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS_PREDICTION_MARKET || 180_000,
 );
 const RESEARCH_TIMING_TRACE = /^(1|true|yes|on)$/i.test(
   String(process.env.RESEARCH_TIMING_TRACE || '').trim(),
@@ -104,6 +111,356 @@ function parseLiveDataPayload(liveData: string): Record<string, unknown> | null 
   }
 }
 
+function predictionMarketTaskContext(task: string): {
+  title: string;
+  outcomes: string[];
+  category: string | null;
+  provider: string | null;
+} | null {
+  if (!/\bprediction market\b/i.test(task)) return null;
+
+  const title = task
+    .replace(/^research\s+(?:the\s+)?(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
+    .replace(/\bListed outcomes in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bPrediction market category in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bPrediction market provider in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bAgentFlow market address reference:[^\n]*/gi, '')
+    .replace(/\bUse the market category to disambiguate the subject before searching[^\n]*/gi, '')
+    .replace(/\bFocus on the real-world event[^\n]*/gi, '')
+    .replace(/\b0x[a-fA-F0-9]{40}\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const outcomesMatch = task.match(/\bListed outcomes in AgentFlow:\s*([^\n]+)/i);
+  const outcomes = (outcomesMatch?.[1] || '')
+    .replace(/\.$/, '')
+    .split(/[\/|,]/)
+    .map((value) => value.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  const categoryMatch = task.match(/\bPrediction market category in AgentFlow:\s*([^\n.]+)/i);
+  const providerMatch = task.match(/\bPrediction market provider in AgentFlow:\s*([^\n.]+)/i);
+
+  return {
+    title: title || 'this prediction market',
+    outcomes,
+    category: categoryMatch?.[1]?.trim() || null,
+    provider: providerMatch?.[1]?.trim() || null,
+  };
+}
+
+function buildFastPredictionMarketBrief(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): ResearchBrief {
+  const context = predictionMarketTaskContext(task);
+  const subject = understanding?.subject?.trim() || context?.title || task.trim();
+  const category = context?.category?.toLowerCase() || '';
+  const underlying = understanding?.underlying?.trim() || null;
+  const title = context?.title || subject;
+  const questionType = understanding?.questionType || 'other';
+  const resolutionDate = understanding?.resolutionDate || null;
+
+  const domainsPriority = new Set<string>();
+  const preferredSourceTypes = new Set<string>(['official', 'primary', 'reputable news', 'market data']);
+  const mustAnswer = new Set<string>();
+  const avoidDrift = new Set<string>([
+    `Do not let retrieval redefine "${subject}" as an unrelated homonym, acronym, app, browser, game launcher, or company.`,
+    'Treat the listed market title and outcomes as the topic contract; do not replace them with a tangential topic from one source.',
+  ]);
+  const subQuestions = new Set<string>();
+
+  if (category) {
+    avoidDrift.add(`Use the AgentFlow market category "${category}" to disambiguate the subject before drawing conclusions.`);
+  }
+  if (context?.provider) {
+    avoidDrift.add(`Do not treat the provider name "${context.provider}" as the research subject; it is only market metadata.`);
+  }
+
+  mustAnswer.add(`What real-world event or threshold does "${title}" refer to?`);
+  mustAnswer.add(`What current evidence best supports or weakens each listed outcome for "${title}"?`);
+  subQuestions.add(`Which current public sources are directly about ${subject}?`);
+
+  if (context?.outcomes.length) {
+    mustAnswer.add(`How does the current evidence compare the listed outcomes: ${context.outcomes.join(' / ')}?`);
+  }
+  if (resolutionDate) {
+    mustAnswer.add(`What evidence matters before the market resolution date ${resolutionDate}?`);
+  }
+
+  if (questionType === 'price_target') {
+    mustAnswer.add(`What are the main price drivers for ${subject}${underlying ? ` and its underlying ${underlying}` : ''}?`);
+    mustAnswer.add('What current market data, forecasts, and macro factors matter most for the target price?');
+    subQuestions.add(`What current market data exists for ${subject}?`);
+    if (underlying) {
+      subQuestions.add(`What current market evidence exists for ${underlying}?`);
+    }
+    if (/\b(xaut|tether gold)\b/i.test(task) || /\bgold\b/i.test(subject) || /\bgold\b/i.test(underlying || '')) {
+      domainsPriority.add('coingecko');
+      domainsPriority.add('kitco');
+      domainsPriority.add('lbma');
+      domainsPriority.add('reuters');
+      domainsPriority.add('bloomberg');
+    }
+  } else if (questionType === 'launch_milestone' || questionType === 'release_date') {
+    mustAnswer.add(`What official launch, release, roadmap, or status updates exist for ${subject}?`);
+    mustAnswer.add('What evidence suggests the milestone is on schedule, delayed, or uncertain?');
+    subQuestions.add(`What official announcements exist for ${subject}?`);
+    if (/\barc\b/i.test(subject) || /\barc\b/i.test(title) || category === 'crypto') {
+      domainsPriority.add('arc.network');
+      domainsPriority.add('circle.com');
+      domainsPriority.add('github.com');
+      domainsPriority.add('coingecko');
+    }
+    if (/\bgta\s*6\b|\bgrand theft auto\b/i.test(task)) {
+      domainsPriority.add('rockstargames.com');
+      domainsPriority.add('take2games.com');
+      domainsPriority.add('reuters');
+    }
+  } else if (questionType === 'event_outcome') {
+    mustAnswer.add(`What current probabilities, odds, rankings, or form indicators matter for ${subject}?`);
+    subQuestions.add(`What current probability evidence exists for ${subject}?`);
+    if (category === 'sports') {
+      domainsPriority.add('fifa.com');
+      domainsPriority.add('uefa.com');
+      domainsPriority.add('espn.com');
+      domainsPriority.add('theanalyst.com');
+      preferredSourceTypes.add('sports analytics');
+    }
+  } else {
+    mustAnswer.add(`What are the most decision-relevant current facts about ${subject}?`);
+  }
+
+  // Wire the LLM-resolved entity (official domains, homonym avoid-terms, aliases) into the
+  // brief so retrieval prioritizes and penalizes by the understood subject instead of relying
+  // only on the hardcoded per-market checks above. Degrades cleanly when no entity resolved.
+  const avoidDomains = new Set<string>(['rss', 'news.google.com']);
+  const entity = understanding?.entity;
+  if (entity) {
+    for (const domain of entity.officialDomains) {
+      const normalized = domain.replace(/^https?:\/\//, '').replace(/^www\./, '').trim().toLowerCase();
+      if (normalized) domainsPriority.add(normalized);
+    }
+    for (const term of entity.avoidTerms) {
+      const normalized = term.trim().toLowerCase();
+      if (normalized) avoidDomains.add(normalized);
+    }
+    if (entity.aliases.length) {
+      subQuestions.add(
+        `Confirm sources are about ${entity.canonicalName} (also known as ${entity.aliases.slice(0, 4).join(', ')}), not a same-named homonym.`,
+      );
+    }
+    if (entity.rationale) {
+      avoidDrift.add(`Resolved subject is "${entity.canonicalName}": ${entity.rationale}`);
+    }
+  }
+
+  return {
+    query: subject,
+    intent: 'prediction_market_research',
+    scope: 'narrow',
+    time_sensitivity:
+      questionType === 'price_target' || questionType === 'launch_milestone' || questionType === 'release_date'
+        ? 'live'
+        : 'recent',
+    required_freshness_days: questionType === 'price_target' ? 14 : 30,
+    geography: [],
+    domains_priority: [...domainsPriority].slice(0, 10),
+    domains_avoid: [...avoidDomains].slice(0, 12),
+    preferred_source_types: [...preferredSourceTypes].slice(0, 6),
+    must_answer: [...mustAnswer].slice(0, 8),
+    avoid_drift: [...avoidDrift].slice(0, 6),
+    minimum_source_diversity: Math.max(category === 'sports' ? 3 : 2, entity?.ambiguity === 'high' ? 3 : 0),
+    sub_questions: [...subQuestions].slice(0, 6),
+    evaluation_rubric:
+      'Prefer current, directly relevant sources that match the market subject and category; do not let one ambiguous result redefine the topic.',
+  };
+}
+
+function suppressStructuredApiHintForTask(task: string, sourceName: 'coingecko' | 'defillama' | 'mempool'): boolean {
+  if (!/\bprediction market\b/i.test(task)) return false;
+  const explicitMetricRequest =
+    /\b(defillama|tvl|total value locked|stablecoins?|liquidity|defi|on[-\s]?chain|mempool|transaction|transactions|fees?)\b/i.test(
+      task,
+    );
+  if (explicitMetricRequest) return false;
+  const launchOrMainnet = /\b(mainnet|testnet|launch date|launch before|pre[-\s]?mainnet)\b/i.test(task);
+  const priceTarget = /\b(reach|hit|market cap|valuation|price target|\$\d)\b/i.test(task);
+  if (sourceName === 'defillama' && (launchOrMainnet || priceTarget)) return true;
+  if (sourceName === 'coingecko' && launchOrMainnet) return true;
+  if (sourceName === 'mempool' && !/\bbitcoin|btc\b/i.test(task)) return true;
+  return false;
+}
+
+function collectFastLiveDataSourceHints(liveData: Record<string, unknown>, task = ''): Array<{
+  name: string;
+  url: string;
+}> {
+  const sources: Array<{ name: string; url: string }> = [];
+  const addSource = (name: unknown, url: unknown) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
+    const label =
+      typeof name === 'string' && name.trim()
+        ? name.trim()
+        : sourceHostname(url) || 'Source';
+    sources.push({ name: label, url });
+  };
+
+  const currentEvents =
+    liveData.current_events && typeof liveData.current_events === 'object'
+      ? (liveData.current_events as Record<string, unknown>)
+      : null;
+  const eventSnapshots = Array.isArray(currentEvents?.article_snapshots)
+    ? (currentEvents?.article_snapshots as Array<Record<string, unknown>>)
+    : [];
+  for (const snapshot of eventSnapshots) {
+    addSource(snapshot.publisher, snapshot.url);
+  }
+
+  const dynamicSources =
+    liveData.dynamic_sources && typeof liveData.dynamic_sources === 'object'
+      ? (liveData.dynamic_sources as Record<string, unknown>)
+      : null;
+  const dynamicArticles = Array.isArray(dynamicSources?.articles)
+    ? (dynamicSources?.articles as Array<Record<string, unknown>>)
+    : [];
+  for (const article of dynamicArticles) {
+    addSource(article.publisher ?? article.title, article.url);
+  }
+
+  const wikipedia =
+    liveData.wikipedia && typeof liveData.wikipedia === 'object'
+      ? (liveData.wikipedia as Record<string, unknown>)
+      : null;
+  const pages = Array.isArray(wikipedia?.pages)
+    ? (wikipedia?.pages as Array<Record<string, unknown>>)
+    : [];
+  for (const page of pages) {
+    addSource(page.title ?? 'Wikipedia', page.url);
+  }
+
+  if (
+    liveData.coingecko &&
+    typeof liveData.coingecko === 'object' &&
+    !suppressStructuredApiHintForTask(task, 'coingecko')
+  ) {
+    addSource('CoinGecko', 'https://www.coingecko.com/');
+  }
+  if (
+    liveData.defillama &&
+    typeof liveData.defillama === 'object' &&
+    !suppressStructuredApiHintForTask(task, 'defillama')
+  ) {
+    addSource('DefiLlama', 'https://defillama.com/');
+  }
+  if (
+    liveData.bitcoin_onchain &&
+    typeof liveData.bitcoin_onchain === 'object' &&
+    !suppressStructuredApiHintForTask(task, 'mempool')
+  ) {
+    addSource('Mempool.space', 'https://mempool.space/');
+  }
+
+  const seen = new Set<string>();
+  return sources.filter((source) => {
+    const key = source.url.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildFastSourceDiagnostics(
+  task: string,
+  liveData: Record<string, unknown>,
+  brief: ResearchBrief,
+): SourceDiagnostics {
+  const existingDiagnostics =
+    liveData.source_diagnostics && typeof liveData.source_diagnostics === 'object'
+      ? (liveData.source_diagnostics as Record<string, unknown>)
+      : null;
+  const sources = collectFastLiveDataSourceHints(liveData, task);
+  const domains = [...new Set(sources.map((source) => sourceHostname(source.url)).filter(Boolean))];
+  // The resolved-entity official domains flow in via brief.domains_priority; treat a match as
+  // authoritative for this market even if it is not in the global high-reliability list.
+  const priorityDomains = brief.domains_priority
+    .map((domain) => domain.trim().toLowerCase())
+    .filter(Boolean);
+  const isPriorityDomain = (domain: string) =>
+    priorityDomains.some((priority) => domain.includes(priority) || priority.includes(domain));
+  const highReliabilityDomains = domains.filter(
+    (domain) =>
+      /\b(reuters\.com|apnews\.com|bloomberg\.com|ft\.com|wsj\.com|cnbc\.com|kitco\.com|lbma\.org\.uk|fifa\.com|uefa\.com|espn\.com|theanalyst\.com|rockstargames\.com|take2games\.com|arc\.network|circle\.com|coingecko\.com|defillama\.com|wikipedia\.org)\b/i.test(
+        domain,
+      ) || isPriorityDomain(domain),
+  );
+  const mediumReliabilityDomains = domains.filter(
+    (domain) =>
+      !highReliabilityDomains.includes(domain) &&
+      /\b(coindesk\.com|cointelegraph\.com|decrypt\.co|marketwatch\.com|investing\.com|yahoo\.com|nasdaq\.com)\b/i.test(
+        domain,
+      ),
+  );
+  const lowReliabilityCount = Math.max(
+    0,
+    domains.length - highReliabilityDomains.length - mediumReliabilityDomains.length,
+  );
+  const reasons: string[] = [];
+
+  if (domains.length < brief.minimum_source_diversity) {
+    reasons.push(
+      `Only ${domains.length} distinct source domain(s) were retrieved; ${brief.minimum_source_diversity} required for this market.`,
+    );
+  }
+  if (domains.length > 0 && highReliabilityDomains.length === 0 && mediumReliabilityDomains.length < 2) {
+    reasons.push('Retrieved sources are mostly weak or background-only for this market.');
+  }
+  if (
+    /\b(arc|arc network)\b/i.test(task) &&
+    domains.some((domain) => /\barc\.net$|arcgames\.com$|thearc\.org$/.test(domain))
+  ) {
+    reasons.push('Retrieved sources include ambiguous ARC homonyms instead of the blockchain project.');
+  }
+  if (/\b(xaut|tether gold)\b/i.test(task)) {
+    const hasGoldEvidence = domains.some((domain) =>
+      /\b(kitco\.com|lbma\.org\.uk|reuters\.com|bloomberg\.com|wsj\.com|ft\.com|cmegroup\.com)\b/i.test(
+        domain,
+      ),
+    );
+    if (!hasGoldEvidence) {
+      reasons.push('The retrieved source set lacks direct gold-market evidence for XAUT.');
+    }
+  }
+
+  if (existingDiagnostics?.search_backend_unhealthy === true) {
+    reasons.push('Configured live search backends were unavailable during this run.');
+  }
+
+  const driftRisk: SourceDiagnostics['drift_risk'] =
+    reasons.length === 0 ? 'low' : reasons.length >= 2 || domains.length === 0 ? 'high' : 'medium';
+
+  return {
+    ...(existingDiagnostics ?? {}),
+    source_count: sources.length,
+    distinct_domains: domains.length,
+    required_distinct_sources: brief.minimum_source_diversity,
+    high_reliability_sources: highReliabilityDomains.length,
+    medium_reliability_sources: mediumReliabilityDomains.length,
+    low_reliability_sources: lowReliabilityCount,
+    has_sufficient_diversity: domains.length >= brief.minimum_source_diversity,
+    drift_risk: driftRisk,
+    drift_reasons: [
+      ...new Set([
+        ...((Array.isArray(existingDiagnostics?.drift_reasons)
+          ? existingDiagnostics?.drift_reasons
+          : []) as string[]),
+        ...reasons,
+      ]),
+    ],
+    top_domains: domains.slice(0, 5),
+  };
+}
+
 function mergeInternalContext(
   upstream: Record<string, unknown> | null,
   generated: Record<string, unknown> | null,
@@ -129,7 +486,28 @@ function getCurrentEventSnapshotCount(payload: Record<string, unknown> | null): 
 
 type LiveDataTimeoutClass = 'forecasting' | 'niche_protocol' | 'creator_audience' | 'current_events' | 'default';
 
+function hasPredictionMarketResearchScaffolding(task: string): boolean {
+  return (
+    /\bresearch the prediction market topic:/i.test(task) ||
+    /\bListed outcomes in AgentFlow:/i.test(task) ||
+    /\bPrediction market category in AgentFlow:/i.test(task) ||
+    /\bPrediction market provider in AgentFlow:/i.test(task) ||
+    /\bAgentFlow market address reference:/i.test(task)
+  );
+}
+
 function classifyLiveDataTimeout(task: string): { timeoutMs: number; queryClass: LiveDataTimeoutClass } {
+  if (
+    looksLikePredictionMarketResearch(task) ||
+    /\bprediction market\b/i.test(task) ||
+    hasPredictionMarketResearchScaffolding(task)
+  ) {
+    return {
+      timeoutMs: LIVE_DATA_TIMEOUT_MS_PREDICTION_MARKET,
+      queryClass: 'forecasting',
+    };
+  }
+
   if (detectForecastingIntent(task).forecasting) {
     return {
       timeoutMs: LIVE_DATA_TIMEOUT_MS_FORECASTING,
@@ -469,15 +847,16 @@ const runHandler = async (req: express.Request, res: express.Response) => {
     // World Cup market — instead of the literal "prediction market" wording. Falls back to
     // the deterministic expansion above if understanding fails.
     let subjectFraming = '';
+    let marketUnderstanding: MarketUnderstanding | null = null;
     if (/\bprediction market\b/i.test(task)) {
-      const understanding = await understandMarketResearch(task).catch(() => null);
-      if (understanding) {
-        const understoodExpansion = understandingToExpandedTask(understanding);
+      marketUnderstanding = await understandMarketResearch(task).catch(() => null);
+      if (marketUnderstanding) {
+        const understoodExpansion = understandingToExpandedTask(marketUnderstanding);
         if (understoodExpansion) {
           expandedTask = understoodExpansion;
-          subjectFraming = understandingToSubjectFraming(understanding);
+          subjectFraming = understandingToSubjectFraming(marketUnderstanding);
           console.log(
-            `[Research ${requestId}] market understanding subject="${understanding.subject}" underlying="${understanding.underlying ?? ''}" type=${understanding.questionType}`,
+            `[Research ${requestId}] market understanding subject="${marketUnderstanding.subject}" underlying="${marketUnderstanding.underlying ?? ''}" type=${marketUnderstanding.questionType}`,
           );
         }
       }
@@ -559,6 +938,9 @@ const runHandler = async (req: express.Request, res: express.Response) => {
 
     let liveData = '';
     const liveDataTimeout = classifyLiveDataTimeout(task);
+    console.log(
+      `[Research ${requestId}] liveData timeout class=${liveDataTimeout.queryClass} timeoutMs=${liveDataTimeout.timeoutMs}`,
+    );
     let generatedInternalContext: Record<string, unknown> | null = null;
     try {
       const capabilityMatches = detectInternalCapabilities(task);
@@ -588,7 +970,10 @@ const runHandler = async (req: express.Request, res: express.Response) => {
       } else {
         pushTimingTrace(timingTrace, traceStart, 'before_fetch_live_data');
         liveData = await withTimeout(
-          fetchLiveData(expandedTask),
+          fetchLiveData(expandedTask, {
+            originalTask: task,
+            understanding: marketUnderstanding,
+          }),
           liveDataTimeout.timeoutMs,
           `Live data timed out after ${liveDataTimeout.timeoutMs / 1000}s`,
         );
@@ -621,6 +1006,19 @@ const runHandler = async (req: express.Request, res: express.Response) => {
       });
     }
 
+    let liveDataPayload = parseLiveDataPayload(liveData);
+    if (liveDataPayload && /\bprediction market\b/i.test(task)) {
+      const researchBrief = buildFastPredictionMarketBrief(task, marketUnderstanding);
+      const sourceDiagnostics = buildFastSourceDiagnostics(task, liveDataPayload, researchBrief);
+      liveDataPayload = {
+        ...liveDataPayload,
+        research_brief: researchBrief,
+        source_diagnostics: sourceDiagnostics,
+        ...(marketUnderstanding ? { prediction_market_understanding: marketUnderstanding } : {}),
+      };
+      liveData = JSON.stringify(liveDataPayload);
+    }
+
     const mergedInternalContext = mergeInternalContext(upstreamInternalContext, generatedInternalContext);
     const contextBlock = mergedInternalContext
       ? `\n\nINTERNAL AGENTFLOW CONTEXT JSON:\n${JSON.stringify(mergedInternalContext, null, 2)}\n\nUse this internal context as primary evidence for private AgentFlow handles, wallets, invoices, payment requests, transactions, contacts, and reputation cache. Public web evidence is enrichment only. If public web evidence is limited, say so and still produce a risk assessment from internal evidence.`
@@ -628,7 +1026,6 @@ const runHandler = async (req: express.Request, res: express.Response) => {
     const walletContextBlock = walletContext && portfolioImpact
       ? `\n\nPORTFOLIO_CONTEXT JSON:\n${JSON.stringify(walletContext, null, 2)}\n\nThe user asked about their portfolio. Use this AgentFlow DCW snapshot as private first-party exposure context. Classify what the user holds (stablecoins, volatile crypto, DeFi, Gateway, mixed) and explain impact through those asset classes. Do not expose full wallet addresses, raw balances, or PnL unless the user explicitly asks for a balance/portfolio breakdown. If the snapshot has an error or empty holdings, say that the DCW scan was unavailable or empty instead of inventing holdings.`
       : '';
-    const liveDataPayload = parseLiveDataPayload(liveData);
     const currentEventsPayload =
       liveDataPayload?.current_events &&
       typeof liveDataPayload.current_events === 'object'
@@ -645,7 +1042,7 @@ const runHandler = async (req: express.Request, res: express.Response) => {
       : '';
     pushTimingTrace(timingTrace, traceStart, 'before_user_message_construction');
     const userMessage = liveData
-      ? `AS OF ${asOf}\nCURRENT DATE: ${asOf.slice(0, 10)}\n\nLIVE DATA JSON:\n${liveData}${contextBlock}${walletContextBlock}\n\n${subjectFraming ? `${subjectFraming}\n\n` : ''}USER TASK:\n${task}\n\nSEARCH QUERY VARIANTS:\n${expandedTask}\n\nUse the LIVE DATA JSON above for current figures and dated evidence. Do not cite or mention any date after CURRENT DATE as if it has happened. When present, cite concrete titles and URLs from current_events.articles, current_events.article_snapshots, dynamic_sources.articles, wikipedia.pages, coingecko, defillama, and bitcoin_onchain; do not invent outlets. Retrieval layers are not evidence and must not be cited as sources.${geopoliticalEvidenceInstruction} When creator_audience_metrics is present, treat current_subscribers/current_subscribers_display and observed_at as direct evidence for the latest available audience count and mention that figure explicitly in the answer. When bitcoin_onchain is present, treat it as primary evidence for Bitcoin network transaction counts, block counts, fees, and on-chain activity windows; do not substitute market trading volume for on-chain transaction volume. When PORTFOLIO_CONTEXT is present, classify the user's exposure and explain impact through that exposure profile without revealing raw balances, full addresses, or PnL unless explicitly requested. Prefer official APIs, reputable publishers, Mempool.space for Bitcoin block/on-chain metrics, CoinGecko for token market data, DefiLlama for chain TVL and stablecoin liquidity, current-event article snapshots for recent developments, and Wikipedia for factual background. Use the SEARCH QUERY VARIANTS as additional source-planning angles when the topic is broad or ecosystem-focused.`
+      ? `AS OF ${asOf}\nCURRENT DATE: ${asOf.slice(0, 10)}\n\nLIVE DATA JSON:\n${liveData}${contextBlock}${walletContextBlock}\n\n${subjectFraming ? `${subjectFraming}\n\n` : ''}USER TASK:\n${task}\n\nSEARCH QUERY VARIANTS:\n${expandedTask}\n\nUse the LIVE DATA JSON above for current figures and dated evidence. Do not cite or mention any date after CURRENT DATE as if it has happened. When present, cite concrete titles and URLs from current_events.articles, current_events.article_snapshots, dynamic_sources.articles, wikipedia.pages, coingecko, defillama, and bitcoin_onchain; do not invent outlets. Retrieval layers are not evidence and must not be cited as sources.${geopoliticalEvidenceInstruction} For prediction-market reports, do not infer event dates, launch dates, odds, or prices unless the value appears in LIVE DATA. For mainnet/testnet launch markets, do not treat DefiLlama TVL alone as evidence of mainnet readiness, ecosystem traction, or launch timing. When creator_audience_metrics is present, treat current_subscribers/current_subscribers_display and observed_at as direct evidence for the latest available audience count and mention that figure explicitly in the answer. When bitcoin_onchain is present, treat it as primary evidence for Bitcoin network transaction counts, block counts, fees, and on-chain activity windows; do not substitute market trading volume for on-chain transaction volume. When PORTFOLIO_CONTEXT is present, classify the user's exposure and explain impact through that exposure profile without revealing raw balances, full addresses, or PnL unless explicitly requested. Prefer official APIs, reputable publishers, Mempool.space for Bitcoin block/on-chain metrics, CoinGecko for token market data, DefiLlama for chain TVL and stablecoin liquidity only when directly relevant, current-event article snapshots for recent developments, and Wikipedia for factual background. Use the SEARCH QUERY VARIANTS as additional source-planning angles when the topic is broad or ecosystem-focused.`
       : `${task}${contextBlock}${walletContextBlock}`;
     pushTimingTrace(timingTrace, traceStart, 'after_user_message_construction', {
       userMessageChars: userMessage.length,

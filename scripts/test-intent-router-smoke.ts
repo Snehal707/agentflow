@@ -13,6 +13,11 @@ const CASES = [
     raw_message: 'show all markets',
     expected_intent: 'predmarket.list',
   },
+  {
+    raw_message:
+      'research the prediction market topic: Will GTA 6 launch before November 30, 2026?\nListed outcomes in AgentFlow: Yes / No.\nAgentFlow market address reference: 0x5Cf866D334b9bF0e007433b1022aeCf58b37F1B9.\nFocus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.',
+    expected_intent: 'research.report',
+  },
 ] as const;
 
 async function main(): Promise<void> {

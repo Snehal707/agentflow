@@ -78,6 +78,17 @@ const MOJIBAKE_REPLACEMENTS: Array<[RegExp, string]> = [
 
 function applyKnownMojibakeReplacements(text: string): string {
   let normalized = text;
+  normalized = normalized
+    .replace(/\u00e2\u20ac\u2122/g, "'")
+    .replace(/\u00e2\u20ac\u02dc/g, "'")
+    .replace(/\u00e2\u20ac\u0153/g, '"')
+    .replace(/\u00e2\u20ac[\u009d\ufffd]/g, '"')
+    .replace(/\u00e2\u20ac\u201c/g, '-')
+    .replace(/\u00e2\u20ac\u201d/g, '-')
+    .replace(/\u00e2\u20ac\u00a2/g, '-')
+    .replace(/\u00e2\u20ac\u00a6/g, '...')
+    .replace(/\u00e2\u20ac\u2018/g, '-')
+    .replace(/\u00e2\u20ac\u0090/g, '-');
   for (const [pattern, replacement] of MOJIBAKE_REPLACEMENTS) {
     normalized = normalized.replace(pattern, replacement);
   }

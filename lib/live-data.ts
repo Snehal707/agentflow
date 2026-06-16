@@ -6,17 +6,31 @@
  * Firecrawl is used to scrape targeted article URLs into compact snapshots.
  * DuckDuckGo is used for lightweight background context and descriptive snippets.
  */
-import { fetchUrlViaFirecrawl, type FirecrawlSearchResult } from './firecrawl';
+import {
+  fetchUrlViaFirecrawl,
+  getSearchBackendDiagnostics,
+  searchFirecrawlNews,
+  searchSearxng,
+  type FirecrawlSearchResult,
+  type SearchBackendDiagnostic,
+} from './firecrawl';
+import {
+  understandMarketResearch,
+  type MarketUnderstanding,
+} from './market-understanding';
 import { SOURCE_REGISTRY, classifyTopic, type SourceConfig } from './source-registry';
 import { detectProtocolQueryShape } from './protocol-query-shape';
 import {
   isAuthoritativeSportsEvidenceUrl,
+  isAuthoritativeSportsOddsSource,
   isCircularResearchSourceUrl,
   isCreatorAudienceMetricTask,
+  isPredictionMarketResearchTask,
   isLowValueSourceForTask,
   isLowValueSocialSourceUrl,
   isLowValueVideoUrl,
   isOfficialCreatorPlatformUrl,
+  sourceHostname,
 } from './source-policy';
 import { decodeTextResponse, normalizeSourceText, repairMojibake } from './text-normalization';
 
@@ -54,6 +68,7 @@ type GdeltArticleSnapshot = {
   article_url?: string;
   domain?: string;
   publisher?: string;
+  description?: string;
   language?: string;
   source_country?: string;
   seen_at?: string;
@@ -214,6 +229,10 @@ function cleanPredictionMarketResearchTaskForSearch(task: string): string {
   return cleaned || task.trim();
 }
 
+function extractPredictionMarketQuestion(task: string): string {
+  return cleanPredictionMarketResearchTaskForSearch(task);
+}
+
 function normalizeLiveDataSearchTask(task: string): string {
   const stripped = task.replace(/\bExecution context:[\s\S]*$/i, '').trim();
   if (/\bprediction\s+market\b/i.test(stripped)) {
@@ -224,7 +243,7 @@ function normalizeLiveDataSearchTask(task: string): string {
 
 function extractPredictionMarketListedOutcomes(task: string): string[] {
   const match = task.match(
-    /\bListed outcomes in AgentFlow:\s*([\s\S]*?)(?=\bFocus on the real-world event\b|$)/i,
+    /\bListed outcomes in AgentFlow:\s*([\s\S]*?)(?=\bPrediction market category in AgentFlow:|\bPrediction market provider in AgentFlow:|\bAgentFlow market address reference:|\bUse the market category to disambiguate the subject before searching\b|\bFocus on the real-world event\b|$)/i,
   );
   if (!match?.[1]) return [];
   return match[1]
@@ -233,6 +252,16 @@ function extractPredictionMarketListedOutcomes(task: string): string[] {
     .filter(Boolean)
     .filter((value) => value.length > 1)
     .slice(0, 8);
+}
+
+function extractPredictionMarketCategory(task: string): string | null {
+  const match = task.match(/\bPrediction market category in AgentFlow:\s*([^\n.]+)/i);
+  return match?.[1]?.replace(/\s+/g, ' ').trim().toLowerCase() || null;
+}
+
+function extractPredictionMarketProvider(task: string): string | null {
+  const match = task.match(/\bPrediction market provider in AgentFlow:\s*([^\n.]+)/i);
+  return match?.[1]?.replace(/\s+/g, ' ').trim().toLowerCase() || null;
 }
 
 function normalizeSportsTeamName(value: string): string {
@@ -261,6 +290,8 @@ function normalizeSportsPredictionTopic(value: string): string {
 }
 
 function isSportsPredictionMarketTask(task: string): boolean {
+  const category = extractPredictionMarketCategory(task);
+  if (category === 'sports') return true;
   return (
     /\bprediction market\b/i.test(task) &&
     /\b(ucl|champions league|uefa|premier league|nba|nfl|mlb|nhl|fifa|world cup|arsenal|bayern|atletico|psg|france|argentina|brazil|england|spain|portugal|netherlands|germany|morocco|belgium)\b/i.test(
@@ -269,26 +300,125 @@ function isSportsPredictionMarketTask(task: string): boolean {
   );
 }
 
-function buildSportsPredictionMarketQueries(task: string, cleanedTask: string): string[] {
+function detectSportsCompetition(task: string): {
+  league: string;
+  season: string | null;
+  officialDomain: string | null;
+} | null {
+  const haystack = task.toLowerCase();
+  if (/\bnba\b/.test(haystack)) {
+    return { league: 'NBA', season: '2025-26', officialDomain: 'nba.com' };
+  }
+  if (/\bnfl\b|super bowl|afc|nfc/.test(haystack)) {
+    return { league: 'NFL', season: '2026', officialDomain: 'nfl.com' };
+  }
+  if (/\bmlb\b|world series|american league|national league/.test(haystack)) {
+    return { league: 'MLB', season: '2026', officialDomain: 'mlb.com' };
+  }
+  if (/\bnhl\b|stanley cup/.test(haystack)) {
+    return { league: 'NHL', season: '2025-26', officialDomain: 'nhl.com' };
+  }
+  if (/\b(uefa champions league|champions league|ucl)\b/.test(haystack)) {
+    return {
+      league: 'UEFA Champions League',
+      season: '2025-26',
+      officialDomain: 'uefa.com',
+    };
+  }
+  if (/\b(fifa world cup|world cup)\b/.test(haystack)) {
+    return { league: 'FIFA World Cup', season: '2026', officialDomain: 'fifa.com' };
+  }
+  return null;
+}
+
+function extractSingleTeamOutcomeSubject(task: string, cleanedTask: string): string | null {
+  const question = normalizeSportsTeamName(cleanedTask || task);
+  const singleTeamMatch = question.match(
+    /\bwill\s+(.+?)\s+win\s+the\s+(?:20\d{2}\s+)?(?:nba finals|nfl|super bowl|world series|stanley cup|champions league|uefa champions league|fifa world cup)\b/i,
+  );
+  if (singleTeamMatch?.[1]) {
+    return normalizeSportsTeamName(singleTeamMatch[1]);
+  }
+  const outcomes = extractPredictionMarketListedOutcomes(task)
+    .map(normalizeSportsTeamName)
+    .filter((value) => value && !/^(yes|no|other)$/i.test(value));
+  return outcomes.length === 1 ? outcomes[0] : null;
+}
+
+function isSportsWinnerPredictionMarketTask(
+  task: string,
+  understanding?: MarketUnderstanding | null,
+): boolean {
+  if (extractPredictionMarketCategory(task) !== 'sports') return false;
+  const normalized = `${task} ${understanding?.subject || ''}`.toLowerCase();
+  const outcomes = extractPredictionMarketListedOutcomes(task).filter(
+    (value) => value && !/^(yes|no)$/i.test(value),
+  );
+  return (
+    /\b(who\s+will\s+win|winner|champion|championship|title)\b/i.test(normalized) ||
+    outcomes.length >= 3
+  );
+}
+
+function hasSportsWinnerMarketEvidenceSignal(haystack: string): boolean {
+  return /\b(odds|favorite|favorites|betting|prediction|predictions|probability|probabilities|implied|outright|power ranking|power rankings|team rankings|ranking|rankings|re-ranking|re-rank|contender|contenders|opta|the analyst|oddschecker|action network|covers|fox sports|sporting news|the athletic)\b/i.test(
+    haystack,
+  );
+}
+
+function hasSportsWinnerMarketMatchNoiseSignal(haystack: string): boolean {
+  return /\b(live updates?|best bets?|preview|match preview|opener|group [a-z0-9]+|where to watch|lineups?|vs\.?|versus|today'?s games|tonight'?s games|monday'?s games|tuesday'?s games|wednesday'?s games|thursday'?s games|friday'?s games|saturday'?s games|sunday'?s games|quarterfinal|quarter-final|semifinal|semi-final|round of 16|coach says|photos?)\b/i.test(
+    haystack,
+  );
+}
+
+function buildSportsPredictionMarketQueries(
+  task: string,
+  cleanedTask: string,
+  understanding?: MarketUnderstanding | null,
+): string[] {
   if (!isSportsPredictionMarketTask(task) && !isSportsPredictionMarketTask(cleanedTask)) {
     return [];
   }
 
   const queries: string[] = [];
+  for (const query of understanding?.searchQueries ?? []) {
+    addUniqueQuery(queries, query);
+  }
   const normalizedBase = normalizeSportsPredictionTopic(cleanedTask || task);
   const outcomes = extractPredictionMarketListedOutcomes(task)
     .map(normalizeSportsTeamName)
-    .filter(Boolean);
-  const teamsText = outcomes.join(' ');
-  const competition =
-    /\b(uefa champions league|champions league|ucl)\b/i.test(`${task} ${cleanedTask}`)
-      ? 'UEFA Champions League 2025/26'
-      : /\b(fifa world cup|world cup)\b/i.test(`${task} ${cleanedTask}`)
-        ? 'FIFA World Cup 2026'
-      : normalizedBase;
+    .filter((value) => value && !/^(yes|no|other)$/i.test(value));
+  const singleTeamSubject = extractSingleTeamOutcomeSubject(task, cleanedTask);
+  const competitionMeta = detectSportsCompetition(`${task} ${cleanedTask}`);
+  const competition = competitionMeta
+    ? `${competitionMeta.league}${competitionMeta.season ? ` ${competitionMeta.season}` : ''}`
+    : normalizedBase;
+  const broadTournamentWinnerMarket =
+    Boolean(competitionMeta) &&
+    /\b(world cup|champions league|uefa|nba finals|super bowl|world series|stanley cup)\b/i.test(
+      competition,
+    ) &&
+    outcomes.length >= 3;
+  const teamsText =
+    !singleTeamSubject && !broadTournamentWinnerMarket && outcomes.length >= 2 && outcomes.length <= 3
+      ? outcomes.join(' ')
+      : '';
 
-  addUniqueQuery(queries, normalizedBase);
-  if (teamsText) {
+  if (singleTeamSubject && competitionMeta) {
+    addUniqueQuery(queries, `"${singleTeamSubject}" ${competitionMeta.league} finals odds`);
+    addUniqueQuery(queries, `"${singleTeamSubject}" ${competitionMeta.league} injuries`);
+    addUniqueQuery(queries, `"${singleTeamSubject}" ${competitionMeta.league} roster finals`);
+    addUniqueQuery(queries, `"${singleTeamSubject}" ${competitionMeta.league} ${competitionMeta.season || ''}`);
+    if (competitionMeta.officialDomain) {
+      addUniqueQuery(queries, `site:${competitionMeta.officialDomain} "${singleTeamSubject}" ${competitionMeta.league} finals`);
+    }
+    addUniqueQuery(queries, `site:espn.com "${singleTeamSubject}" ${competitionMeta.league} finals`);
+    addUniqueQuery(queries, `site:oddschecker.com "${singleTeamSubject}" ${competitionMeta.league} odds`);
+    addUniqueQuery(queries, `site:actionnetwork.com "${singleTeamSubject}" ${competitionMeta.league} odds`);
+    addUniqueQuery(queries, normalizedBase);
+  } else if (teamsText) {
+    addUniqueQuery(queries, normalizedBase);
     addUniqueQuery(queries, `${competition} ${teamsText}`);
     addUniqueQuery(queries, `${competition} ${teamsText} semi finals`);
     addUniqueQuery(queries, `${competition} ${teamsText} final result`);
@@ -296,19 +426,52 @@ function buildSportsPredictionMarketQueries(task: string, cleanedTask: string): 
     addUniqueQuery(queries, `${competition} ${teamsText} opta analyst`);
     addUniqueQuery(queries, `${competition} ${teamsText} current form injuries`);
   } else {
-    addUniqueQuery(queries, `${competition} odds predictions`);
-    addUniqueQuery(queries, `${competition} current form injuries`);
+    addUniqueQuery(queries, normalizedBase);
+    if (broadTournamentWinnerMarket) {
+      addUniqueQuery(queries, `${competition} winner odds`);
+      addUniqueQuery(queries, `${competition} betting odds favorites`);
+      addUniqueQuery(queries, `${competition} predictions`);
+      addUniqueQuery(queries, `${competition} outright odds`);
+      addUniqueQuery(queries, `${competition} opta prediction`);
+      addUniqueQuery(queries, `${competition} team rankings`);
+      addUniqueQuery(queries, `${competition} power rankings`);
+    } else {
+      addUniqueQuery(queries, `${competition} odds predictions`);
+      addUniqueQuery(queries, `${competition} current form injuries`);
+      addUniqueQuery(queries, `${competition} winner odds`);
+      addUniqueQuery(queries, `${competition} favorites`);
+    }
   }
 
-  addUniqueQuery(queries, `site:uefa.com ${competition} winners`);
+  if (competitionMeta?.officialDomain) {
+    addUniqueQuery(queries, `site:${competitionMeta.officialDomain} ${competition} winners`);
+  } else {
+    addUniqueQuery(queries, `site:uefa.com ${competition} winners`);
+  }
   if (/\bFIFA World Cup 2026\b/i.test(competition)) {
+    addUniqueQuery(queries, `${competition} winner odds`);
+    addUniqueQuery(queries, `${competition} betting odds favorites`);
     addUniqueQuery(queries, `site:fifa.com ${competition} favorites odds`);
     addUniqueQuery(queries, `site:espn.com ${competition} predictions`);
+    addUniqueQuery(queries, `site:theanalyst.com ${competition} prediction`);
+    addUniqueQuery(queries, `site:oddschecker.com ${competition} odds`);
+    addUniqueQuery(queries, `site:actionnetwork.com ${competition} odds`);
+    addUniqueQuery(queries, `site:foxsports.com ${competition} champion odds`);
+    addUniqueQuery(queries, `site:covers.com ${competition} odds`);
+    addUniqueQuery(queries, `site:cbssports.com ${competition} odds`);
     addUniqueQuery(queries, `${competition} fifa rankings favorites`);
+    if (outcomes.length >= 3) {
+      const contenders = outcomes.slice(0, 4).join(' ');
+      addUniqueQuery(queries, `${competition} ${contenders} winner odds`);
+      addUniqueQuery(queries, `${competition} ${contenders} favorites`);
+      addUniqueQuery(queries, `${competition} ${contenders} prediction`);
+    }
   }
-  addUniqueQuery(queries, `${competition} winner latest`);
-  addUniqueQuery(queries, `${competition} latest`);
-  return queries.slice(0, 8);
+  if (!broadTournamentWinnerMarket) {
+    addUniqueQuery(queries, `${competition} winner latest`);
+    addUniqueQuery(queries, `${competition} latest`);
+  }
+  return queries.slice(0, 12);
 }
 
 /**
@@ -317,49 +480,433 @@ function buildSportsPredictionMarketQueries(task: string, cleanedTask: string): 
  * falls back to unrelated news). Extracts the subject and the question type and builds a
  * few focused queries. Sports markets keep their dedicated builder.
  */
-function buildPredictionMarketSubjectQueries(task: string, cleanedTask: string): string[] {
+function buildPredictionMarketSubjectQueries(
+  task: string,
+  cleanedTask: string,
+  understanding?: MarketUnderstanding | null,
+): string[] {
   if (!/\bprediction market\b/i.test(task)) return [];
   if (isSportsPredictionMarketTask(task) || isSportsPredictionMarketTask(cleanedTask)) return [];
 
   // Strip the forecasting scaffolding to isolate the subject.
-  const subject = (cleanedTask || task)
-    .replace(/^\s*will\s+/i, '')
-    .replace(/\b(?:by|before|after|on|until|reach(?:es)?|hit|cross|exceed|surpass)\b[\s\S]*$/i, ' ')
-    .replace(/\$[\d,]+(?:\.\d+)?[kmbt]?/gi, ' ')
-    .replace(/\b20\d{2}\b/g, ' ')
-    .replace(/[?".,:;()]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const subject =
+    stripPredictionMarketIntentSuffix(
+      understanding?.entity?.canonicalName || understanding?.subject || '',
+    ) ||
+    (cleanedTask || task)
+      .replace(/^\s*will\s+/i, '')
+      .replace(/\b(?:by|before|after|on|until|reach(?:es)?|hit|cross|exceed|surpass)\b[\s\S]*$/i, ' ')
+      .replace(/\$[\d,]+(?:\.\d+)?[kmbt]?/gi, ' ')
+      .replace(/\b20\d{2}\b/g, ' ')
+      .replace(/[?".,:;()]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
 
   if (!subject || subject.length < 2) return [];
 
   const haystack = `${task} ${cleanedTask}`.toLowerCase();
   const targetYear = (task.match(/\b(20\d{2})\b/) || [])[1] ?? String(new Date().getUTCFullYear());
+  const category = extractPredictionMarketCategory(task) || extractPredictionMarketCategory(cleanedTask);
+  const provider = extractPredictionMarketProvider(task);
   const queries: string[] = [];
+  const ticker = (task.match(/\(([A-Z]{2,6})\)/) || [])[1];
 
   if (/\breach|hit|price|\$|usd|market cap|all[- ]time high|ath\b/i.test(haystack)) {
     // Lead with the ticker + year ("XAUT price prediction 2026"): self-hosted search
     // returns far better asset-specific results for that phrasing than the full name
     // (e.g. "Tether Gold XAUT ..." collapses into generic Tether/USDT results).
-    const ticker = (task.match(/\(([A-Z]{2,6})\)/) || [])[1];
     if (ticker) {
       addUniqueQuery(queries, `${ticker} price prediction ${targetYear}`);
       addUniqueQuery(queries, `${ticker} price forecast`);
+      addUniqueQuery(queries, `${ticker} latest news`);
     }
     addUniqueQuery(queries, `${subject} price prediction ${targetYear}`);
     addUniqueQuery(queries, `${subject} price forecast`);
+    addUniqueQuery(queries, `${subject} market analysis ${targetYear}`);
     addUniqueQuery(queries, `${subject} latest news`);
+    if (/\bxaut\b|\btether gold\b/i.test(haystack)) {
+      addUniqueQuery(queries, 'XAUT latest news');
+      addUniqueQuery(queries, 'Tether Gold latest news');
+      addUniqueQuery(queries, `Tether Gold price prediction ${targetYear}`);
+      addUniqueQuery(queries, `gold price forecast ${targetYear}`);
+      addUniqueQuery(queries, `gold price forecast july ${targetYear}`);
+      addUniqueQuery(queries, `spot gold analysis ${targetYear}`);
+      addUniqueQuery(queries, 'spot gold price latest');
+      addUniqueQuery(queries, 'spot gold latest news');
+      addUniqueQuery(queries, 'gold market outlook');
+      addUniqueQuery(queries, `gold market outlook ${targetYear}`);
+      addUniqueQuery(queries, 'tokenized gold market analysis');
+      addUniqueQuery(queries, 'gold market macro drivers');
+      addUniqueQuery(queries, 'world gold council gold outlook');
+      addUniqueQuery(queries, 'site:kitco.com gold price forecast');
+      addUniqueQuery(queries, 'site:lbma.org.uk gold market');
+      addUniqueQuery(queries, 'site:reuters.com gold prices');
+    }
   } else if (/\blaunch|release|ship|come out|drop|debut|available\b/i.test(haystack)) {
-    addUniqueQuery(queries, `${subject} release date news`);
-    addUniqueQuery(queries, `${subject} launch delay latest`);
-    addUniqueQuery(queries, `${subject} official announcement`);
+    if (
+      category === 'gaming' ||
+      category === 'games' ||
+      /\bgta\s*6\b|\bgrand theft auto\b/i.test(haystack)
+    ) {
+      addUniqueQuery(queries, `${subject} release date confirmation`);
+      addUniqueQuery(queries, `Rockstar Games ${subject} confirmed launch timeline`);
+      addUniqueQuery(queries, `${subject} development status ${targetYear}`);
+      addUniqueQuery(queries, 'site:rockstargames.com Grand Theft Auto VI');
+      addUniqueQuery(queries, 'site:rockstargames.com GTA 6 release date');
+      addUniqueQuery(queries, 'site:take2games.com Grand Theft Auto VI release');
+    } else if (category === 'crypto' || provider === 'achmarket' || isArcNetworkTask(subject)) {
+      addUniqueQuery(queries, `${subject} mainnet launch ${targetYear}`);
+      addUniqueQuery(queries, `${subject} roadmap mainnet ${targetYear}`);
+      addUniqueQuery(queries, `${subject} launch date announcement`);
+      if (isArcNetworkTask(subject) || /\barc\b/i.test(subject)) {
+        addUniqueQuery(queries, 'ARC Network mainnet');
+        addUniqueQuery(queries, 'ARC Network mainnet launch');
+        addUniqueQuery(queries, 'ARC Network testnet');
+        addUniqueQuery(queries, 'ARC Network stablecoin blockchain');
+        addUniqueQuery(queries, 'ARC Network onchain finance');
+        addUniqueQuery(queries, 'ARC L1 blockchain');
+        addUniqueQuery(queries, 'site:arc.network ARC Network mainnet');
+        addUniqueQuery(queries, 'site:arc.network ARC Network launch');
+        addUniqueQuery(queries, 'site:circle.com ARC Network blockchain');
+        addUniqueQuery(queries, 'site:arc.io ARC stablecoin-native L1 blockchain');
+      } else {
+        addUniqueQuery(queries, `${subject} official announcement`);
+      }
+    } else {
+      addUniqueQuery(queries, `${subject} release date news`);
+      addUniqueQuery(queries, `${subject} launch delay latest`);
+      addUniqueQuery(queries, `${subject} official announcement`);
+    }
   } else {
     addUniqueQuery(queries, `${subject} latest news`);
     addUniqueQuery(queries, `${subject} forecast ${targetYear ?? ''}`.trim());
     addUniqueQuery(queries, `${subject} analysis prediction`);
   }
 
-  return queries.slice(0, 5);
+  return queries.slice(0, 10);
+}
+
+function stripPredictionMarketIntentSuffix(subject: string): string {
+  return subject
+    .replace(
+      /\b(price target|price forecast|release timing|release date|winner|launch milestone|mainnet launch|launch date|event outcome|metric threshold)\b/gi,
+      ' ',
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractPredictionMarketSubjectCore(task: string, cleanedTask: string): string {
+  const subject = (cleanedTask || task)
+    .replace(/^\s*will\s+/i, ' ')
+    .replace(
+      /\b(?:by|before|after|on|until|reach(?:es)?|hit|cross|exceed|surpass|launch|release|ship|come out|drop|debut|available|win)\b[\s\S]*$/i,
+      ' ',
+    )
+    .replace(/\$[\d,]+(?:\.\d+)?[kmbt]?/gi, ' ')
+    .replace(/\b20\d{2}\b/g, ' ')
+    .replace(/[?".,:;()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return subject;
+}
+
+function buildPredictionMarketIntentTerms(
+  task: string,
+  category: string | null,
+  questionType?: MarketUnderstanding['questionType'] | null,
+): string[] {
+  const haystack = task.toLowerCase();
+  const terms: string[] = [];
+  const addTerm = (term: string | undefined) => {
+    const value = term?.replace(/\s+/g, ' ').trim();
+    if (!value || terms.includes(value)) return;
+    terms.push(value);
+  };
+
+  const isPriceTarget = questionType === 'price_target' || /\breach|hit|price|\$|usd|ath\b/i.test(haystack);
+  const isGameRelease =
+    category === 'games' ||
+    category === 'gaming' ||
+    /\bgta\s*6\b|\bgrand theft auto\b|\bvideo game\b/i.test(haystack);
+  const isCryptoLaunch =
+    category === 'crypto' &&
+    /\bmainnet|launch|testnet|roadmap|validator|token|blockchain\b/i.test(haystack);
+
+  if (isPriceTarget) {
+    addTerm('price');
+    addTerm('market analysis');
+    addTerm('latest news');
+    addTerm('macro drivers');
+    addTerm('institutional flows');
+  }
+  if (isGameRelease) {
+    addTerm('release date');
+    addTerm('launch window');
+    addTerm('development update');
+    addTerm('official announcement');
+    addTerm('delay');
+  } else if (questionType === 'launch_milestone' || isCryptoLaunch || /\bmainnet\b/i.test(haystack)) {
+    addTerm('mainnet');
+    addTerm('mainnet launch');
+    addTerm('roadmap');
+    addTerm('testnet');
+    addTerm('official announcement');
+  } else if (
+    questionType === 'release_date' ||
+    /\blaunch|release|ship|come out|drop|debut|available\b/i.test(haystack)
+  ) {
+    addTerm('release date');
+    addTerm('launch window');
+    addTerm('development update');
+    addTerm('official announcement');
+    addTerm('delay');
+  } else if (questionType === 'event_outcome') {
+    addTerm('odds');
+    addTerm('latest news');
+    addTerm('standings');
+  } else if (questionType === 'metric_threshold') {
+    addTerm('latest');
+    addTerm('data');
+    addTerm('trend');
+  }
+
+  if (category === 'crypto' && !isPriceTarget) {
+    addTerm('crypto');
+    addTerm('blockchain');
+  } else if (category === 'crypto' && isPriceTarget) {
+    addTerm('crypto');
+    addTerm('analysis');
+  } else if (category === 'games' || category === 'gaming') {
+    addTerm('game');
+  } else if (category === 'sports') {
+    addTerm('sports');
+  }
+
+  return terms.slice(0, 6);
+}
+
+function buildPredictionMarketEntityQueries(
+  task: string,
+  cleanedTask: string,
+  understanding?: MarketUnderstanding | null,
+): string[] {
+  if (!/\bprediction market\b/i.test(task)) return [];
+  if (isSportsPredictionMarketTask(task) || isSportsPredictionMarketTask(cleanedTask)) return [];
+
+  const category = extractPredictionMarketCategory(task) || extractPredictionMarketCategory(cleanedTask);
+  const provider = extractPredictionMarketProvider(task);
+  const haystack = `${task} ${cleanedTask}`.toLowerCase();
+  const isPriceTarget =
+    understanding?.questionType === 'price_target' || /\breach|hit|price|\$|usd|ath\b/i.test(haystack);
+  const isCryptoLaunchLike =
+    category === 'crypto' && /\bmainnet|launch|testnet|roadmap|validator|token|blockchain\b/i.test(haystack);
+  const resolutionYear =
+    understanding?.resolutionDate?.slice(0, 4) ||
+    (task.match(/\b(20\d{2})\b/) || [])[1] ||
+    String(new Date().getUTCFullYear());
+  const subject =
+    stripPredictionMarketIntentSuffix(understanding?.subject || '') ||
+    extractPredictionMarketSubjectCore(task, cleanedTask);
+  if (!subject) return [];
+
+  const queries: string[] = [];
+  const entity = understanding?.entity;
+  const aliases = [
+    entity?.canonicalName,
+    ...((entity?.aliases ?? []) as string[]),
+    subject,
+    understanding?.underlying,
+  ]
+    .map((value) => stripPredictionMarketIntentSuffix(value || ''))
+    .map((value) => value.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .filter((value, index, values) => values.findIndex((candidate) => candidate.toLowerCase() === value.toLowerCase()) === index)
+    .slice(0, 5);
+  const intentTerms = buildPredictionMarketIntentTerms(task, category, understanding?.questionType);
+
+  if (understanding?.underlying) {
+    addUniqueQuery(queries, understanding.underlying);
+    addUniqueQuery(queries, `${understanding.underlying} latest`);
+    addUniqueQuery(queries, `${understanding.underlying} analysis`);
+    if (understanding.questionType === 'price_target') {
+      addUniqueQuery(queries, `${understanding.underlying} market analysis ${resolutionYear}`);
+      addUniqueQuery(queries, `${understanding.underlying} latest news`);
+      addUniqueQuery(queries, `${understanding.underlying} macro drivers`);
+    }
+  }
+
+  for (const alias of aliases) {
+    const normalizedAlias = alias.trim();
+    const isShortCryptoAcronym =
+      isCryptoLaunchLike &&
+      /^[A-Z]{2,4}$/i.test(normalizedAlias) &&
+      normalizedAlias.split(/\s+/).length === 1;
+
+    // Short crypto acronyms like "ARC" are too ambiguous to search naked. Search engines
+    // return clinics, browsers, charities, and other homonyms unless we force blockchain
+    // context into the query itself.
+    if (!isShortCryptoAcronym) {
+      addUniqueQuery(queries, normalizedAlias);
+    }
+    for (const term of intentTerms) {
+      addUniqueQuery(queries, `${normalizedAlias} ${term}`);
+    }
+    if (category === 'crypto' && isPriceTarget) {
+      addUniqueQuery(queries, `${normalizedAlias} latest news`);
+      addUniqueQuery(queries, `${normalizedAlias} market analysis`);
+      addUniqueQuery(queries, `${normalizedAlias} macro drivers`);
+      addUniqueQuery(queries, `${normalizedAlias} institutional demand`);
+    }
+    if (isCryptoLaunchLike && alias.split(/\s+/).length <= 2) {
+      addUniqueQuery(queries, `${normalizedAlias} blockchain project`);
+      addUniqueQuery(queries, `${normalizedAlias} blockchain`);
+      addUniqueQuery(queries, `${normalizedAlias} crypto project`);
+      addUniqueQuery(queries, `${normalizedAlias} roadmap crypto`);
+      addUniqueQuery(queries, `${normalizedAlias} docs blockchain`);
+      addUniqueQuery(queries, `${normalizedAlias} onchain finance`);
+      addUniqueQuery(queries, `${normalizedAlias} stablecoin blockchain`);
+      addUniqueQuery(queries, `${normalizedAlias} layer 1 blockchain`);
+      if (/\bmainnet|launch\b/i.test(haystack)) {
+        addUniqueQuery(queries, `${normalizedAlias} blockchain mainnet`);
+        addUniqueQuery(queries, `${normalizedAlias} crypto mainnet`);
+        addUniqueQuery(queries, `${normalizedAlias} mainnet launch crypto`);
+        addUniqueQuery(queries, `${normalizedAlias} blockchain launch roadmap`);
+      }
+    }
+  }
+
+  for (const domain of entity?.officialDomains ?? []) {
+    const alias = aliases[0] || subject;
+    addUniqueQuery(queries, `site:${domain} ${alias}`);
+    for (const term of intentTerms.slice(0, 3)) {
+      addUniqueQuery(queries, `site:${domain} ${alias} ${term}`);
+    }
+  }
+
+  if ((category === 'games' || category === 'gaming') && /\bgta\s*6\b|\bgrand theft auto\b/i.test(haystack)) {
+    addUniqueQuery(queries, 'Rockstar Games GTA 6 release date');
+    addUniqueQuery(queries, 'Take-Two Grand Theft Auto VI release');
+  }
+
+  if ((category === 'crypto' || provider === 'achmarket') && /\bxaut\b|\btether gold\b/i.test(haystack)) {
+    addUniqueQuery(queries, 'XAUT latest news');
+    addUniqueQuery(queries, 'Tether Gold market analysis');
+    addUniqueQuery(queries, `gold market analysis ${resolutionYear}`);
+    addUniqueQuery(queries, `gold price forecast ${resolutionYear}`);
+    addUniqueQuery(queries, `gold price forecast july ${resolutionYear}`);
+    addUniqueQuery(queries, 'spot gold latest news');
+    addUniqueQuery(queries, 'gold market macro drivers');
+    addUniqueQuery(queries, 'world gold council gold outlook');
+    addUniqueQuery(queries, 'site:kitco.com gold market');
+    addUniqueQuery(queries, 'site:lbma.org.uk gold market');
+    addUniqueQuery(queries, 'site:reuters.com gold prices');
+    addUniqueQuery(queries, 'site:gold.org gold outlook');
+  }
+
+  if ((category === 'crypto' || provider === 'achmarket') && /\barc\b/i.test(haystack) && /\bmainnet|launch\b/i.test(haystack)) {
+    addUniqueQuery(queries, 'ARC Network crypto');
+    addUniqueQuery(queries, 'ARC Network blockchain');
+    addUniqueQuery(queries, 'Circle Arc blockchain');
+    addUniqueQuery(queries, 'ARC stablecoin-native L1 blockchain');
+    addUniqueQuery(queries, 'ARC onchain finance blockchain');
+    addUniqueQuery(queries, 'ARC Network testnet');
+    addUniqueQuery(queries, `ARC Network mainnet ${resolutionYear}`);
+    addUniqueQuery(queries, 'ARC Network roadmap mainnet');
+    addUniqueQuery(queries, 'ARC blockchain launch announcement');
+  }
+
+  return queries.slice(0, 12);
+}
+
+function buildPredictionMarketDiscoveryQueries(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): string[] {
+  if (!/\bprediction market\b/i.test(task) || !understanding) return [];
+
+  const queries: string[] = [];
+  const category = extractPredictionMarketCategory(task);
+  const haystack = `${task} ${understanding.subject}`.toLowerCase();
+  const entity = understanding.entity;
+  const canonical = stripPredictionMarketIntentSuffix(entity?.canonicalName || understanding.subject);
+  const aliases = [
+    canonical,
+    ...(entity?.aliases ?? []),
+    understanding.underlying,
+  ]
+    .map((value) => stripPredictionMarketIntentSuffix(value || ''))
+    .map((value) => value.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .filter(
+      (value, index, values) =>
+        values.findIndex((candidate) => candidate.toLowerCase() === value.toLowerCase()) === index,
+    )
+    .slice(0, 4);
+
+  for (const alias of aliases) {
+    addUniqueQuery(queries, alias);
+  }
+
+  if (category === 'crypto') {
+    for (const alias of aliases.slice(0, 3)) {
+      addUniqueQuery(queries, `${alias} crypto`);
+      addUniqueQuery(queries, `${alias} blockchain`);
+      addUniqueQuery(queries, `${alias} ecosystem`);
+      addUniqueQuery(queries, `${alias} docs`);
+      addUniqueQuery(queries, `${alias} blog`);
+      addUniqueQuery(queries, `${alias} latest news`);
+      addUniqueQuery(queries, `${alias} market analysis`);
+      addUniqueQuery(queries, `${alias} onchain finance`);
+    }
+    if (
+      understanding.questionType === 'price_target' ||
+      /\b(market cap|reach|hit|price|\$|usd|ath)\b/i.test(haystack)
+    ) {
+      for (const alias of aliases.slice(0, 3)) {
+        addUniqueQuery(queries, `${alias} macro drivers`);
+        addUniqueQuery(queries, `${alias} ETF flows`);
+        addUniqueQuery(queries, `${alias} institutional demand`);
+        addUniqueQuery(queries, `site:coindesk.com ${alias} news`);
+        addUniqueQuery(queries, `site:coindesk.com ${alias} analysis`);
+        addUniqueQuery(queries, `site:theblock.co ${alias} news`);
+        addUniqueQuery(queries, `site:theblock.co ${alias} analysis`);
+        addUniqueQuery(queries, `site:decrypt.co ${alias} news`);
+        addUniqueQuery(queries, `site:decrypt.co ${alias} analysis`);
+        addUniqueQuery(queries, `site:forbes.com ${alias} crypto`);
+        addUniqueQuery(queries, `site:reuters.com ${alias} crypto`);
+      }
+    }
+    if (/\b(mainnet|launch|testnet)\b/i.test(haystack)) {
+      for (const alias of aliases.slice(0, 3)) {
+        addUniqueQuery(queries, `${alias} roadmap`);
+        addUniqueQuery(queries, `${alias} developer update`);
+        addUniqueQuery(queries, `${alias} validator`);
+        addUniqueQuery(queries, `${alias} testnet`);
+        addUniqueQuery(queries, `${alias} mainnet`);
+      }
+    }
+    if (understanding.underlying) {
+      addUniqueQuery(queries, `${understanding.underlying} latest`);
+      addUniqueQuery(queries, `${understanding.underlying} market news`);
+    }
+  } else if (category === 'games' || category === 'gaming') {
+    for (const alias of aliases.slice(0, 3)) {
+      addUniqueQuery(queries, `${alias} game`);
+      addUniqueQuery(queries, `${alias} developer update`);
+      addUniqueQuery(queries, `${alias} release`);
+      addUniqueQuery(queries, `${alias} trailer`);
+    }
+  } else if (category === 'sports') {
+    for (const alias of aliases.slice(0, 3)) {
+      addUniqueQuery(queries, `${alias} odds`);
+      addUniqueQuery(queries, `${alias} standings`);
+      addUniqueQuery(queries, `${alias} injuries`);
+      addUniqueQuery(queries, `${alias} fixtures`);
+    }
+  }
+
+  return queries.slice(0, 12);
 }
 
 function filterCreatorAudienceEvidence(
@@ -493,9 +1040,495 @@ async function fetchCreatorAudienceMetricSnapshot(
   }
 }
 
+function officialFallbackUrlsForPredictionMarket(understanding: MarketUnderstanding): string[] {
+  const urls: string[] = [];
+  if (/\barc network\b/i.test(understanding.entity?.canonicalName || understanding.subject)) {
+    addUniqueQuery(urls, 'https://arc.io/');
+    addUniqueQuery(urls, 'https://arc.io/blog');
+    addUniqueQuery(urls, 'https://docs.arc.io/arc-chain');
+    addUniqueQuery(
+      urls,
+      'https://www.circle.com/blog/introducing-arc-an-open-layer-1-blockchain-purpose-built-for-stablecoin-finance',
+    );
+  }
+  if (
+    /\b(xaut|tether gold)\b/i.test(understanding.subject) ||
+    /\bgold\b/i.test(understanding.underlying || '')
+  ) {
+    addUniqueQuery(urls, 'https://tether.to/en/gold/');
+    addUniqueQuery(urls, 'https://www.kitco.com/');
+    addUniqueQuery(urls, 'https://www.lbma.org.uk/');
+    addUniqueQuery(urls, 'https://www.gold.org/goldhub/');
+  }
+  for (const domain of understanding.entity?.officialDomains ?? []) {
+    const normalizedDomain = domain.trim().toLowerCase();
+    if (!normalizedDomain) continue;
+    addUniqueQuery(urls, `https://${normalizedDomain}/`);
+    addUniqueQuery(urls, `https://${normalizedDomain}/blog`);
+    addUniqueQuery(urls, `https://${normalizedDomain}/news`);
+  }
+  if (/\bgta\b|\bgrand theft auto\b/i.test(understanding.subject)) {
+    addUniqueQuery(urls, 'https://www.xbox.com/en-US/games/store/grand-theft-auto-vi/9nl3wwnzlzzn');
+    addUniqueQuery(urls, 'https://www.take2games.com/ir/news');
+    addUniqueQuery(urls, 'https://www.rockstargames.com/newswire');
+  }
+  return urls.slice(0, 8);
+}
+
+function hasPredictionMarketUnderlyingGoldEvidence(
+  snapshots: FirecrawlArticleSnapshot[],
+): boolean {
+  return snapshots.some((snapshot) =>
+    /\b(kitco\.com|lbma\.org\.uk|gold\.org|goldhub|reuters\.com|cmegroup\.com|bullion)\b/i.test(
+      `${snapshot.publisher || ''} ${snapshot.url} ${snapshot.title} ${snapshot.summary || ''}`,
+    ),
+  );
+}
+
+async function fetchPredictionMarketOfficialFallbackEvidence(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): Promise<FirecrawlArticleSnapshot[]> {
+  if (!understanding?.entity?.officialDomains?.length) return [];
+  if (!/\bprediction market\b/i.test(task)) return [];
+  if (
+    !/\b(mainnet|launch|release|testnet)\b/i.test(task) &&
+    !(
+      /\b(xaut|tether gold)\b/i.test(task) ||
+      /\bgold\b/i.test(understanding.underlying || '')
+    )
+  ) {
+    return [];
+  }
+
+  const snapshots = await Promise.all(
+    officialFallbackUrlsForPredictionMarket(understanding).map(async (url) => {
+      try {
+        const markdown = await fetchUrlViaFirecrawl(url);
+        const summary = markdownToSnippet(markdown, 420);
+        if (!summary) return null;
+        if (/\bpage not found\b|\bdoesn't exist\b|\bhas been moved\b/i.test(summary)) {
+          return null;
+        }
+        const title =
+          normalizeSourceText(markdown.match(/^#\s+(.+)$/m)?.[1] || '', {
+            stripChrome: true,
+            collapseWhitespace: true,
+          }) || `${understanding.entity?.canonicalName || understanding.subject} official page`;
+        const snapshot: FirecrawlArticleSnapshot = {
+          title,
+          url,
+          publisher: extractHostname(url),
+          summary,
+        };
+        return isEntityRelevantPredictionMarketSource(snapshot, task, understanding) ? snapshot : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  const deduped = new Map<string, FirecrawlArticleSnapshot>();
+  for (const snapshot of snapshots) {
+    if (!snapshot || deduped.has(snapshot.url)) continue;
+    deduped.set(snapshot.url, snapshot);
+  }
+  return [...deduped.values()].slice(0, 4);
+}
+
+async function fetchPredictionMarketRegistryArticleEvidence(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): Promise<FirecrawlArticleSnapshot[]> {
+  if (!isPredictionMarketResearchTask(task)) return [];
+
+  const rssArticles = await fetchDynamicSources(task).catch(() => [] as GdeltArticleSnapshot[]);
+  if (rssArticles.length === 0) return [];
+
+  const snapshots = await Promise.all(
+    rssArticles.slice(0, 8).map((article) =>
+      fetchFirecrawlArticleSnapshot(article, { bypassCache: true }).catch(() => null),
+    ),
+  );
+
+  const deduped = new Map<string, FirecrawlArticleSnapshot>();
+  for (const snapshot of snapshots) {
+    if (!snapshot) continue;
+    if (matchesResolvedEntityAvoidTerms(snapshot, understanding)) continue;
+    if (!isEntityRelevantPredictionMarketSource(snapshot, task, understanding)) continue;
+    deduped.set(snapshot.url, snapshot);
+  }
+
+  return [...deduped.values()].slice(0, 6);
+}
+
+async function fetchPredictionMarketOfficialSearchEvidence(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): Promise<FirecrawlArticleSnapshot[]> {
+  if (!/\bprediction market\b/i.test(task) || !understanding?.entity?.officialDomains?.length) {
+    return [];
+  }
+
+  const canonical = stripPredictionMarketIntentSuffix(
+    understanding.entity.canonicalName || understanding.subject,
+  );
+  if (!canonical) return [];
+
+  const category = extractPredictionMarketCategory(task);
+  const queries: string[] = [];
+  for (const domain of understanding.entity.officialDomains.slice(0, 2)) {
+    addUniqueQuery(queries, `site:${domain} ${canonical}`);
+    addUniqueQuery(queries, `site:${domain} ${canonical} official announcement`);
+    if (understanding.questionType === 'launch_milestone') {
+      if (category === 'games' || category === 'gaming') {
+        addUniqueQuery(queries, `site:${domain} ${canonical} release date`);
+        addUniqueQuery(queries, `site:${domain} ${canonical} launch`);
+      } else if (category === 'crypto') {
+        addUniqueQuery(queries, `site:${domain} ${canonical} mainnet`);
+        addUniqueQuery(queries, `site:${domain} ${canonical} roadmap`);
+      }
+    }
+  }
+
+  const groups = await Promise.all(
+    queries.slice(0, 6).map(async (query) => {
+      try {
+        const [firecrawlResults, searxngResults] = await Promise.allSettled([
+          searchFirecrawlNews(query, 4, { recency: 'all' }),
+          searchSearxng(query, 4, { timeoutMs: 10_000, categories: ['news'] }),
+        ]);
+        const merged = new Map<string, FirecrawlSearchResult>();
+        for (const resultSet of [firecrawlResults, searxngResults]) {
+          if (resultSet.status !== 'fulfilled') continue;
+          for (const result of resultSet.value) {
+            const url = result.url?.trim();
+            if (!url || merged.has(url)) continue;
+            merged.set(url, result);
+          }
+        }
+        return [...merged.values()]
+          .map((result) => buildFirecrawlSearchSnapshot(result))
+          .filter((snapshot): snapshot is FirecrawlArticleSnapshot => Boolean(snapshot));
+      } catch {
+        return [] as FirecrawlArticleSnapshot[];
+      }
+    }),
+  );
+
+  const deduped = new Map<string, FirecrawlArticleSnapshot>();
+  for (const group of groups) {
+    for (const snapshot of group) {
+      if (isLikelyHomepageUrl(snapshot.url)) continue;
+      if (matchesResolvedEntityAvoidTerms(snapshot, understanding)) continue;
+      if (!isEntityRelevantPredictionMarketSource(snapshot, task, understanding)) continue;
+      if (!deduped.has(snapshot.url)) {
+        deduped.set(snapshot.url, snapshot);
+      }
+    }
+  }
+
+  return selectPredictionMarketEvidenceWithHostDiversity(
+    task,
+    [...deduped.values()],
+    4,
+  );
+}
+
+async function fetchPredictionMarketSportsAuthorityEvidence(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): Promise<FirecrawlArticleSnapshot[]> {
+  if (!/\bprediction market\b/i.test(task) || extractPredictionMarketCategory(task) !== 'sports') {
+    return [];
+  }
+
+  const canonical = stripPredictionMarketIntentSuffix(
+    understanding?.entity?.canonicalName || understanding?.subject || normalizeLiveDataSearchTask(task),
+  );
+  const competitionMeta = detectSportsCompetition(`${task} ${canonical}`);
+  const competition = competitionMeta
+    ? `${competitionMeta.league}${competitionMeta.season ? ` ${competitionMeta.season}` : ''}`
+    : canonical;
+  const queries: string[] = [];
+
+  addUniqueQuery(queries, `site:theanalyst.com ${competition} prediction`);
+  addUniqueQuery(queries, `site:theanalyst.com ${competition} winner odds`);
+  addUniqueQuery(queries, `site:oddschecker.com ${competition} odds`);
+  addUniqueQuery(queries, `site:oddschecker.com ${competition} winner odds`);
+  addUniqueQuery(queries, `site:actionnetwork.com ${competition} odds`);
+  addUniqueQuery(queries, `site:espn.com ${competition} odds`);
+  addUniqueQuery(queries, `site:sportingnews.com ${competition} odds`);
+
+  const fallbackUrls: string[] = [];
+  if (/\bFIFA World Cup\b/i.test(competition)) {
+    addUniqueQuery(fallbackUrls, 'https://www.foxsports.com/stories/soccer/world-cup-2026-champion-odds');
+    addUniqueQuery(
+      fallbackUrls,
+      'https://www.espn.com/espn/betting/story/_/id/48386952/espn-soccer-futbol-world-cup-betting-odds-championship-groups',
+    );
+    addUniqueQuery(fallbackUrls, 'https://www.oddschecker.com/us/soccer/world-cup/winner');
+    addUniqueQuery(fallbackUrls, 'https://www.oddschecker.com/us/soccer/world-cup');
+    addUniqueQuery(
+      fallbackUrls,
+      'https://theanalyst.com/articles/fifa-world-cup-2026-groups-predictions-previews',
+    );
+    addUniqueQuery(fallbackUrls, 'https://www.covers.com/world-cup/odds');
+    addUniqueQuery(fallbackUrls, 'https://www.cbssports.com/betting/news/world-cup-odds/');
+  }
+
+  const fallbackSnapshots = await Promise.all(
+    fallbackUrls.slice(0, 7).map(async (url) => {
+      try {
+        const markdown = await fetchUrlViaFirecrawl(url);
+        const summary = markdownToSnippet(markdown, 520);
+        if (!summary) return null;
+        const title =
+          normalizeSourceText(markdown.match(/^#\s+(.+)$/m)?.[1] || '', {
+            stripChrome: true,
+            collapseWhitespace: true,
+          }) || `${competition} odds and predictions`;
+        const snapshot: FirecrawlArticleSnapshot = {
+          title,
+          url,
+          publisher: extractHostname(url),
+          summary,
+        };
+        return isEntityRelevantPredictionMarketSource(snapshot, task, understanding)
+          ? snapshot
+          : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  if (process.env.RETR_DEBUG && fallbackUrls.length > 0) {
+    const kept = fallbackSnapshots.filter(Boolean) as FirecrawlArticleSnapshot[];
+    console.error(
+      `[RETR][sports-fallback] competition="${competition}" urls=${fallbackUrls.length} kept=${kept.length} keptHosts=${kept
+        .map((snapshot) => extractHostname(snapshot.url) || snapshot.url)
+        .join(',')}`,
+    );
+  }
+
+  const groups = await Promise.all(
+    queries.slice(0, 6).map(async (query) => {
+      try {
+        const [firecrawlResults, searxngResults] = await Promise.allSettled([
+          searchFirecrawlNews(query, 4, { recency: 'all' }),
+          searchSearxng(query, 4, { timeoutMs: 10_000, categories: ['news'] }),
+        ]);
+        const merged = new Map<string, FirecrawlSearchResult>();
+        for (const resultSet of [firecrawlResults, searxngResults]) {
+          if (resultSet.status !== 'fulfilled') continue;
+          for (const result of resultSet.value) {
+            const url = result.url?.trim();
+            if (!url || merged.has(url)) continue;
+            merged.set(url, result);
+          }
+        }
+        return [...merged.values()]
+          .map((result) => buildFirecrawlSearchSnapshot(result))
+          .filter((snapshot): snapshot is FirecrawlArticleSnapshot => Boolean(snapshot));
+      } catch {
+        return [] as FirecrawlArticleSnapshot[];
+      }
+    }),
+  );
+
+  const deduped = new Map<string, FirecrawlArticleSnapshot>();
+  for (const snapshot of fallbackSnapshots) {
+    if (!snapshot) continue;
+    if (isLikelyHomepageUrl(snapshot.url)) continue;
+    if (matchesResolvedEntityAvoidTerms(snapshot, understanding)) continue;
+    if (!isEntityRelevantPredictionMarketSource(snapshot, task, understanding)) continue;
+    deduped.set(snapshot.url, snapshot);
+  }
+  for (const group of groups) {
+    for (const snapshot of group) {
+      if (isLikelyHomepageUrl(snapshot.url)) continue;
+      if (matchesResolvedEntityAvoidTerms(snapshot, understanding)) continue;
+      if (!isEntityRelevantPredictionMarketSource(snapshot, task, understanding)) continue;
+      if (!deduped.has(snapshot.url)) {
+        deduped.set(snapshot.url, snapshot);
+      }
+    }
+  }
+
+  return selectPredictionMarketEvidenceWithHostDiversity(task, [...deduped.values()], 4);
+}
+
+function mergePredictionMarketCurrentEventSnapshots(
+  task: string,
+  currentEvents: CurrentEventsSnapshot | null,
+  existing: FirecrawlArticleSnapshot[],
+  understanding: MarketUnderstanding | null,
+): FirecrawlArticleSnapshot[] {
+  if (!/\bprediction market\b/i.test(task)) return existing;
+  if (existing.length >= 4) return existing;
+
+  const deduped = new Map<string, FirecrawlArticleSnapshot>();
+  for (const snapshot of existing) {
+    deduped.set(snapshot.url, snapshot);
+  }
+  for (const snapshot of currentEvents?.article_snapshots ?? []) {
+    if (isGoogleNewsUrl(snapshot.url) || isGoogleConsentUrl(snapshot.url)) {
+      if (process.env.RETR_DEBUG) {
+        console.error(`[RETR][merge-current] skip google url=${snapshot.url}`);
+      }
+      continue;
+    }
+    if (!isEntityRelevantPredictionMarketSource(snapshot, task, understanding)) {
+      if (process.env.RETR_DEBUG) {
+        console.error(
+          `[RETR][merge-current] skip entity gate url=${snapshot.url} title=${snapshot.title}`,
+        );
+      }
+      continue;
+    }
+    if (!deduped.has(snapshot.url)) {
+      deduped.set(snapshot.url, snapshot);
+    }
+  }
+  const merged = [...deduped.values()];
+  if (merged.length === existing.length) return existing;
+
+  return selectPredictionMarketEvidenceWithHostDiversity(
+    task,
+    filterPredictionMarketResearchEvidence(
+      task,
+      [...new Map(merged.map((snapshot) => [snapshot.url, snapshot])).values()],
+      understanding,
+    ),
+    PREDICTION_MARKET_EVIDENCE_LIMIT,
+  );
+}
+
+async function recoverPredictionMarketSnapshotsFromCurrentEvents(
+  task: string,
+  currentEvents: CurrentEventsSnapshot | null,
+  understanding: MarketUnderstanding | null,
+): Promise<FirecrawlArticleSnapshot[]> {
+  if (!/\bprediction market\b/i.test(task)) return [];
+  const articles = currentEvents?.articles ?? [];
+  if (articles.length === 0) return [];
+
+  const recovered = await Promise.all(
+    articles.slice(0, 6).map(async (article) => {
+      const rawUrl = article.article_url?.trim() || article.url?.trim() || '';
+      if (!rawUrl) return null;
+      const resolvedUrl = await resolveArticleUrl(rawUrl);
+      const directUrl =
+        resolvedUrl && !isGoogleNewsUrl(resolvedUrl) && !isLikelyHomepageUrl(resolvedUrl)
+          ? resolvedUrl
+          : await recoverDirectArticleUrlFromSearch({
+              title: article.title,
+              publisher: article.publisher,
+              domain: article.domain,
+            });
+      const usableUrl = directUrl || (isGoogleNewsUrl(rawUrl) ? '' : rawUrl);
+      if (!usableUrl || isLikelyHomepageUrl(usableUrl)) {
+        if (process.env.RETR_DEBUG) {
+          console.error(
+            `[RETR][recover-current] unusable raw=${rawUrl} resolved=${resolvedUrl || ''} direct=${directUrl || ''}`,
+          );
+        }
+        return null;
+      }
+      const snapshot: FirecrawlArticleSnapshot = {
+        title: article.title,
+        url: usableUrl,
+        publisher: article.publisher || article.domain,
+        seen_at: article.seen_at,
+        summary: article.title,
+      };
+      if (matchesResolvedEntityAvoidTerms(snapshot, understanding)) {
+        if (process.env.RETR_DEBUG) {
+          console.error(
+            `[RETR][recover-current] avoidTerms url=${usableUrl} title=${article.title}`,
+          );
+        }
+        return null;
+      }
+      if (!isEntityRelevantPredictionMarketSource(snapshot, task, understanding)) {
+        if (process.env.RETR_DEBUG) {
+          console.error(
+            `[RETR][recover-current] entityGate url=${usableUrl} title=${article.title}`,
+          );
+        }
+        return null;
+      }
+      return snapshot;
+    }),
+  );
+
+  const deduped = new Map<string, FirecrawlArticleSnapshot>();
+  for (const snapshot of recovered) {
+    if (!snapshot || deduped.has(snapshot.url)) continue;
+    deduped.set(snapshot.url, snapshot);
+  }
+  return [...deduped.values()];
+}
+
+async function enrichPredictionMarketSnapshotsFromPages(
+  task: string,
+  understanding: MarketUnderstanding | null,
+  snapshots: FirecrawlArticleSnapshot[],
+): Promise<FirecrawlArticleSnapshot[]> {
+  if (!/\bprediction market\b/i.test(task)) return snapshots;
+  if (snapshots.length === 0) return snapshots;
+
+  const candidates = snapshots
+    .filter((snapshot) => !isLikelyHomepageUrl(snapshot.url))
+    .filter((snapshot) => !isLowValueSocialSourceUrl(snapshot.url))
+    .slice(0, 6);
+
+  const enriched = await Promise.all(
+    candidates.map(async (snapshot) => {
+      try {
+        const markdown = await fetchUrlViaFirecrawl(snapshot.url);
+        const summary = markdownToSnippet(markdown, 520);
+        if (!summary) return snapshot;
+        const title =
+          normalizeSourceText(markdown.match(/^#\s+(.+)$/m)?.[1] || '', {
+            stripChrome: true,
+            collapseWhitespace: true,
+          }) || snapshot.title;
+        const enrichedSnapshot: FirecrawlArticleSnapshot = {
+          ...snapshot,
+          title,
+          summary,
+        };
+        if (matchesResolvedEntityAvoidTerms(enrichedSnapshot, understanding)) {
+          return null;
+        }
+        return enrichedSnapshot;
+      } catch {
+        return snapshot;
+      }
+    }),
+  );
+
+  const merged = new Map<string, FirecrawlArticleSnapshot>();
+  for (const snapshot of snapshots) {
+    merged.set(snapshot.url, snapshot);
+  }
+  for (const snapshot of enriched) {
+    if (!snapshot) continue;
+    merged.set(snapshot.url, snapshot);
+  }
+  return [...merged.values()];
+}
+
 function splitExpandedTaskQueries(task: string): string[] {
-  return task
+  const normalizedInput =
+    task.includes('|') || !/\bprediction market\b/i.test(task)
+      ? task
+      : normalizeLiveDataSearchTask(task);
+
+  return normalizedInput
     .split('|')
+    .map((query) => normalizeLiveDataSearchTask(query))
     .map((query) => query.trim())
     .filter(Boolean);
 }
@@ -504,6 +1537,468 @@ function addUniqueQuery(queries: string[], query: string | undefined): void {
   const value = query?.replace(/\s+/g, ' ').trim();
   if (!value || queries.includes(value)) return;
   queries.push(value);
+}
+
+function buildPredictionMarketResearchBrief(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): Record<string, unknown> | null {
+  if (!/\bprediction market\b/i.test(task)) return null;
+  return {
+    query: cleanPredictionMarketResearchTaskForSearch(task),
+    subject: understanding?.subject ?? null,
+    underlying: understanding?.underlying ?? null,
+    question_type: understanding?.questionType ?? null,
+    resolution_date: understanding?.resolutionDate ?? null,
+    listed_outcomes: extractPredictionMarketListedOutcomes(task),
+    category: extractPredictionMarketCategory(task),
+    provider: extractPredictionMarketProvider(task),
+    entity: understanding?.entity ?? null,
+    avoid_drift: true,
+  };
+}
+
+function buildPredictionMarketSearchSeed(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): string {
+  if (!understanding) {
+    // No LLM understanding (timeout / parse failure). Do NOT dump the literal
+    // "Will X reach $Y by <date>?" sentence into search — that retrieves little and is the
+    // ambiguous-fallthrough case that produced false "thin evidence". Derive subject-scoped
+    // queries deterministically; fall back to the cleaned task only if the subject can't be
+    // isolated (e.g. sports markets, which get their own query builder downstream).
+    const cleaned = normalizeLiveDataSearchTask(task);
+    const subjectQueries = buildPredictionMarketEntityQueries(task, cleaned, null);
+    return subjectQueries.length > 0 ? subjectQueries.join(' | ') : cleaned || task;
+  }
+
+  const cleaned = normalizeLiveDataSearchTask(task);
+  const queries = [...buildPredictionMarketDiscoveryQueries(task, understanding), ...understanding.searchQueries];
+  for (const query of buildPredictionMarketEntityQueries(task, cleaned, understanding)) {
+    addUniqueQuery(queries, query);
+  }
+  const entity = understanding.entity;
+  if (entity?.canonicalName) {
+    addUniqueQuery(queries, `${entity.canonicalName} latest news`);
+    addUniqueQuery(queries, `${entity.canonicalName} official announcement`);
+  }
+  for (const domain of entity?.officialDomains ?? []) {
+    const canonical = entity?.canonicalName || understanding.subject;
+    addUniqueQuery(queries, `site:${domain} ${canonical}`);
+    if (/\b(mainnet|launch|release)\b/i.test(understanding.subject)) {
+      addUniqueQuery(queries, `site:${domain} ${canonical} roadmap`);
+      addUniqueQuery(queries, `site:${domain} ${canonical} announcement`);
+    }
+  }
+  if (understanding.underlying) {
+    addUniqueQuery(queries, `${understanding.underlying} latest`);
+    addUniqueQuery(queries, `${understanding.underlying} analysis`);
+  }
+  if (/\bworld cup|fifa\b/i.test(understanding.subject)) {
+    addUniqueQuery(queries, 'site:fifa.com FIFA World Cup 2026');
+    addUniqueQuery(queries, 'FIFA World Cup 2026 favorites odds');
+    addUniqueQuery(queries, 'site:theanalyst.com FIFA World Cup 2026 prediction');
+    addUniqueQuery(queries, 'site:oddschecker.com FIFA World Cup 2026 odds');
+  }
+  if (/\bxaut|tether gold\b/i.test(understanding.subject)) {
+    addUniqueQuery(queries, 'site:kitco.com gold price forecast');
+    addUniqueQuery(queries, 'site:reuters.com gold prices');
+    addUniqueQuery(queries, 'site:lbma.org.uk gold market');
+    addUniqueQuery(queries, 'spot gold latest news');
+    addUniqueQuery(queries, 'gold market outlook 2026');
+    addUniqueQuery(queries, 'world gold council gold outlook');
+  }
+  if (/\bgta\b|\bgrand theft auto\b/i.test(understanding.subject)) {
+    addUniqueQuery(queries, 'site:rockstargames.com GTA 6');
+    addUniqueQuery(queries, 'site:take2games.com Grand Theft Auto VI');
+    addUniqueQuery(queries, 'site:businesswire.com Take-Two Grand Theft Auto VI');
+  }
+  return [...new Set(queries.map((query) => query.trim()).filter(Boolean))].join(' | ');
+}
+
+function matchesResolvedEntityAvoidTerms(
+  snapshot: FirecrawlArticleSnapshot,
+  understanding: MarketUnderstanding | null,
+): boolean {
+  const avoidTerms = understanding?.entity?.avoidTerms ?? [];
+  if (avoidTerms.length === 0) return false;
+  const haystack =
+    `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase();
+  return avoidTerms.some((term) => term && haystack.includes(term.toLowerCase()));
+}
+
+const PREDICTION_MARKET_ENTITY_TOKEN_STOP_WORDS = new Set([
+  'will',
+  'before',
+  'after',
+  'between',
+  'reach',
+  'hit',
+  'launch',
+  'release',
+  'mainnet',
+  'win',
+  'winner',
+  'price',
+  'target',
+  'protocol',
+  'network',
+  'blockchain',
+  'coin',
+  'token',
+  'cryptocurrency',
+  'team',
+  'season',
+  'finals',
+  'final',
+  'playoffs',
+  'official',
+  'announcement',
+  'latest',
+  'market',
+  'markets',
+  'capitalization',
+  'cap',
+  'trillion',
+]);
+
+function isPredictionMarketCategoryAuthorityHost(task: string, hostname: string): boolean {
+  const category = extractPredictionMarketCategory(task);
+  if (category === 'sports') {
+    return /\b(espn\.com|nba\.com|nfl\.com|mlb\.com|nhl\.com|cbssports\.com|foxsports\.com|sportingnews\.com|theanalyst\.com|oddschecker\.com|actionnetwork\.com|covers\.com|draftkings\.com|fanduel\.com|vegasinsider\.com|sports\.yahoo\.com|si\.com|rotowire\.com|fifa\.com|uefa\.com)\b/i.test(
+      hostname,
+    );
+  }
+  if (category === 'games' || category === 'gaming') {
+    return /\b(rockstargames\.com|take2games\.com|ign\.com|gamespot\.com|polygon\.com|eurogamer\.net|kotaku\.com|businesswire\.com|reuters\.com|playstation\.com|xbox\.com|steampowered\.com|gamingbolt\.com)\b/i.test(
+      hostname,
+    );
+  }
+  if (category === 'crypto') {
+    return /\b(coingecko\.com|coinmarketcap\.com|defillama\.com|theblock\.co|coindesk\.com|cointelegraph\.com|decrypt\.co|binance\.com|coinbase\.com|kraken\.com|reuters\.com|bloomberg\.com|wsj\.com|ft\.com|kitco\.com|lbma\.org\.uk|cmegroup\.com|circle\.com|arc\.io|arc\.network)\b/i.test(
+      hostname,
+    );
+  }
+  return false;
+}
+
+function extractPredictionMarketEntityPhrases(
+  understanding: MarketUnderstanding | null,
+): string[] {
+  if (!understanding?.entity) return [];
+  return [
+    understanding.entity.canonicalName,
+    ...understanding.entity.aliases,
+    understanding.subject,
+    understanding.underlying,
+  ]
+    .map((value) => value?.replace(/\s+/g, ' ').trim() || '')
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function extractPredictionMarketEntityTokens(
+  understanding: MarketUnderstanding | null,
+): string[] {
+  if (!understanding?.entity) return [];
+  const tokens = new Set<string>();
+  for (const phrase of extractPredictionMarketEntityPhrases(understanding)) {
+    for (const token of phrase
+      .replace(/[()'",.:;/?-]/g, ' ')
+      .split(/\s+/)
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean)) {
+      if (/^\d+$/.test(token)) continue;
+      if (/^(?:19|20)\d{2}$/.test(token)) continue;
+      if (token.length < 3 && !/^[a-z]{2,10}$/i.test(token)) continue;
+      if (PREDICTION_MARKET_ENTITY_TOKEN_STOP_WORDS.has(token)) continue;
+      tokens.add(token);
+    }
+  }
+  return [...tokens].slice(0, 12);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function countDistinctPredictionMarketEntityTokenMatches(
+  haystack: string,
+  understanding: MarketUnderstanding | null,
+): number {
+  let matches = 0;
+  for (const token of extractPredictionMarketEntityTokens(understanding)) {
+    if (new RegExp(`\\b${escapeRegExp(token)}\\b`, 'i').test(haystack)) {
+      matches += 1;
+    }
+  }
+  return matches;
+}
+
+function hasStrongPredictionMarketPhraseMatch(
+  haystack: string,
+  understanding: MarketUnderstanding | null,
+): boolean {
+  return extractPredictionMarketEntityPhrases(understanding).some((phrase) => {
+    const normalized = phrase.toLowerCase();
+    const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+    if (wordCount < 2) return false;
+    return new RegExp(`\\b${escapeRegExp(normalized)}\\b`, 'i').test(haystack);
+  });
+}
+
+function hasPredictionMarketSportsContext(haystack: string): boolean {
+  return /\b(nba|nfl|mlb|nhl|uefa|fifa|champions league|world cup|finals|playoffs|season|standings|odds|injury|injuries|roster|coach|game|match|series|championship|title|team|player)\b/i.test(
+    haystack,
+  );
+}
+
+/**
+ * Category-consistent CONTENT terms that real coverage of the resolved subject carries but a
+ * same-named homonym does not — used to rescue obscure single-word entities (e.g. "Monad" the
+ * blockchain) from the strict token-count thresholds without reopening drift. Intentionally
+ * excludes generic words like "protocol"/"token"/"quantum" that leak into hardware/quantum
+ * docs, so it admits Monad-the-blockchain while still rejecting Monad-the-FP-concept,
+ * curacao.com, and Xilinx Zynq pages.
+ */
+function hasPredictionMarketCategoryContentSignal(haystack: string, task: string): boolean {
+  const category = extractPredictionMarketCategory(task);
+  if (category === 'crypto' || /\b(mainnet|testnet|blockchain)\b/i.test(task)) {
+    return /\b(blockchain|mainnet|testnet|layer[- ]?1|l1|evm|web3|defi|cryptocurrency|crypto|tokenomics|staking|validator|on-chain|rollup|smart contract|stablecoin|consensus mechanism)\b/i.test(
+      haystack,
+    );
+  }
+  if (category === 'games' || category === 'gaming') {
+    return /\b(release date|gameplay|trailer|developer|publisher|game studio|console|playstation|ps5|xbox|steam|launch trailer)\b/i.test(
+      haystack,
+    );
+  }
+  return false;
+}
+
+function hasPredictionMarketEditorialArticleSignal(snapshot: FirecrawlArticleSnapshot, task: string): boolean {
+  const parsed = parseSnapshotUrl(snapshot);
+  const hostname = normalizedHostnameFromUrl(parsed);
+  const haystack = `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''}`.toLowerCase();
+  if (extractPredictionMarketCategory(task) === 'crypto') {
+    const strongEditorialHost =
+      /\b(coindesk\.com|theblock\.co|decrypt\.co|forbes\.com|reuters\.com|bloomberg\.com|wsj\.com|ft\.com|cointelegraph\.com|blockworks\.co|bankless\.com|messari\.io|coinmetrics\.io|glassnode\.com)\b/i.test(
+        hostname,
+      );
+    const articleStyle =
+      hasArticleLikePath(snapshot) ||
+      /\b(news|analysis|report|insight|editorial|market analysis|etf|macro|flows|institutional)\b/i.test(
+        haystack,
+      );
+    return strongEditorialHost && articleStyle;
+  }
+  return false;
+}
+
+function hasMeaningfulUnderlyingMatch(
+  haystack: string,
+  understanding: MarketUnderstanding | null,
+): boolean {
+  if (!understanding?.underlying) return false;
+  const normalized = understanding.underlying.toLowerCase().trim();
+  if (!normalized) return false;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length >= 2) {
+    return new RegExp(`\\b${escapeRegExp(normalized)}\\b`, 'i').test(haystack);
+  }
+  if (normalized.length < 4) return false;
+  return new RegExp(`\\b${escapeRegExp(normalized)}\\b`, 'i').test(haystack);
+}
+
+function isEntityRelevantPredictionMarketSource(
+  snapshot: FirecrawlArticleSnapshot,
+  task: string,
+  understanding: MarketUnderstanding | null,
+): boolean {
+  if (!understanding?.entity) return true;
+  const parsed = parseSnapshotUrl(snapshot);
+  const hostname = normalizedHostnameFromUrl(parsed);
+  const haystack =
+    `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase();
+  if (!haystack.trim()) return false;
+  if (matchesResolvedEntityAvoidTerms(snapshot, understanding)) return false;
+
+  if (
+    understanding.entity.officialDomains.some(
+      (domain) => domain && hostnameMatches(hostname, domain.toLowerCase()),
+    )
+  ) {
+    return true;
+  }
+
+  if (hasStrongPredictionMarketPhraseMatch(haystack, understanding)) {
+    return true;
+  }
+
+  const distinctTokenMatches = countDistinctPredictionMarketEntityTokenMatches(
+    haystack,
+    understanding,
+  );
+  const authoritativeCategorySource = isPredictionMarketCategoryAuthorityHost(task, hostname);
+  const underlyingMatch = hasMeaningfulUnderlyingMatch(haystack, understanding);
+  const canonicalWords = understanding.entity.canonicalName
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  const canonicalSingleToken = canonicalWords.length === 1;
+  const sportsTask = extractPredictionMarketCategory(task) === 'sports';
+  const sportsContext = hasPredictionMarketSportsContext(haystack);
+  const sportsWinnerMarket = isSportsWinnerPredictionMarketTask(task, understanding);
+
+  if (!sportsTask && authoritativeCategorySource && (distinctTokenMatches >= 1 || underlyingMatch)) {
+    return true;
+  }
+
+  if (sportsTask) {
+    if (!sportsContext) return false;
+    if (sportsWinnerMarket && !hasSportsWinnerMarketEvidenceSignal(haystack)) {
+      return false;
+    }
+    if (
+      sportsWinnerMarket &&
+      hasSportsWinnerMarketMatchNoiseSignal(haystack) &&
+      !/\b(winner odds|outright|favorites|power rankings|team rankings|re-ranking|re-rank|contender|contenders)\b/i.test(
+        haystack,
+      )
+    ) {
+      return false;
+    }
+    return distinctTokenMatches >= 2 || hasStrongPredictionMarketPhraseMatch(haystack, understanding);
+  }
+
+  if (canonicalSingleToken) {
+    // A one-word entity (e.g. "Monad") can NEVER reach distinctTokenMatches >= 2, so the
+    // thresholds below silently reject all real coverage except official-domain and
+    // category-authority hosts — that is why an obscure crypto launch surfaced only
+    // CoinMarketCap. Rescue sources that name the canonical entity AND carry strong
+    // category-consistent content (crypto/games terms); the homonym pages do not.
+    const canonicalToken = canonicalWords[0];
+    const canonicalTokenMatch = canonicalToken
+      ? new RegExp(`\\b${escapeRegExp(canonicalToken)}\\b`, 'i').test(haystack)
+      : false;
+    if (canonicalTokenMatch && hasPredictionMarketCategoryContentSignal(haystack, task)) {
+      return true;
+    }
+    if (understanding.entity.ambiguity === 'low') {
+      return distinctTokenMatches >= 2 || underlyingMatch;
+    }
+    return distinctTokenMatches >= 2 && (underlyingMatch || authoritativeCategorySource);
+  }
+
+  if (understanding.entity.ambiguity === 'high') {
+    return distinctTokenMatches >= 2;
+  }
+  if (understanding.entity.ambiguity === 'medium') {
+    return distinctTokenMatches >= 2;
+  }
+  return distinctTokenMatches >= 1 || underlyingMatch;
+}
+
+function resolvedEntitySourceBoost(
+  snapshot: FirecrawlArticleSnapshot,
+  understanding: MarketUnderstanding | null,
+): number {
+  if (!understanding?.entity) return 0;
+  const haystack =
+    `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase();
+  let score = 0;
+  for (const domain of understanding.entity.officialDomains) {
+    if (domain && haystack.includes(domain.toLowerCase())) score += 24;
+  }
+  if (haystack.includes(understanding.entity.canonicalName.toLowerCase())) score += 24;
+  for (const alias of understanding.entity.aliases) {
+    if (alias && haystack.includes(alias.toLowerCase())) score += 12;
+  }
+  if (understanding.underlying && haystack.includes(understanding.underlying.toLowerCase())) {
+    score += 14;
+  }
+  if (matchesResolvedEntityAvoidTerms(snapshot, understanding)) score -= 150;
+  return score;
+}
+
+function buildPredictionMarketSourceDiagnostics(
+  task: string,
+  understanding: MarketUnderstanding | null,
+  snapshots: FirecrawlArticleSnapshot[],
+  backendDiagnostics: SearchBackendDiagnostic[] = [],
+): Record<string, unknown> | null {
+  if (!/\bprediction market\b/i.test(task)) return null;
+  const diversityKeyForSnapshot = (snapshot: FirecrawlArticleSnapshot): string => {
+    const host = sourceHostname(snapshot.url);
+    if (host && host !== 'news.google.com') return host;
+    const publisher = (snapshot.publisher || '')
+      .toLowerCase()
+      .replace(/^www\./, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return publisher || host;
+  };
+  const hosts = new Set(
+    snapshots
+      .map((snapshot) => diversityKeyForSnapshot(snapshot))
+      .filter(Boolean),
+  );
+  const officialDomains = understanding?.entity?.officialDomains ?? [];
+  const hasOfficialMatch = snapshots.some((snapshot) =>
+    officialDomains.some((domain) =>
+      `${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase().includes(domain.toLowerCase()),
+    ),
+  );
+  const authoritativeCategoryMatches = snapshots.filter((snapshot) =>
+    isPredictionMarketCategoryAuthorityHost(
+      task,
+      normalizedHostnameFromUrl(parseSnapshotUrl(snapshot)),
+    ),
+  ).length;
+  const relevantEntityMatches = snapshots.filter((snapshot) =>
+    isEntityRelevantPredictionMarketSource(snapshot, task, understanding),
+  ).length;
+  const drifted = snapshots.some((snapshot) => matchesResolvedEntityAvoidTerms(snapshot, understanding));
+  const diversity = hosts.size >= 2 ? 'sufficient' : 'insufficient';
+  const unresolvedEntity =
+    Boolean(understanding?.entity) &&
+    ((snapshots.length > 0 && relevantEntityMatches === 0) ||
+      (snapshots.length === 0 && understanding?.entity?.ambiguity === 'high'));
+  const backendFailures = backendDiagnostics
+    .filter((backend) => backend.status === 'unavailable' || backend.status === 'degraded')
+    .map((backend) =>
+      backend.lastError
+        ? `${backend.provider}: ${backend.lastError}`
+        : `${backend.provider}: unavailable`,
+    );
+  const searchBackendUnhealthy =
+    backendDiagnostics.length > 0 &&
+    backendDiagnostics.every((backend) => backend.status === 'unavailable' || backend.status === 'degraded');
+  const driftRisk = drifted
+    ? 'high'
+    : unresolvedEntity
+      ? 'high'
+    : understanding?.entity?.ambiguity === 'high'
+      ? 'high'
+      : understanding?.entity?.ambiguity === 'medium' && !hasOfficialMatch
+        ? 'medium'
+        : diversity === 'insufficient'
+          ? 'medium'
+          : 'low';
+  return {
+    source_diversity: diversity,
+    unique_source_domains: hosts.size,
+    has_official_match: hasOfficialMatch,
+    authoritative_category_matches: authoritativeCategoryMatches,
+    relevant_entity_matches: relevantEntityMatches,
+    unresolved_entity: unresolvedEntity,
+    drift_risk: driftRisk,
+    entity_ambiguity: understanding?.entity?.ambiguity ?? null,
+    search_backend_unhealthy: searchBackendUnhealthy,
+    search_backend_failures: backendFailures,
+    search_backends: backendDiagnostics,
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -521,7 +2016,7 @@ function buildResearchQueryVariants(task: string): string[] {
     return sportsPredictionQueries;
   }
   const queries: string[] = [];
-  for (const subjectQuery of buildPredictionMarketSubjectQueries(task, cleanedTask)) {
+  for (const subjectQuery of buildPredictionMarketEntityQueries(task, cleanedTask, null)) {
     addUniqueQuery(queries, subjectQuery);
   }
   const splitQueries = splitExpandedTaskQueries(cleanedTask);
@@ -562,7 +2057,7 @@ function buildResearchQueryVariants(task: string): string[] {
     }
   }
 
-  return queries.slice(0, 10);
+  return queries.slice(0, 16);
 }
 
 const FIRECRAWL_SCAFFOLDING_PREFIXES: RegExp[] = [
@@ -715,6 +2210,14 @@ function buildForecastingFirecrawlVariants(baseQuery: string, intent: Forecastin
     addUniqueQuery(variants, 'bitcoin halving cycle analysis');
   }
 
+  if (/\bxaut\b|\btether gold\b|\bgold\b/.test(lowerEntity)) {
+    addUniqueQuery(variants, `gold price forecast ${targetYear || new Date().getUTCFullYear()}`);
+    addUniqueQuery(variants, 'spot gold price latest');
+    addUniqueQuery(variants, 'site:kitco.com gold price forecast');
+    addUniqueQuery(variants, 'site:lbma.org.uk gold market');
+    addUniqueQuery(variants, 'site:reuters.com gold prices');
+  }
+
   return variants;
 }
 
@@ -729,6 +2232,10 @@ function buildCurrentStateFirecrawlVariants(baseQuery: string): string[] {
   if (broadAssetLike) {
     addUniqueQuery(variants, `${baseQuery} market analysis`);
     addUniqueQuery(variants, `${baseQuery} news ${new Date().getUTCFullYear()}`);
+    addUniqueQuery(variants, `site:coindesk.com ${baseQuery} news`);
+    addUniqueQuery(variants, `site:theblock.co ${baseQuery} analysis`);
+    addUniqueQuery(variants, `site:decrypt.co ${baseQuery} news`);
+    addUniqueQuery(variants, `site:reuters.com ${baseQuery} crypto`);
   } else if (creatorAudienceLike) {
     addUniqueQuery(variants, `${baseQuery} current subscriber count`);
     addUniqueQuery(variants, `${baseQuery} live subscriber count`);
@@ -738,9 +2245,22 @@ function buildCurrentStateFirecrawlVariants(baseQuery: string): string[] {
     addUniqueQuery(variants, `${baseQuery} official announcement`);
     addUniqueQuery(variants, `${baseQuery} roadmap`);
     addUniqueQuery(variants, `${baseQuery} latest news`);
-    if (/\barc\b/i.test(baseQuery)) {
-      addUniqueQuery(variants, 'ARC blockchain mainnet launch 2026');
-      addUniqueQuery(variants, 'Circle ARC mainnet 2026');
+    if (isArcNetworkTask(baseQuery)) {
+      addUniqueQuery(variants, 'ARC Network crypto');
+      addUniqueQuery(variants, 'ARC Network blockchain');
+      addUniqueQuery(variants, 'Circle Arc blockchain');
+      addUniqueQuery(variants, 'ARC stablecoin-native L1 blockchain');
+      addUniqueQuery(variants, 'site:arc.network ARC Network mainnet');
+      addUniqueQuery(variants, 'site:arc.network ARC Network testnet mainnet');
+      addUniqueQuery(variants, 'site:arc.network ARC Network launch');
+      addUniqueQuery(variants, 'site:circle.com ARC Network blockchain');
+      addUniqueQuery(variants, 'site:arc.io ARC stablecoin-native L1 blockchain');
+    }
+    if (/\bgta\s*6\b|\bgrand theft auto\s*(?:6|vi)\b/i.test(baseQuery)) {
+      addUniqueQuery(variants, 'site:rockstargames.com GTA 6 release date');
+      addUniqueQuery(variants, 'site:rockstargames.com Grand Theft Auto VI');
+      addUniqueQuery(variants, 'site:take2games.com Grand Theft Auto VI release');
+      addUniqueQuery(variants, 'Rockstar Games GTA 6 release date latest');
     }
   } else if (/\blandscape\b|\becosystem\b/i.test(baseQuery)) {
     addUniqueQuery(variants, `${baseQuery} analysis`);
@@ -749,20 +2269,60 @@ function buildCurrentStateFirecrawlVariants(baseQuery: string): string[] {
   return variants;
 }
 
-export function buildPrimaryFirecrawlQueryVariants(task: string): string[] {
-  const cleanedTask = normalizeLiveDataSearchTask(task);
-  const sportsPredictionQueries = buildSportsPredictionMarketQueries(task, cleanedTask);
+export function buildPrimaryFirecrawlQueryVariants(
+  task: string,
+  contextTask = task,
+  understanding?: MarketUnderstanding | null,
+): string[] {
+  const cleanedContextTask = normalizeLiveDataSearchTask(contextTask);
+  const sportsPredictionQueries = buildSportsPredictionMarketQueries(
+    contextTask,
+    cleanedContextTask,
+    understanding ?? null,
+  );
   if (sportsPredictionQueries.length > 0) {
     return sportsPredictionQueries;
   }
-  const splitQueries = splitExpandedTaskQueries(cleanedTask);
-  const baseQueries = splitQueries.length > 0 ? splitQueries : [cleanedTask];
+  const splitQueries = splitExpandedTaskQueries(task);
+  const normalizedTask = normalizeLiveDataSearchTask(task);
+  const category = extractPredictionMarketCategory(contextTask) || extractPredictionMarketCategory(task);
+  const isPredictionTask =
+    /\bprediction market\b/i.test(contextTask) || /\bprediction market\b/i.test(task);
+  const predictionLaunchTask =
+    isPredictionTask && /\b(launch|release|ship|come out|debut|available|mainnet)\b/i.test(contextTask);
+  const baseQueries =
+    splitQueries.length > 0
+      ? splitQueries
+      : [normalizedTask || cleanedContextTask];
   const queries: string[] = [];
+  const subjectQueries = buildPredictionMarketSubjectQueries(
+    contextTask,
+    cleanedContextTask,
+    understanding ?? null,
+  );
+  const entityQueries = isPredictionTask
+    ? buildPredictionMarketEntityQueries(
+        contextTask,
+        cleanedContextTask,
+        understanding ?? null,
+      )
+    : [];
+  const discoveryQueries = isPredictionTask
+    ? buildPredictionMarketDiscoveryQueries(contextTask, understanding ?? null)
+    : [];
 
   // Lead with subject-scoped queries for non-sports prediction markets so retrieval is
   // about the market's actual subject, not the literal "Will X by <date>?" phrasing.
-  for (const subjectQuery of buildPredictionMarketSubjectQueries(task, cleanedTask)) {
-    addUniqueQuery(queries, subjectQuery);
+  if (isPredictionTask) {
+    for (const subjectQuery of subjectQueries) {
+      addUniqueQuery(queries, subjectQuery);
+    }
+    for (const subjectQuery of entityQueries) {
+      addUniqueQuery(queries, subjectQuery);
+    }
+    for (const subjectQuery of discoveryQueries) {
+      addUniqueQuery(queries, subjectQuery);
+    }
   }
 
   for (const query of baseQueries) {
@@ -774,9 +2334,11 @@ export function buildPrimaryFirecrawlQueryVariants(task: string): string[] {
 
     addUniqueQuery(queries, primary);
 
-    const enrichmentVariants = forecastingIntent.forecasting
-      ? buildForecastingFirecrawlVariants(primary, forecastingIntent)
-      : buildCurrentStateFirecrawlVariants(primary);
+    const enrichmentVariants = predictionLaunchTask
+      ? buildCurrentStateFirecrawlVariants(primary)
+      : forecastingIntent.forecasting
+        ? buildForecastingFirecrawlVariants(primary, forecastingIntent)
+        : buildCurrentStateFirecrawlVariants(primary);
 
     for (const variant of enrichmentVariants) {
       addUniqueQuery(queries, variant);
@@ -784,43 +2346,233 @@ export function buildPrimaryFirecrawlQueryVariants(task: string): string[] {
   }
 
   if (queries.length === 0) {
-    addUniqueQuery(queries, normalizeCurrentEventQuery(expandFirecrawlCryptoSymbols(cleanedTask)));
+    addUniqueQuery(queries, normalizeCurrentEventQuery(expandFirecrawlCryptoSymbols(normalizedTask)));
   }
 
-  return queries.slice(0, 10);
+  const ranked = queries.slice();
+  if (isPredictionTask) {
+    const rank = (query: string): number => {
+      const normalized = query.toLowerCase();
+      let score = 0;
+      if (subjectQueries.some((item) => item.toLowerCase() === normalized)) score += 80;
+      if (entityQueries.some((item) => item.toLowerCase() === normalized)) score += 60;
+      if (discoveryQueries.some((item) => item.toLowerCase() === normalized)) score += 50;
+      if (/\b(official announcement|release date confirmation|launch date announcement|mainnet launch|roadmap mainnet|winner odds|betting odds|opta|theanalyst)\b/i.test(query)) {
+        score += 25;
+      }
+      if (/^site:/i.test(query)) score += 15;
+      if (
+        /\b(xaut|tether gold)\b/i.test(contextTask) &&
+        /\b(gold|spot gold|kitco|lbma|world gold council|gold\.org|reuters)\b/i.test(query)
+      ) {
+        score += 32;
+      }
+      if (
+        /\b(xaut|tether gold)\b/i.test(contextTask) &&
+        /\bprice prediction\b/i.test(query) &&
+        !/\b(gold|spot gold|kitco|lbma|world gold council|gold\.org|reuters)\b/i.test(query)
+      ) {
+        score -= 10;
+      }
+      if (/\bnetwork network\b/i.test(normalized)) score -= 40;
+      if (/\bprediction market\b/i.test(normalized)) score -= 20;
+      return score;
+    };
+    ranked.sort((a, b) => rank(b) - rank(a));
+  }
+
+  return ranked.slice(0, 14);
+}
+
+// Keep a wide evidence set for prediction-market reports. The previous logic capped at 5 (and
+// often fewer once one official source matched), which manufactured "thin evidence" out of rich
+// retrieval. Downstream rendering/claim-building applies its own narrower caps.
+const PREDICTION_MARKET_EVIDENCE_LIMIT = 10;
+
+function selectPredictionMarketEvidenceWithHostDiversity(
+  task: string,
+  snapshots: FirecrawlArticleSnapshot[],
+  limit: number,
+): FirecrawlArticleSnapshot[] {
+  const dedupedSnapshots = [...new Map(snapshots.map((snapshot) => [snapshot.url, snapshot])).values()];
+  const selected: FirecrawlArticleSnapshot[] = [];
+  const hostCounts = new Map<string, number>();
+  const maxPerHost = extractPredictionMarketCategory(task) === 'sports' ? 2 : 2;
+
+  const canAdd = (snapshot: FirecrawlArticleSnapshot): boolean => {
+    const host = normalizedHostnameFromUrl(parseSnapshotUrl(snapshot));
+    if (!host) return true;
+    return (hostCounts.get(host) ?? 0) < maxPerHost;
+  };
+
+  const push = (snapshot: FirecrawlArticleSnapshot): void => {
+    selected.push(snapshot);
+    const host = normalizedHostnameFromUrl(parseSnapshotUrl(snapshot));
+    if (!host) return;
+    hostCounts.set(host, (hostCounts.get(host) ?? 0) + 1);
+  };
+
+  for (const snapshot of dedupedSnapshots) {
+    if (!canAdd(snapshot)) continue;
+    push(snapshot);
+    if (selected.length >= limit) return selected;
+  }
+
+  for (const snapshot of dedupedSnapshots) {
+    if (selected.some((item) => item.url === snapshot.url)) continue;
+    push(snapshot);
+    if (selected.length >= limit) break;
+  }
+
+  return selected;
+}
+
+function isOfficialPredictionMarketSource(
+  snapshot: FirecrawlArticleSnapshot,
+  understanding: MarketUnderstanding | null,
+): boolean {
+  if (!understanding?.entity?.officialDomains?.length) return false;
+  const hostname = normalizedHostnameFromUrl(parseSnapshotUrl(snapshot));
+  if (!hostname) return false;
+  return understanding.entity.officialDomains.some((domain) =>
+    domain ? hostnameMatches(hostname, domain.toLowerCase()) : false,
+  );
+}
+
+function predictionMarketEvidenceSortScore(
+  snapshot: FirecrawlArticleSnapshot,
+  task: string,
+  understanding: MarketUnderstanding | null,
+): number {
+  const qualityContext = buildSourceQualityContext(task);
+  const hostname = normalizedHostnameFromUrl(parseSnapshotUrl(snapshot));
+  const official = isOfficialPredictionMarketSource(snapshot, understanding);
+  const authoritativeCategorySource = isPredictionMarketCategoryAuthorityHost(task, hostname);
+  const editorial = hasPredictionMarketEditorialArticleSignal(snapshot, task);
+  let score = resolvedEntitySourceBoost(snapshot, understanding);
+
+  score += sourceQualityScore(snapshot, qualityContext);
+  score += eventRecencyScore(snapshot.seen_at);
+  score += firecrawlSnapshotRelevance(snapshot, task);
+  if (editorial) score += 28;
+  if (authoritativeCategorySource && !official) score += 18;
+  if (official) score -= 18;
+  if (official && !hasArticleLikePath(snapshot)) score -= 10;
+
+  return score;
 }
 
 function filterPredictionMarketResearchEvidence(
   task: string,
   snapshots: FirecrawlArticleSnapshot[],
+  understanding?: MarketUnderstanding | null,
 ): FirecrawlArticleSnapshot[] {
   if (!/\bprediction market\b/i.test(task)) return snapshots;
 
-  const withoutCircularMarketSources = snapshots.filter((snapshot) => {
+  // Drop only genuine junk: circular market sources, resolved-entity homonym drift, and
+  // low-value social/video. Everything else is candidate evidence. Critically, we do NOT
+  // collapse to a narrow token-matched subset the moment one official source appears — that
+  // turned rich retrieval (a dozen good Reuters/Bloomberg/news articles) into 2-source "thin"
+  // reports. Homonym drift is handled by avoidTerms; relevance is handled by ranking, not by
+  // discarding any news that doesn't echo the exact entity token.
+  const candidates = snapshots.filter((snapshot) => {
     if (isCircularResearchSourceUrl(task, snapshot.url)) return false;
+    if (isGoogleNewsUrl(snapshot.url) || isGoogleConsentUrl(snapshot.url)) return false;
+    if (matchesResolvedEntityAvoidTerms(snapshot, understanding ?? null)) return false;
+    if (isLowValueSocialSourceUrl(snapshot.url)) return false;
+    if (isLowValueVideoUrl(snapshot.url)) return false;
     return true;
   });
-  const authoritative = withoutCircularMarketSources.filter((snapshot) =>
-    isAuthoritativeSportsEvidenceUrl(snapshot.url, snapshot.publisher),
-  );
+  if (candidates.length === 0) return [];
 
-  if (authoritative.length >= 2) {
-    return authoritative;
+  const entityRelevantCandidates: FirecrawlArticleSnapshot[] = [];
+  const gateRejected: FirecrawlArticleSnapshot[] = [];
+  for (const snapshot of candidates) {
+    if (!understanding?.entity || isEntityRelevantPredictionMarketSource(snapshot, task, understanding)) {
+      entityRelevantCandidates.push(snapshot);
+    } else {
+      gateRejected.push(snapshot);
+    }
+  }
+  if (understanding?.entity && process.env.RESEARCH_GATE_TRACE) {
+    console.log(
+      `[research][gate] entity="${understanding.entity.canonicalName}" ambiguity=${understanding.entity.ambiguity} candidates=${candidates.length} kept=${entityRelevantCandidates.length} rejected=${gateRejected.length}` +
+        (gateRejected.length
+          ? ` rejectedHosts=${gateRejected
+              .map((snapshot) => normalizedHostnameFromUrl(parseSnapshotUrl(snapshot)))
+              .filter(Boolean)
+              .join(',')}`
+          : ''),
+    );
+  }
+  if (understanding?.entity && entityRelevantCandidates.length === 0) {
+    return [];
   }
 
-  const nonSocial = withoutCircularMarketSources.filter(
-    (snapshot) => !isLowValueSocialSourceUrl(snapshot.url) && !isLowValueVideoUrl(snapshot.url),
-  );
-  if (nonSocial.length >= 2) {
-    return nonSocial;
-  }
+  const qualityContext = buildSourceQualityContext(task);
 
-  return withoutCircularMarketSources;
+  const isOfficialOrAuthoritative = (snapshot: FirecrawlArticleSnapshot): boolean => {
+    const haystack = `${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase();
+    if (
+      understanding?.entity?.officialDomains?.some((domain) =>
+        haystack.includes(domain.toLowerCase()),
+      )
+    ) {
+      return true;
+    }
+    if (
+      isPredictionMarketCategoryAuthorityHost(
+        task,
+        normalizedHostnameFromUrl(parseSnapshotUrl(snapshot)),
+      )
+    ) {
+      return true;
+    }
+    if (/\b(rockstargames\.com|take2games\.com)\b/i.test(haystack)) return true;
+    return isAuthoritativeSportsEvidenceUrl(snapshot.url, snapshot.publisher);
+  };
+
+  // Favor dynamic editorial/category-authority coverage for betting insight, while still
+  // allowing official sources to survive as supporting evidence instead of becoming the
+  // backbone of every thin run.
+  return selectPredictionMarketEvidenceWithHostDiversity(
+    task,
+    [...entityRelevantCandidates]
+    .sort((a, b) => {
+      const scoreDelta =
+        predictionMarketEvidenceSortScore(b, task, understanding ?? null) -
+        predictionMarketEvidenceSortScore(a, task, understanding ?? null);
+      if (scoreDelta !== 0) return scoreDelta;
+      const authoritativeDelta =
+        Number(isOfficialOrAuthoritative(b)) - Number(isOfficialOrAuthoritative(a));
+      if (authoritativeDelta !== 0) return authoritativeDelta;
+      return sourceQualityScore(b, qualityContext) - sourceQualityScore(a, qualityContext);
+    }),
+    PREDICTION_MARKET_EVIDENCE_LIMIT,
+  );
+}
+
+function hasAuthoritativeSportsOddsEvidence(
+  task: string,
+  snapshots: FirecrawlArticleSnapshot[],
+): boolean {
+  if (extractPredictionMarketCategory(task) !== 'sports') return false;
+  return snapshots.some((snapshot) => {
+    const haystack =
+      `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase();
+    return (
+      isAuthoritativeSportsOddsSource(snapshot.url, snapshot.publisher) &&
+      /\b(odds|favorite|favorites|betting|prediction|predictions|probability|probabilities|implied)\b/i.test(
+        haystack,
+      )
+    );
+  });
 }
 
 function sanitizePredictionMarketCurrentEvents(
   task: string,
   currentEvents: CurrentEventsSnapshot | null,
+  understanding?: MarketUnderstanding | null,
 ): CurrentEventsSnapshot | null {
   if (!currentEvents || !/\bprediction market\b/i.test(task)) {
     return currentEvents;
@@ -829,6 +2581,7 @@ function sanitizePredictionMarketCurrentEvents(
   const filterUrl = (url: string | undefined): boolean => {
     if (!url) return false;
     if (isCircularResearchSourceUrl(task, url)) return false;
+    if (isGoogleNewsUrl(url) || isGoogleConsentUrl(url)) return false;
     return true;
   };
 
@@ -838,12 +2591,71 @@ function sanitizePredictionMarketCurrentEvents(
   const filteredSnapshots = (currentEvents.article_snapshots || []).filter((article) =>
     filterUrl(article.url),
   );
+  const entityFilteredArticles = understanding?.entity
+    ? filteredArticles.filter((article) =>
+        isEntityRelevantPredictionMarketSource(
+          {
+            title: article.title,
+            summary:
+              (article as { summary?: string; description?: string }).summary ??
+              (article as { summary?: string; description?: string }).description ??
+              '',
+            publisher:
+              article.publisher ??
+              (article as { domain?: string }).domain ??
+              '',
+            url: article.url,
+            seen_at: article.seen_at,
+          },
+          task,
+          understanding,
+        ),
+      )
+    : filteredArticles;
+  const entityFilteredSnapshots = understanding?.entity
+    ? filteredSnapshots.filter((article) =>
+        isEntityRelevantPredictionMarketSource(
+          {
+            title: article.title,
+            summary: article.summary ?? '',
+            publisher: article.publisher ?? '',
+            url: article.url,
+            seen_at: article.seen_at,
+          },
+          task,
+          understanding,
+        ),
+      )
+    : filteredSnapshots;
+  if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(task)) {
+    console.error(
+      `[RETR][sanitize-current] filteredArticles=${filteredArticles.length} filteredSnapshots=${filteredSnapshots.length} entityArticles=${entityFilteredArticles.length} entitySnapshots=${entityFilteredSnapshots.length}`,
+    );
+    if (entityFilteredSnapshots.length > 0) {
+      console.error(
+        `[RETR][sanitize-current]   snapshotUrls=${entityFilteredSnapshots
+          .slice(0, 6)
+          .map((article) => article.url)
+          .join(' | ')}`,
+      );
+    }
+  }
+  const recencyFilteredArticles =
+    extractPredictionMarketCategory(task) === 'sports'
+      ? entityFilteredArticles.filter((article) => !article.seen_at || isRecentCurrentEvent(article))
+      : entityFilteredArticles;
+  const recencyFilteredSnapshots =
+    extractPredictionMarketCategory(task) === 'sports'
+      ? entityFilteredSnapshots.filter(
+          (article) => !article.seen_at || isRecentCurrentEvent(snapshotToCurrentEventArticle(article)),
+        )
+      : entityFilteredSnapshots;
 
   const authoritativeCount =
-    filteredArticles.filter((article) =>
+    recencyFilteredArticles.filter((article) =>
       isAuthoritativeSportsEvidenceUrl(article.url, article.publisher),
     ).length +
-    filteredSnapshots.filter((article) =>
+    recencyFilteredSnapshots.filter((article) =>
       isAuthoritativeSportsEvidenceUrl(article.url, article.publisher),
     ).length;
 
@@ -866,8 +2678,8 @@ function sanitizePredictionMarketCurrentEvents(
     ...(keepFramingSignals && currentEvents.framing_signals
       ? { framing_signals: currentEvents.framing_signals }
       : {}),
-    articles: filteredArticles.filter((article) => socialFilter(article.url)),
-    article_snapshots: filteredSnapshots.filter((article) => socialFilter(article.url)),
+    articles: recencyFilteredArticles.filter((article) => socialFilter(article.url)),
+    article_snapshots: recencyFilteredSnapshots.filter((article) => socialFilter(article.url)),
   };
 }
 
@@ -1040,6 +2852,14 @@ async function fetchTextWithTimeout(url: string, timeoutMs = LIVE_DATA_FETCH_TIM
 
 function detectResearchDomain(task: string): ResearchDomain {
   const cleanedTask = stripExecutionContext(task);
+  const predictionMarketCategory = extractPredictionMarketCategory(cleanedTask);
+  if (predictionMarketCategory) {
+    if (predictionMarketCategory === 'crypto') return 'crypto';
+    if (predictionMarketCategory === 'politics' || predictionMarketCategory === 'geopolitics') {
+      return 'geopolitics';
+    }
+    return 'general';
+  }
   if (isArcNetworkTask(cleanedTask)) {
     return 'crypto';
   }
@@ -1071,6 +2891,10 @@ function detectResearchDomain(task: string): ResearchDomain {
 }
 
 function pickCoinTargets(task: string): Array<{ coinId: string; symbol: string }> {
+  if (/\btether gold\b|\bxaut\b/i.test(task)) {
+    return [{ coinId: 'tether-gold', symbol: 'XAUT' }];
+  }
+
   const matches = COIN_KEYWORDS.filter((item) => item.pattern.test(task)).map(
     (item) => ({
       coinId: item.coinId,
@@ -1100,6 +2924,34 @@ function pickCoinTargets(task: string): Array<{ coinId: string; symbol: string }
   }
 
   return [];
+}
+
+function shouldFetchDefiLlamaDataForTask(
+  task: string,
+  understanding?: MarketUnderstanding | null,
+): boolean {
+  const explicitDefiMetric = /\b(defillama|tvl|total value locked|stablecoins?|liquidity|defi ecosystem|protocol revenue|chain fees|on[-\s]?chain liquidity)\b/i.test(
+    task,
+  );
+  if (!isPredictionMarketResearchTask(task)) {
+    return true;
+  }
+  if (explicitDefiMetric) {
+    return true;
+  }
+  if (
+    understanding?.questionType === 'launch_milestone' ||
+    /\b(mainnet|testnet|launch date|launch before|pre[-\s]?mainnet)\b/i.test(task)
+  ) {
+    return false;
+  }
+  if (
+    understanding?.questionType === 'price_target' ||
+    /\b(reach|hit|market cap|valuation|price target|\$\d)\b/i.test(task)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function pickChainTargets(task: string): string[] {
@@ -1188,7 +3040,10 @@ function normalizeCurrentEventQuery(task: string): string {
     .trim();
 }
 
-function buildCurrentEventQueries(task: string): string[] {
+function buildCurrentEventQueries(
+  task: string,
+  understanding?: MarketUnderstanding | null,
+): string[] {
   const cleanedTask = normalizeLiveDataSearchTask(task);
   const queries: string[] = [];
   const entities = extractGeopoliticalEntities(cleanedTask);
@@ -1203,8 +3058,113 @@ function buildCurrentEventQueries(task: string): string[] {
     }
   };
 
-  for (const query of buildResearchQueryVariants(task)) {
-    addQuery(query);
+  const predictionMarketTask = /\bprediction market\b/i.test(task);
+  if (predictionMarketTask && understanding) {
+    const canonical = stripPredictionMarketIntentSuffix(
+      understanding.entity?.canonicalName || understanding.subject,
+    );
+    const marketCategory = extractPredictionMarketCategory(task);
+    const sportsWinnerMarket =
+      marketCategory === 'sports' &&
+      understanding.questionType === 'event_outcome' &&
+      isSportsWinnerPredictionMarketTask(task, understanding);
+    const entityAliases = [
+      ...(understanding.entity?.aliases ?? []),
+      understanding.subject,
+    ]
+      .map((value) => stripPredictionMarketIntentSuffix(value || ''))
+      .map((value) => value.replace(/\bGTAVI\b/gi, 'GTA VI').replace(/\bGTA6\b/gi, 'GTA 6'))
+      .map((value) => value.replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+    const aliasQueries = [...new Set(entityAliases)].filter((alias) => {
+      if (!canonical) return true;
+      if (alias.toLowerCase() === canonical.toLowerCase()) return false;
+      if (
+        marketCategory === 'crypto' &&
+        understanding.questionType === 'launch_milestone' &&
+        /^[A-Z]{2,5}$/i.test(alias)
+      ) {
+        return false;
+      }
+      return alias.length >= 3;
+    });
+    if (canonical) {
+      if (!sportsWinnerMarket) {
+        addQuery(`${canonical} latest`);
+        addQuery(`${canonical} latest news`);
+      }
+      if (understanding.questionType === 'launch_milestone') {
+        if (marketCategory === 'crypto') {
+          addQuery(`${canonical} blockchain`);
+          addQuery(`${canonical} mainnet`);
+          addQuery(`${canonical} mainnet launch`);
+          addQuery(`${canonical} roadmap`);
+          addQuery(`${canonical} testnet`);
+          addQuery(`${canonical} official announcement`);
+          const officialDomain = understanding.entity?.officialDomains?.[0];
+          if (officialDomain) {
+            addQuery(`site:${officialDomain} ${canonical} mainnet`);
+            addQuery(`site:${officialDomain} ${canonical} official announcement`);
+          }
+        } else if (marketCategory === 'games' || marketCategory === 'gaming') {
+          addQuery(`${canonical} release date`);
+          addQuery(`${canonical} launch window`);
+          addQuery(`${canonical} development update`);
+          addQuery(`${canonical} official announcement`);
+          addQuery(`${canonical} delay latest`);
+          const officialDomain = understanding.entity?.officialDomains?.[0];
+          if (officialDomain) {
+            addQuery(`site:${officialDomain} ${canonical} release date`);
+            addQuery(`site:${officialDomain} ${canonical} official announcement`);
+          }
+        } else {
+          addQuery(`${canonical} official announcement`);
+        }
+      }
+      if (understanding.questionType === 'event_outcome' && marketCategory === 'sports') {
+        addQuery(`${canonical} odds`);
+        addQuery(`${canonical} favorites`);
+        addQuery(`${canonical} team rankings`);
+        if (sportsWinnerMarket) {
+          addQuery(`${canonical} winner odds`);
+          addQuery(`${canonical} outright odds`);
+          addQuery(`${canonical} opta prediction`);
+          addQuery(`${canonical} power rankings`);
+        } else {
+          addQuery(`${canonical} injuries form`);
+        }
+      }
+      if (marketCategory === 'crypto') {
+        addQuery(`${canonical} crypto`);
+        addQuery(`${canonical} blockchain project`);
+      }
+      if (/\barc network\b/i.test(canonical)) {
+        addQuery('ARC Network blockchain');
+        addQuery('ARC Network stablecoin blockchain');
+        addQuery('Circle ARC Network blockchain');
+      }
+      for (const alias of aliasQueries.slice(0, 2)) {
+        if (!sportsWinnerMarket) {
+          addQuery(`${alias} latest`);
+          addQuery(`${alias} latest news`);
+        }
+        if (understanding.questionType === 'launch_milestone') {
+          if (marketCategory === 'games' || marketCategory === 'gaming') {
+            addQuery(`${alias} release date`);
+            addQuery(`${alias} official announcement`);
+          } else if (marketCategory === 'crypto' && !/^[A-Z]{2,5}$/i.test(alias)) {
+            addQuery(`${alias} mainnet`);
+            addQuery(`${alias} official announcement`);
+          }
+        }
+      }
+    }
+  }
+
+  if (!predictionMarketTask || !understanding) {
+    for (const query of buildResearchQueryVariants(task)) {
+      addQuery(query);
+    }
   }
 
   if (shippingFocused) {
@@ -1231,6 +3191,19 @@ function buildCurrentEventQueries(task: string): string[] {
   }
 
   return queries.slice(0, 10);
+}
+
+function isBroadCryptoPredictionMarketTask(
+  task: string,
+  understanding: MarketUnderstanding | null,
+): boolean {
+  if (!/\bprediction market\b/i.test(task)) return false;
+  if (extractPredictionMarketCategory(task) !== 'crypto') return false;
+  if (understanding?.questionType === 'launch_milestone') return false;
+  if (/\b(mainnet|launch|testnet|roadmap|validator)\b/i.test(task)) return false;
+  return /\b(bitcoin|btc|ethereum|eth|solana|sol|market cap|reach|hit|price|\$|usd|ath)\b/i.test(
+    task,
+  );
 }
 
 function isBroadLongHorizonOverviewTask(task: string): boolean {
@@ -1369,6 +3342,16 @@ function isFutureSeenAt(seenAt?: string): boolean {
 }
 
 function isUsableCurrentEventArticle(article: GdeltArticleSnapshot | FirecrawlArticleSnapshot): boolean {
+  const fallbackArticleUrl =
+    'article_url' in article && typeof article.article_url === 'string' ? article.article_url : '';
+  const url = (article.url || fallbackArticleUrl || '').toLowerCase();
+  if (
+    /\bplay\.google\.com\/store\/apps\b/.test(url) ||
+    /\bapps\.apple\.com\b/.test(url) ||
+    /\bstore\.steampowered\.com\/app\b/.test(url)
+  ) {
+    return false;
+  }
   return !isFutureSeenAt(article.seen_at);
 }
 
@@ -1435,6 +3418,20 @@ function isGoogleNewsUrl(url: string | undefined): boolean {
   return Boolean(url && /news\.google\.com/i.test(url));
 }
 
+function isGoogleConsentUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  return /consent\.google\.com|[?&]continue=https?:\/\/news\.google\.com|\/sorry\/|\/setprefs/i.test(
+    url,
+  );
+}
+
+function isGoogleConsentInterstitialText(text: string | undefined): boolean {
+  if (!text) return false;
+  return /\bbefore you continue to google\b|\bwe use cookies and data to\b|\bdeliver and maintain google services\b/i.test(
+    text,
+  );
+}
+
 function normalizeArticleTitle(title: string | undefined): string {
   return (title || '')
     .toLowerCase()
@@ -1481,7 +3478,36 @@ function markdownToSnippet(markdown: string, maxChars = 520): string | null {
     .replace(/\s+/g, ' ')
     .trim();
 
+  if (!text || isGoogleConsentInterstitialText(text)) {
+    return null;
+  }
+
   return truncateSentences(text, maxChars) ?? null;
+}
+
+function extractVisiblePublishedDateFromMarkdown(markdown: string | undefined): string | undefined {
+  if (!markdown) return undefined;
+
+  const normalized = markdown.replace(/\r\n/g, '\n');
+  const patterns = [
+    /\bPublished\s*\n+\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/i,
+    /\bPublished\s*:?\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/i,
+    /\bPublished\s*\n+\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\b/i,
+    /\bPublished\s*:?\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\b/i,
+    /\bUpdated\s*:?\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/i,
+    /\bLast updated\s*:?\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/i,
+  ];
+
+  for (const pattern of patterns) {
+    const candidate = normalized.match(pattern)?.[1]?.trim();
+    if (!candidate) continue;
+    const timestamp = Date.parse(candidate);
+    if (Number.isFinite(timestamp)) {
+      return new Date(timestamp).toISOString();
+    }
+  }
+
+  return undefined;
 }
 
 function extractHostname(url: string | undefined): string | undefined {
@@ -1522,7 +3548,7 @@ function extractFirecrawlSeenAt(result: FirecrawlSearchResult): string | undefin
     'article:modified',
     'modifiedTime',
     'last_updated_date',
-  ]) || result.date;
+  ]) || result.date || extractVisiblePublishedDateFromMarkdown(result.markdown);
 
   if (!candidate) return undefined;
   const timestamp = Date.parse(candidate);
@@ -1538,7 +3564,10 @@ function buildFirecrawlSearchSnapshot(
     getMetadataString(metadata, ['sourceURL', 'ogUrl', 'og:url', 'url']) ||
     result.url?.trim();
 
-  if (!url || isLikelyHomepageUrl(url)) {
+  if (!url || isLikelyHomepageUrl(url) || isGoogleConsentUrl(url)) {
+    return null;
+  }
+  if (/\/(?:llms\.txt|robots\.txt|sitemap(?:[_-]index)?\.xml)(?:[?#]|$)/i.test(url)) {
     return null;
   }
 
@@ -1560,7 +3589,11 @@ function buildFirecrawlSearchSnapshot(
     truncateSentences(normalizedSummaryText, 320) ||
     (result.markdown ? markdownToSnippet(result.markdown, 420) : null);
 
-  if (!summary) {
+  if (
+    !summary ||
+    isGoogleConsentInterstitialText(normalizedTitle) ||
+    isGoogleConsentInterstitialText(summary)
+  ) {
     return null;
   }
 
@@ -1738,7 +3771,10 @@ function isCryptoResearchTopic(task: string): boolean {
 function buildSourceQualityContext(task: string): SourceQualityContext {
   return {
     task,
-    strictness: isBroadCurrentStateResearchTask(task) ? 'strict' : 'soft',
+    strictness:
+      isPredictionMarketResearchTask(task) || isBroadCurrentStateResearchTask(task)
+        ? 'strict'
+        : 'soft',
     cryptoTopic: isCryptoResearchTopic(task),
   };
 }
@@ -1848,6 +3884,27 @@ function sourceQualityScore(snapshot: FirecrawlArticleSnapshot, context: SourceQ
   if (context.cryptoTopic && isPreferredCryptoResearchDomain(snapshot) && !generic) {
     score += cryptoPreferredDomainBoost(snapshot);
   }
+  if (context.cryptoTopic && hasPredictionMarketEditorialArticleSignal(snapshot, context.task)) {
+    score += 42;
+  }
+  if (
+    context.cryptoTopic &&
+    /\b(coindesk\.com|theblock\.co|decrypt\.co|forbes\.com|reuters\.com|bloomberg\.com|wsj\.com|ft\.com|cointelegraph\.com|blockworks\.co)\b/i.test(
+      `${hostname} ${snapshot.title} ${snapshot.summary}`,
+    ) &&
+    !generic
+  ) {
+    score += 26;
+  }
+  if (
+    context.cryptoTopic &&
+    /\b(etf|macro|institutional|flows|demand|treasury|liquidity|reserve|halving)\b/i.test(
+      `${snapshot.title} ${snapshot.summary}`,
+    ) &&
+    !generic
+  ) {
+    score += 18;
+  }
   if (creatorAudienceTask && /\b(socialcounts\.org|livecounts\.io|socialblade\.com|viewstats\.com)\b/.test(`${hostname} ${snapshot.title} ${snapshot.summary}`.toLowerCase())) {
     score += 70;
   }
@@ -1860,6 +3917,7 @@ function sourceQualityScore(snapshot: FirecrawlArticleSnapshot, context: SourceQ
     if (ageDays !== null && ageDays > 90) score -= 12;
     if (generic && !snapshot.seen_at) score -= 20;
     if (generic && !articleLike) score -= 10;
+    if (context.cryptoTopic && generic) score -= 22;
   } else if (ageDays !== null && ageDays <= 90) {
     score += 4;
   }
@@ -1883,6 +3941,7 @@ function selectQualityDiverseSnapshots(
   ranked: FirecrawlArticleSnapshot[],
   context: SourceQualityContext,
   limit: number,
+  task?: string,
 ): FirecrawlArticleSnapshot[] {
   if (context.strictness !== 'strict') {
     return ranked.slice(0, limit);
@@ -1890,13 +3949,57 @@ function selectQualityDiverseSnapshots(
 
   const selected: FirecrawlArticleSnapshot[] = [];
   const genericFamilies = new Set<string>();
+  const hostCounts = new Map<string, number>();
   let genericCount = 0;
+  let editorialCryptoCount = 0;
+  const maxPerHost =
+    task && extractPredictionMarketCategory(task) === 'sports' ? 1 : 2;
+  const genericCap =
+    task &&
+    extractPredictionMarketCategory(task) === 'crypto' &&
+    /\b(market cap|reach|hit|price|\$|usd|ath)\b/i.test(task)
+      ? 1
+      : 2;
+
+  const canAddHost = (snapshot: FirecrawlArticleSnapshot): boolean => {
+    const host = normalizedHostnameFromUrl(parseSnapshotUrl(snapshot));
+    if (!host) return true;
+    return (hostCounts.get(host) ?? 0) < maxPerHost;
+  };
+
+  const recordHost = (snapshot: FirecrawlArticleSnapshot): void => {
+    const host = normalizedHostnameFromUrl(parseSnapshotUrl(snapshot));
+    if (!host) return;
+    hostCounts.set(host, (hostCounts.get(host) ?? 0) + 1);
+  };
 
   for (const snapshot of ranked) {
+    if (!canAddHost(snapshot)) continue;
+    if (
+      task &&
+      extractPredictionMarketCategory(task) === 'crypto' &&
+      hasPredictionMarketEditorialArticleSignal(snapshot, task)
+    ) {
+      selected.push(snapshot);
+      recordHost(snapshot);
+      editorialCryptoCount += 1;
+      if (selected.length >= limit) {
+        return selected;
+      }
+      continue;
+    }
     const generic = isGenericDestination(snapshot);
     if (generic) {
       const family = genericSourceFamilyKey(snapshot);
-      if (genericCount >= 2 || genericFamilies.has(family)) {
+      if (
+        genericCount >= genericCap ||
+        genericFamilies.has(family) ||
+        (
+          task &&
+          extractPredictionMarketCategory(task) === 'crypto' &&
+          editorialCryptoCount >= 1
+        )
+      ) {
         continue;
       }
       genericFamilies.add(family);
@@ -1904,6 +4007,7 @@ function selectQualityDiverseSnapshots(
     }
 
     selected.push(snapshot);
+    recordHost(snapshot);
     if (selected.length >= limit) {
       return selected;
     }
@@ -1911,8 +4015,16 @@ function selectQualityDiverseSnapshots(
 
   for (const snapshot of ranked) {
     if (selected.some((item) => item.url === snapshot.url)) continue;
-    if (isGenericDestination(snapshot) && genericCount >= 2) continue;
+    if (!canAddHost(snapshot)) continue;
+    const generic = isGenericDestination(snapshot);
+    if (generic) {
+      const family = genericSourceFamilyKey(snapshot);
+      if (genericCount >= genericCap || genericFamilies.has(family)) continue;
+      genericFamilies.add(family);
+      genericCount += 1;
+    }
     selected.push(snapshot);
+    recordHost(snapshot);
     if (selected.length >= limit) break;
   }
 
@@ -1922,9 +4034,18 @@ function selectQualityDiverseSnapshots(
 function hasRequiredFirecrawlTopicAnchor(
   snapshot: FirecrawlArticleSnapshot,
   task: string,
+  understanding?: MarketUnderstanding | null,
 ): boolean {
   const haystack = `${snapshot.title} ${snapshot.summary} ${snapshot.publisher || ''} ${snapshot.url}`.toLowerCase();
   const anchors: RegExp[] = [];
+
+  if (
+    /\bprediction market\b/i.test(task) &&
+    understanding?.entity &&
+    isEntityRelevantPredictionMarketSource(snapshot, task, understanding)
+  ) {
+    return true;
+  }
 
   // Tether Gold (XAUT) must not collapse into generic "Tether" (USDT) results — require a
   // gold-specific anchor so the topic-relevant forecast pages survive ranking.
@@ -1937,7 +4058,45 @@ function hasRequiredFirecrawlTopicAnchor(
     anchors.push(/\barc\b|\barc\.network\b/i);
   }
   if (/\barc\b/i.test(task) && /\bmainnet\b|\blaunch\b|\btestnet\b/i.test(task)) {
+    if (extractPredictionMarketCategory(task) === 'crypto') {
+      const hasArcToken = /\barc\b|\barc\.network\b/i.test(haystack);
+      const hasCryptoContext =
+        /\b(mainnet|blockchain|crypto|network|testnet|validator|chain|web3|roadmap|smart contract|explorer|docs)\b/i.test(
+          haystack,
+        );
+      return hasArcToken && hasCryptoContext;
+    }
     anchors.push(/\barc\b|\barc\.network\b/i);
+  }
+  if (
+    extractPredictionMarketCategory(task) === 'crypto' &&
+    /\bmainnet\b|\blaunch\b|\btestnet\b/i.test(task)
+  ) {
+    const shortAcronym = task.match(/\b([A-Z]{2,4})\b/);
+    if (shortAcronym?.[1]) {
+      const token = shortAcronym[1];
+      const hasAcronymToken = new RegExp(`\\b${escapeRegex(token)}\\b`, 'i').test(haystack);
+      const hasCryptoContext =
+        /\b(mainnet|blockchain|crypto|network|testnet|validator|chain|web3|roadmap|smart contract|explorer|docs)\b/i.test(
+          haystack,
+        );
+      if (!hasAcronymToken || !hasCryptoContext) {
+        return false;
+      }
+    }
+  }
+  if (/\bgta\s*6\b|\bgrand theft auto\s*(?:6|vi)\b/i.test(task)) {
+    if (/\bgta\s*(?:v|5)\b|\bgrand theft auto\s*(?:v|5)\b|\blegacy\b/i.test(haystack)) {
+      return false;
+    }
+    anchors.push(/\bgta\s*(?:6|vi)\b|\bgrand theft auto\s*(?:6|vi)\b/i);
+  }
+  const versionedAcronyms = [...task.matchAll(/\b([A-Z]{2,6})\s*(\d{1,2}|[IVX]{1,5})\b/g)];
+  for (const match of versionedAcronyms) {
+    const token = match[1]?.trim();
+    const version = match[2]?.trim();
+    if (!token || !version) continue;
+    anchors.push(new RegExp(`\\b${escapeRegex(token)}\\s*${escapeRegex(version)}\\b`, 'i'));
   }
   if (/\bstablecoin\b|\busdc\b|\busd coin\b/i.test(task)) {
     anchors.push(/\bstablecoin\b|\busdc\b|\busd[- ]coin\b/i);
@@ -2197,19 +4356,44 @@ function deriveCurrentEventFramingSignals(params: {
 async function fetchFirecrawlSearchSnapshots(
   queryVariants: string[],
   task: string,
-  options?: { bypassCache?: boolean },
+  options?: { bypassCache?: boolean; understanding?: MarketUnderstanding | null },
 ): Promise<FirecrawlArticleSnapshot[]> {
   const { searchFirecrawlNews, searchSearxng } = await import('./firecrawl');
   const forecastingIntent = detectForecastingIntent(task);
+  const understanding = options?.understanding ?? null;
   const shippingFocused = /\bshipping\b|\bhormuz\b|\bstrait\b|\binsurance\b|\btanker\b|\bred sea\b|\bsuez\b/i.test(
     task,
   );
   const sourceQualityContext = buildSourceQualityContext(task);
   const uniqueQueries = [...new Set(queryVariants.map((query) => query.trim()).filter(Boolean))];
+  const discoveryQueries = new Set(
+    buildPredictionMarketDiscoveryQueries(task, understanding).map((query) => query.trim().toLowerCase()),
+  );
   const scoreQuery = (query: string): number => {
     let score = 0;
     const normalized = query.toLowerCase();
     if (normalized === task.trim().toLowerCase()) score += 30;
+    if (/^site:/.test(normalized)) score += /\bprediction market\b/i.test(task) ? 10 : 24;
+    if (/\bprediction market\b/i.test(task) && discoveryQueries.has(normalized)) score += 34;
+    if (/\b(official|announcement|newsroom|roadmap)\b/.test(normalized)) score += 16;
+    if (/\b(odds|favorite|favorites|probability|prediction)\b/.test(normalized)) score += 10;
+    if (/\b(kitco|lbma|reuters|rockstar|rockstargames|take2|fifa|theanalyst|oddschecker)\b/.test(normalized)) score += 18;
+    if (
+      /\b(xaut|tether gold)\b/i.test(task) &&
+      /\b(gold|spot gold|kitco|lbma|world gold council|gold\.org|reuters)\b/i.test(normalized)
+    ) {
+      score += 28;
+    }
+    if (
+      /\b(xaut|tether gold)\b/i.test(task) &&
+      /\bprice prediction\b/i.test(normalized) &&
+      !/\b(gold|spot gold|kitco|lbma|world gold council|gold\.org|reuters)\b/i.test(normalized)
+    ) {
+      score -= 10;
+    }
+    if (/\bprediction market\b/i.test(task) && /\b(crypto|blockchain|ecosystem|docs|blog|developer update|game|trailer|fixtures|injuries|standings)\b/i.test(normalized)) {
+      score += 18;
+    }
     if (sourceQualityContext.strictness === 'strict') {
       if (/\b(news|analysis|research|insights?|report|market analysis|landscape)\b/i.test(query)) {
         score += 35;
@@ -2231,10 +4415,33 @@ async function fetchFirecrawlSearchSnapshots(
     if (sourceQualityContext.strictness !== 'strict' && /\breport\b|\bresearch\b|\bimpact\b|\bdisruptions?\b/i.test(query)) score -= 20;
     return score;
   };
-  const maxQueries = Math.min(uniqueQueries.length, 5);
-  const selectedQueries = uniqueQueries
-    .sort((a, b) => scoreQuery(b) - scoreQuery(a))
-    .slice(0, maxQueries);
+  const isPredictionMarketQuery = /\bprediction market\b/i.test(task);
+  const maxQueries = Math.min(uniqueQueries.length, isPredictionMarketQuery ? 9 : 5);
+  const sortedQueries = uniqueQueries.slice().sort((a, b) => scoreQuery(b) - scoreQuery(a));
+
+  // Guarantee broad subject queries are actually searched. site:-scoped queries score highly but
+  // official domains are frequently thin/poorly indexed in Firecrawl + SearXNG, so without a cap
+  // they crowd out the broad queries ("<subject> latest news") that return real evidence — which
+  // is what made GTA 6 / World Cup markets look like they had "insufficient evidence". We cap how
+  // many site: queries can take slots, then backfill any unused budget with the skipped ones.
+  const siteQueryCap = isPredictionMarketQuery ? 2 : 2;
+  const isSiteQuery = (query: string) => /^site:/i.test(query.trim());
+  const selectedQueries: string[] = [];
+  let siteSelected = 0;
+  for (const query of sortedQueries) {
+    if (selectedQueries.length >= maxQueries) break;
+    if (isSiteQuery(query)) {
+      if (siteSelected >= siteQueryCap) continue;
+      siteSelected += 1;
+    }
+    selectedQueries.push(query);
+  }
+  if (selectedQueries.length < maxQueries) {
+    for (const query of sortedQueries) {
+      if (selectedQueries.length >= maxQueries) break;
+      if (!selectedQueries.includes(query)) selectedQueries.push(query);
+    }
+  }
 
   if (selectedQueries.length === 0) {
     return [];
@@ -2266,7 +4473,8 @@ async function fetchFirecrawlSearchSnapshots(
     attempt: 'primary' | 'retry',
     bypassCacheForAttempt = false,
   ): Promise<FirecrawlArticleSnapshot[]> => {
-    const cached = bypassCacheForAttempt ? null : getCacheValue(firecrawlSearchCache.get(query));
+    const cacheKey = `${attempt}:${query}`;
+    const cached = bypassCacheForAttempt ? null : getCacheValue(firecrawlSearchCache.get(cacheKey));
     if (cached) {
       return cached;
     }
@@ -2276,6 +4484,10 @@ async function fetchFirecrawlSearchSnapshots(
         searchFirecrawlWithBudget(query),
         searchSearxng(query, 6, {
           timeoutMs: 15_000,
+          categories:
+            forecastingIntent.forecasting || /\bprediction market\b/i.test(task)
+              ? ['news']
+              : undefined,
         }),
       ]);
 
@@ -2290,15 +4502,32 @@ async function fetchFirecrawlSearchSnapshots(
 
       if (firecrawlResults.status === 'fulfilled') {
         pushResults(firecrawlResults.value);
+      } else if (process.env.RETR_DEBUG || /\bprediction market\b/i.test(task)) {
+        console.error(
+          `[RETR]   firecrawl search failed for "${query.slice(0, 120)}": ${
+            firecrawlResults.reason instanceof Error
+              ? firecrawlResults.reason.message
+              : String(firecrawlResults.reason)
+          }`,
+        );
       }
       if (searxngResults.status === 'fulfilled') {
         pushResults(searxngResults.value);
+      } else if (process.env.RETR_DEBUG || /\bprediction market\b/i.test(task)) {
+        console.error(
+          `[RETR]   searxng search failed for "${query.slice(0, 120)}": ${
+            searxngResults.reason instanceof Error
+              ? searxngResults.reason.message
+              : String(searxngResults.reason)
+          }`,
+        );
       }
 
       const snapshots = [...mergedResults.values()]
         .map((result) => buildFirecrawlSearchSnapshot(result))
         .filter((snapshot): snapshot is FirecrawlArticleSnapshot => Boolean(snapshot))
-        .filter(isUsableCurrentEventArticle);
+        .filter(isUsableCurrentEventArticle)
+        .filter((snapshot) => !matchesResolvedEntityAvoidTerms(snapshot, understanding));
 
       if (bypassCacheForAttempt || snapshots.length === 0) {
         return snapshots;
@@ -2306,7 +4535,7 @@ async function fetchFirecrawlSearchSnapshots(
 
       return setTimedCache(
         firecrawlSearchCache,
-        query,
+        cacheKey,
         snapshots,
         FIRECRAWL_CACHE_TTL_MS,
       );
@@ -2322,15 +4551,43 @@ async function fetchFirecrawlSearchSnapshots(
     Promise.all(
       selectedQueries.map((query) => fetchSnapshotsForQuery(query, attempt, bypassCacheForAttempt)),
     );
+  const countRelevantSnapshots = (groups: FirecrawlArticleSnapshot[][]): number => {
+    const seen = new Set<string>();
+    let count = 0;
+    for (const group of groups) {
+      for (const snapshot of group) {
+        if (seen.has(snapshot.url)) continue;
+        seen.add(snapshot.url);
+        if (!isUsableCurrentEventArticle(snapshot)) continue;
+        if (matchesResolvedEntityAvoidTerms(snapshot, understanding)) continue;
+        if (!hasRequiredFirecrawlTopicAnchor(snapshot, task, understanding)) continue;
+        if (sourceQualityContext.strictness === 'strict' && isLikelyNonEnglishSource(snapshot)) {
+          continue;
+        }
+        count += 1;
+      }
+    }
+    return count;
+  };
 
+  const __t0 = Date.now();
   let snapshotGroups = await loadSnapshotGroups(
     'primary',
     options?.bypassCache === true,
   );
-  if (snapshotGroups.every((group) => group.length === 0)) {
+  const primaryRelevantCount = countRelevantSnapshots(snapshotGroups);
+  if (
+    snapshotGroups.every((group) => group.length === 0) ||
+    (isPredictionMarketQuery && primaryRelevantCount < 2)
+  ) {
     await sleep(FIRECRAWL_EMPTY_RETRY_DELAY_MS);
-    snapshotGroups = await loadSnapshotGroups('retry', true);
+    const retryGroups = await loadSnapshotGroups('retry', true);
+    snapshotGroups = snapshotGroups.map((group, index) => [
+      ...group,
+      ...(retryGroups[index] || []),
+    ]);
   }
+  const __searchMs = Date.now() - __t0;
 
   const deduped = new Map<string, FirecrawlArticleSnapshot>();
   for (const group of snapshotGroups) {
@@ -2341,11 +4598,32 @@ async function fetchFirecrawlSearchSnapshots(
     }
   }
 
-  const ranked = [...deduped.values()]
+  if (process.env.RETR_DEBUG) {
+    const all = [...deduped.values()];
+    const afterUsable = all.filter(isUsableCurrentEventArticle);
+    const afterAnchor = afterUsable.filter((s) => hasRequiredFirecrawlTopicAnchor(s, task, understanding));
+    const afterLang = afterAnchor.filter((s) => sourceQualityContext.strictness !== 'strict' || !isLikelyNonEnglishSource(s));
+    console.error(`[RETR] task="${task.slice(0, 50)}" strictness=${sourceQualityContext.strictness} searchMs=${__searchMs} queries=${selectedQueries.length}`);
+    console.error(`[RETR]   perQuery=${snapshotGroups.map((g) => g.length).join(',')} deduped=${deduped.size} -> usable=${afterUsable.length} -> anchor=${afterAnchor.length} -> lang=${afterLang.length}`);
+    console.error(`[RETR]   deduped urls: ${all.slice(0, 12).map((s) => s.url).join(' | ')}`);
+    console.error(`[RETR]   dropped by anchor: ${afterUsable.filter((s) => !hasRequiredFirecrawlTopicAnchor(s, task, understanding)).slice(0, 8).map((s) => s.url).join(' | ')}`);
+  }
+
+  const enrichedSnapshots = isPredictionMarketQuery
+    ? await enrichPredictionMarketSnapshotsFromPages(task, understanding, [...deduped.values()])
+    : [...deduped.values()];
+
+  const ranked = enrichedSnapshots
     .filter(isUsableCurrentEventArticle)
-    .filter((snapshot) => hasRequiredFirecrawlTopicAnchor(snapshot, task))
+    .filter((snapshot) => !matchesResolvedEntityAvoidTerms(snapshot, understanding))
+    .filter((snapshot) => hasRequiredFirecrawlTopicAnchor(snapshot, task, understanding))
     .filter((snapshot) => sourceQualityContext.strictness !== 'strict' || !isLikelyNonEnglishSource(snapshot))
     .sort((a, b) => {
+      const entityDelta =
+        resolvedEntitySourceBoost(b, understanding) - resolvedEntitySourceBoost(a, understanding);
+      if (entityDelta !== 0) {
+        return entityDelta;
+      }
       const qualityDelta =
         sourceQualityScore(b, sourceQualityContext) - sourceQualityScore(a, sourceQualityContext);
       if (qualityDelta !== 0) {
@@ -2362,11 +4640,29 @@ async function fetchFirecrawlSearchSnapshots(
   if (shippingFocused) {
     const shippingSpecific = ranked.filter((snapshot) => shippingEvidenceScore(snapshot) >= 4);
     if (shippingSpecific.length > 0) {
-      return selectQualityDiverseSnapshots(shippingSpecific, sourceQualityContext, 4);
+      const selected = selectQualityDiverseSnapshots(shippingSpecific, sourceQualityContext, 4, task);
+      if (process.env.RETR_DEBUG) {
+        console.error(
+          `[RETR]   shipping selected=${selected.length} hosts=${selected
+            .map((snapshot) => normalizedHostnameFromUrl(parseSnapshotUrl(snapshot)))
+            .filter(Boolean)
+            .join(',')}`,
+        );
+      }
+      return selected;
     }
   }
 
-  return selectQualityDiverseSnapshots(ranked, sourceQualityContext, 5);
+  const selected = selectQualityDiverseSnapshots(ranked, sourceQualityContext, 5, task);
+  if (process.env.RETR_DEBUG) {
+    console.error(
+      `[RETR]   ranked=${ranked.length} selected=${selected.length} hosts=${selected
+        .map((snapshot) => normalizedHostnameFromUrl(parseSnapshotUrl(snapshot)))
+        .filter(Boolean)
+        .join(',')}`,
+    );
+  }
+  return selected;
 }
 
 function isLikelyHomepageUrl(url: string): boolean {
@@ -2402,10 +4698,72 @@ function hasDirectScrapeableUrl(article: GdeltArticleSnapshot): boolean {
   return Boolean(direct && !isLikelyHomepageUrl(direct) && !isGoogleNewsUrl(direct));
 }
 
+function extractGoogleNewsDecodeParams(html: string): {
+  id: string;
+  timestamp: string;
+  signature: string;
+} | null {
+  const id = html.match(/data-n-a-id="([^"]+)"/i)?.[1]?.trim();
+  const timestamp = html.match(/data-n-a-ts="([^"]+)"/i)?.[1]?.trim();
+  const signature = html.match(/data-n-a-sg="([^"]+)"/i)?.[1]?.trim();
+  if (!id || !timestamp || !signature) return null;
+  return { id, timestamp, signature };
+}
+
+async function decodeGoogleNewsArticleUrl(url: string): Promise<string | null> {
+  try {
+    const articleHtml = await fetchTextWithTimeout(url, LIVE_DATA_FETCH_TIMEOUT_MS);
+    const params = extractGoogleNewsDecodeParams(articleHtml);
+    if (!params) return null;
+
+    const requestPayload = [[[
+      'Fbv4je',
+      `["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],"${params.id}",${params.timestamp},"${params.signature}"]`,
+      null,
+      'generic',
+    ]]];
+
+    const response = await fetch(
+      'https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          Referrer: 'https://news.google.com/',
+          'User-Agent': 'Mozilla/5.0',
+        },
+        body: `f.req=${encodeURIComponent(JSON.stringify(requestPayload))}`,
+        signal: AbortSignal.timeout(LIVE_DATA_FETCH_TIMEOUT_MS),
+      },
+    );
+    const text = await decodeTextResponse(response);
+    const decodedUrl =
+      text.match(/\[\\"garturlres\\",\\"(.*?)\\",/i)?.[1]?.trim() ||
+      text.match(/\["garturlres","(.*?)",/i)?.[1]?.trim();
+    if (!decodedUrl || isGoogleNewsUrl(decodedUrl) || isGoogleConsentUrl(decodedUrl)) {
+      return null;
+    }
+    return decodedUrl;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveArticleUrl(url: string): Promise<string> {
   const cached = getCacheValue(redirectUrlCache.get(url));
   if (cached) {
     return cached;
+  }
+
+  if (isGoogleNewsUrl(url)) {
+    const decoded = await decodeGoogleNewsArticleUrl(url);
+    if (decoded) {
+      redirectUrlCache.set(url, {
+        value: decoded,
+        expiresAt: Date.now() + NEWS_RSS_CACHE_TTL_MS,
+      });
+      return decoded;
+    }
   }
 
   try {
@@ -2415,11 +4773,12 @@ async function resolveArticleUrl(url: string): Promise<string> {
       signal: AbortSignal.timeout(LIVE_DATA_FETCH_TIMEOUT_MS),
     });
     const resolved = response.url || url;
+    const finalUrl = isGoogleConsentUrl(resolved) ? url : resolved;
     redirectUrlCache.set(url, {
-      value: resolved,
+      value: finalUrl,
       expiresAt: Date.now() + NEWS_RSS_CACHE_TTL_MS,
     });
-    return resolved;
+    return finalUrl;
   } catch {
     redirectUrlCache.set(url, {
       value: url,
@@ -2427,6 +4786,84 @@ async function resolveArticleUrl(url: string): Promise<string> {
     });
     return url;
   }
+}
+
+function scoreRecoveredArticleTitleMatch(
+  expectedTitle: string,
+  candidateTitle: string,
+): number {
+  const expected = normalizeArticleTitle(expectedTitle);
+  const candidate = normalizeArticleTitle(candidateTitle);
+  if (!expected || !candidate) return 0;
+  if (expected === candidate) return 12;
+  if (candidate.includes(expected) || expected.includes(candidate)) return 10;
+
+  const expectedTokens = new Set(expected.split(/\s+/).filter((token) => token.length >= 4));
+  const candidateTokens = new Set(candidate.split(/\s+/).filter((token) => token.length >= 4));
+  let overlap = 0;
+  for (const token of expectedTokens) {
+    if (candidateTokens.has(token)) overlap += 1;
+  }
+  return overlap;
+}
+
+async function recoverDirectArticleUrlFromSearch(article: {
+  title: string;
+  publisher?: string;
+  domain?: string;
+}): Promise<string | null> {
+  const domain = article.domain?.trim().toLowerCase() || '';
+  const queries = [
+    domain ? `site:${domain} "${article.title}"` : '',
+    `"${article.title}" ${article.publisher || ''}`.trim(),
+  ].filter(Boolean);
+
+  for (const query of queries) {
+    try {
+      const [firecrawlResults, searxngResults] = await Promise.allSettled([
+        searchFirecrawlNews(query, 6, { recency: 'all' }),
+        searchSearxng(query, 6, { timeoutMs: 10_000, categories: ['news'] }),
+      ]);
+      const merged = new Map<string, FirecrawlSearchResult>();
+      for (const resultSet of [firecrawlResults, searxngResults]) {
+        if (resultSet.status !== 'fulfilled') continue;
+        for (const result of resultSet.value) {
+          const url = result.url?.trim();
+          if (!url || merged.has(url)) continue;
+          merged.set(url, result);
+        }
+      }
+      const results = [...merged.values()];
+      let bestUrl: string | null = null;
+      let bestScore = 0;
+
+      for (const result of results) {
+        const url = result.url?.trim();
+        if (!url || isGoogleNewsUrl(url) || isLikelyHomepageUrl(url)) continue;
+        if (isLowValueSocialSourceUrl(url) || isLowValueVideoUrl(url)) continue;
+
+        const host = sourceHostname(url);
+        let score = scoreRecoveredArticleTitleMatch(article.title, result.title || '');
+        if (domain && host === domain) score += 6;
+        else if (domain && host.endsWith(`.${domain}`)) score += 4;
+        if (article.publisher && new RegExp(escapeRegex(article.publisher), 'i').test(result.title || '')) {
+          score += 2;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestUrl = url;
+        }
+      }
+
+      if (bestUrl && bestScore >= 6) {
+        return bestUrl;
+      }
+    } catch {
+      // Ignore search recovery failures and fall back to the original URL.
+    }
+  }
+
+  return null;
 }
 
 function titleFromWikipediaUrl(url: string): string | null {
@@ -2651,7 +5088,6 @@ async function fetchBitcoinOnchainData(task: string): Promise<BitcoinOnchainSnap
 async function fetchDefiLlamaData(task: string): Promise<DefiLlamaChainSnapshot[]> {
   const targets = pickChainTargets(task);
   if (targets.length === 0) return [];
-
   let chainsJson = getCacheValue(defillamaChainsCache);
   if (!chainsJson) {
     chainsJson = await fetchJsonWithTimeout<Array<{ name?: string; tvl?: number }>>(
@@ -3016,6 +5452,11 @@ async function fetchGoogleNewsRssData(
   task: string,
   options?: { bypassCache?: boolean },
 ): Promise<GdeltArticleSnapshot[]> {
+  const cleanRssField = (value: string): string =>
+    decodeXmlEntities(value)
+      .replace(/^<!\[CDATA\[/i, '')
+      .replace(/\]\]>$/i, '')
+      .trim();
   const query = task.trim().toLowerCase();
   if (!query) return [];
 
@@ -3037,31 +5478,39 @@ async function fetchGoogleNewsRssData(
     const block = match[1];
     const rawTitle = block.match(/<title>([\s\S]*?)<\/title>/i)?.[1];
     const rawLink = block.match(/<link>([\s\S]*?)<\/link>/i)?.[1];
+    const rawDescription = block.match(/<description>([\s\S]*?)<\/description>/i)?.[1];
     const rawPubDate = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i)?.[1];
     const rawSourceUrl = block.match(/<source\s+url="([^"]+)"/i)?.[1];
     const rawSourceName = block.match(/<source[^>]*>([\s\S]*?)<\/source>/i)?.[1];
 
     if (!rawTitle || !rawLink) continue;
 
-    const title = normalizeSourceText(decodeXmlEntities(rawTitle.trim()), { stripChrome: true });
-    const link = decodeXmlEntities(rawLink.trim());
-    const sourceUrl = rawSourceUrl ? decodeXmlEntities(rawSourceUrl.trim()) : undefined;
+    const title = normalizeSourceText(cleanRssField(rawTitle.trim()), { stripChrome: true });
+    const link = cleanRssField(rawLink.trim());
+    const sourceUrl = rawSourceUrl ? cleanRssField(rawSourceUrl.trim()) : undefined;
     const lastSeparator = title.lastIndexOf(' - ');
     const publisher = rawSourceName
-      ? normalizeSourceText(decodeXmlEntities(rawSourceName.trim()), { stripChrome: true })
+      ? normalizeSourceText(cleanRssField(rawSourceName.trim()), { stripChrome: true })
       : lastSeparator > 0
         ? title.slice(lastSeparator + 3).trim()
         : undefined;
     const cleanTitle =
       lastSeparator > 0 ? title.slice(0, lastSeparator).trim() : title;
+    const description = normalizeSourceText(
+      stripHtml(cleanRssField((rawDescription || '').trim())),
+      { stripChrome: true, collapseWhitespace: true },
+    );
     const publishedAt = rawPubDate ? new Date(rawPubDate).toISOString() : undefined;
     const preferredUrl = sourceUrl && !isLikelyHomepageUrl(sourceUrl) ? sourceUrl : link;
+    const publisherDomain = extractHostname(sourceUrl) || extractHostname(preferredUrl);
 
     snapshots.push({
       title: cleanTitle,
       url: preferredUrl,
       article_url: link,
       publisher,
+      domain: publisherDomain,
+      description: description || undefined,
       seen_at: publishedAt,
       language: 'English',
     });
@@ -3078,10 +5527,18 @@ async function fetchGoogleNewsRssData(
       }
 
       const resolvedUrl = await resolveArticleUrl(snapshot.url);
+      const directUrl =
+        resolvedUrl && !isGoogleNewsUrl(resolvedUrl) && !isLikelyHomepageUrl(resolvedUrl)
+          ? resolvedUrl
+          : await recoverDirectArticleUrlFromSearch({
+              title: snapshot.title,
+              publisher: snapshot.publisher,
+              domain: snapshot.domain,
+            });
       return {
         ...snapshot,
         article_url: snapshot.url,
-        url: resolvedUrl,
+        url: directUrl || resolvedUrl,
       };
     }),
   );
@@ -3102,7 +5559,68 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function buildRelevantQueryWords(task: string): string[] {
+function buildRelevantQueryWords(
+  task: string,
+  understanding?: MarketUnderstanding | null,
+): string[] {
+  if (/\bprediction market\b/i.test(task)) {
+    const tokens = new Set<string>();
+    const addToken = (value: string | null | undefined) => {
+      for (const token of (value || '')
+        .toLowerCase()
+        .replace(/[^\w\s.-]/g, ' ')
+        .split(/\s+/)
+        .map((word) => word.trim())
+        .filter((word) => word.length > 2)) {
+        if (
+          [
+            'will',
+            'before',
+            'after',
+            'reach',
+            'launch',
+            'mainnet',
+            'market',
+            'prediction',
+            'topic',
+            'listed',
+            'outcomes',
+            'agentflow',
+            'provider',
+            'category',
+            'address',
+            'reference',
+            'searching',
+            'focus',
+            'example',
+            'should',
+            'researched',
+            'real',
+            'world',
+            'event',
+          ].includes(token)
+        ) {
+          continue;
+        }
+        tokens.add(token);
+      }
+    };
+    addToken(extractPredictionMarketQuestion(task));
+    addToken(understanding?.entity?.canonicalName);
+    for (const alias of understanding?.entity?.aliases ?? []) addToken(alias);
+    addToken(understanding?.underlying || undefined);
+    if (extractPredictionMarketCategory(task) === 'crypto') {
+      addToken('blockchain');
+      addToken('crypto');
+      if (understanding?.questionType === 'launch_milestone') {
+        addToken('mainnet');
+        addToken('testnet');
+        addToken('roadmap');
+      }
+    }
+    return [...tokens].slice(0, 12);
+  }
+
   return task
     .toLowerCase()
     .replace(/[^\w\s-]/g, ' ')
@@ -3162,7 +5680,7 @@ function isArticleRelevantToTask(article: GdeltArticleSnapshot, task: string): b
   if (queryWords.length === 0) return true;
   const haystack = [
     article.title,
-    (article as { description?: string }).description,
+    article.description,
     article.url,
     article.article_url,
     article.publisher,
@@ -3177,7 +5695,10 @@ function isArticleRelevantToTask(article: GdeltArticleSnapshot, task: string): b
   );
 }
 
-function currentEventTopicAnchors(task: string): RegExp[] {
+function currentEventTopicAnchors(
+  task: string,
+  understanding?: MarketUnderstanding | null,
+): RegExp[] {
   const anchors: RegExp[] = [];
   if (/\bx402\b/i.test(task)) anchors.push(/\bx402\b/i);
   if (/\bopenai\b|\bchatgpt\b/i.test(task)) anchors.push(/\bopenai\b|\bchatgpt\b/i);
@@ -3189,19 +5710,64 @@ function currentEventTopicAnchors(task: string): RegExp[] {
   if (/\bsolana\b|\bsol\b/i.test(task)) anchors.push(/\bsolana\b|\bsol\b/i);
   if (/\biran\b/i.test(task)) anchors.push(/\biran\b/i);
   if (isArcNetworkTask(task)) anchors.push(/\barc\b|\barc\.network\b/i);
+  if (/\bprediction market\b/i.test(task) && understanding?.entity) {
+    const canonical = understanding.entity.canonicalName.toLowerCase().trim();
+    if (canonical.includes('arc network')) {
+      anchors.push(/\barc network\b|\barc\.io\b|\barc\.network\b|\bdocs\.arc\.io\b/i);
+    } else if (
+      canonical.includes('grand theft auto vi') ||
+      canonical.includes('grand theft auto 6')
+    ) {
+      anchors.push(/\bgta\s*(?:6|vi)\b|\bgrand theft auto\s*(?:6|vi)\b/i);
+    } else if (canonical) {
+      anchors.push(new RegExp(`\\b${escapeRegex(canonical)}\\b`, 'i'));
+    }
+  }
   return anchors;
 }
 
 function isStronglyRelevantCurrentEventArticle(
   article: GdeltArticleSnapshot,
   task: string,
+  understanding?: MarketUnderstanding | null,
 ): boolean {
   if (!isArticleRelevantToTask(article, task)) return false;
-  const anchors = currentEventTopicAnchors(task);
+  if (/\bprediction market\b/i.test(task) && understanding?.entity) {
+    const pseudoSnapshot: FirecrawlArticleSnapshot = {
+      title: article.title,
+      url: article.url || article.article_url || '',
+      publisher: article.publisher,
+      seen_at: article.seen_at,
+      summary:
+        normalizeSourceText(article.description || '', {
+          stripChrome: true,
+          collapseWhitespace: true,
+        }) || article.title,
+    };
+    return isEntityRelevantPredictionMarketSource(pseudoSnapshot, task, understanding);
+  }
+  const queryWords = buildRelevantQueryWords(task, understanding);
+  if (queryWords.length > 0) {
+    const haystack = [
+      article.title,
+      article.description,
+      article.url,
+      article.article_url,
+      article.publisher,
+      article.domain,
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    if (!queryWords.some((word) => new RegExp(`\\b${escapeRegex(word)}\\b`, 'i').test(haystack))) {
+      return false;
+    }
+  }
+  const anchors = currentEventTopicAnchors(task, understanding);
   if (anchors.length === 0) return true;
   const haystack = [
     article.title,
-    (article as { description?: string }).description,
+    article.description,
     article.url,
     article.article_url,
     article.publisher,
@@ -3211,6 +5777,45 @@ function isStronglyRelevantCurrentEventArticle(
     .join(' ')
     .toLowerCase();
   return anchors.some((anchor) => anchor.test(haystack));
+}
+
+function buildMetadataSummaryFromArticle(article: GdeltArticleSnapshot): string {
+  const description = normalizeSourceText(article.description || '', {
+    stripChrome: true,
+    collapseWhitespace: true,
+  });
+  const title = normalizeSourceText(article.title || '', {
+    stripChrome: true,
+    collapseWhitespace: true,
+  });
+  const combined =
+    description && title && !description.toLowerCase().includes(title.toLowerCase())
+      ? `${title}. ${description}`
+      : description || title;
+  return truncateSentences(combined, 320) || title;
+}
+
+function buildMetadataSnapshotFromArticle(
+  article: GdeltArticleSnapshot,
+  urlOverride?: string,
+): FirecrawlArticleSnapshot | null {
+  const url = (urlOverride || article.url || article.article_url || '').trim();
+  if (!url || isGoogleConsentUrl(url) || isLikelyHomepageUrl(url)) {
+    return null;
+  }
+
+  const summary = buildMetadataSummaryFromArticle(article);
+  if (!summary || isGoogleConsentInterstitialText(summary)) {
+    return null;
+  }
+
+  return {
+    title: article.title,
+    url,
+    publisher: article.publisher,
+    seen_at: article.seen_at,
+    summary,
+  };
 }
 
 async function fetchHackerNewsRSS(
@@ -3320,9 +5925,9 @@ function articleLooksGeopolitical(
 
 async function fetchCurrentEventsData(
   task: string,
-  options?: { bypassCache?: boolean },
+  options?: { bypassCache?: boolean; understanding?: MarketUnderstanding | null },
 ): Promise<CurrentEventsSnapshot | null> {
-  const queryVariants = buildCurrentEventQueries(task);
+  const queryVariants = buildCurrentEventQueries(task, options?.understanding);
   const statusQueryVariants = buildConflictStatusQueries(task);
   if (queryVariants.length === 0) {
     return null;
@@ -3336,15 +5941,48 @@ async function fetchCurrentEventsData(
     Promise.all(statusQueryVariants.map((query) => fetchGdeltData(query, options).catch(() => []))),
     Promise.all(statusQueryVariants.map((query) => fetchGoogleNewsRssData(query, options).catch(() => []))),
   ]);
+  if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(task)) {
+    console.error(
+      `[RETR][current-events] task="${task.slice(0, 80)}" queries=${queryVariants.length} statusQueries=${statusQueryVariants.length}`,
+    );
+    for (let index = 0; index < queryVariants.length; index += 1) {
+      const gdeltCount = gdeltGroups[index]?.length ?? 0;
+      const rssCount = rssGroups[index]?.length ?? 0;
+      const rssPreview = (rssGroups[index] ?? [])
+        .slice(0, 3)
+        .map((article) => `${article.publisher || article.domain || '?'}::${article.title}`)
+        .join(' | ');
+      console.error(
+        `[RETR][current-events]   query="${queryVariants[index]}" gdelt=${gdeltCount} rss=${rssCount}${rssPreview ? ` rssPreview=${rssPreview}` : ''}`,
+      );
+    }
+  }
   const groups = [...gdeltGroups, ...rssGroups];
   const statusGroups = [...statusGdeltGroups, ...statusRssGroups];
 
   let relevantFirecrawlSearchSnapshots = firecrawlSearchSnapshots.filter((snapshot) =>
-    isStronglyRelevantCurrentEventArticle(snapshotToCurrentEventArticle(snapshot), task),
+    isStronglyRelevantCurrentEventArticle(
+      snapshotToCurrentEventArticle(snapshot),
+      task,
+      options?.understanding,
+    ),
   );
   let merged = mergeCurrentEventArticles(groups).filter((article) =>
-    isStronglyRelevantCurrentEventArticle(article, task),
+    isStronglyRelevantCurrentEventArticle(article, task, options?.understanding),
   );
+  if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(task)) {
+    console.error(
+      `[RETR][current-events]   firecrawlRelevant=${relevantFirecrawlSearchSnapshots.length} mergedRelevant=${merged.length}`,
+    );
+    if (merged.length > 0) {
+      console.error(
+        `[RETR][current-events]   mergedTitles=${merged
+          .slice(0, 6)
+          .map((article) => `${article.publisher || article.domain || '?'}::${article.title}`)
+          .join(' | ')}`,
+      );
+    }
+  }
   if (merged.length === 0 && relevantFirecrawlSearchSnapshots.length > 0) {
     merged = relevantFirecrawlSearchSnapshots.map(snapshotToCurrentEventArticle);
   }
@@ -3363,6 +6001,9 @@ async function fetchCurrentEventsData(
   }
 
   if (merged.length === 0) {
+    if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(task)) {
+      console.error('[RETR][current-events]   merged emptied before snapshot selection');
+    }
     return null;
   }
 
@@ -3387,15 +6028,68 @@ async function fetchCurrentEventsData(
         );
   const articleSnapshots =
     relevantFirecrawlSearchSnapshots.length > 0
-      ? relevantFirecrawlSearchSnapshots
-      : fallbackSnapshots.filter((snapshot) =>
-          isStronglyRelevantCurrentEventArticle(snapshotToCurrentEventArticle(snapshot), task),
+        ? relevantFirecrawlSearchSnapshots
+        : (fallbackSnapshots.length > 0
+            ? fallbackSnapshots
+            : (recentArticles.length > 0 ? recentArticles : merged)
+                .slice(0, 4)
+                .map((article) => buildMetadataSnapshotFromArticle(article))
+                .filter((snapshot): snapshot is FirecrawlArticleSnapshot => Boolean(snapshot))
+          ).filter((snapshot) =>
+          isStronglyRelevantCurrentEventArticle(
+            snapshotToCurrentEventArticle(snapshot),
+            task,
+            options?.understanding,
+          ),
         );
+  if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(task)) {
+    console.error(
+      `[RETR][current-events]   fallbackSnapshots=${fallbackSnapshots.length} articleSnapshots=${articleSnapshots.length} selectedArticlesBase=${(recentArticles.length > 0 ? recentArticles : backgroundArticles).length}`,
+    );
+    if (articleSnapshots.length > 0) {
+      console.error(
+        `[RETR][current-events]   snapshotUrls=${articleSnapshots
+          .slice(0, 6)
+          .map((snapshot) => snapshot.url)
+          .join(' | ')}`,
+      );
+    }
+  }
   const snapshotArticles = articleSnapshots.map(snapshotToCurrentEventArticle);
+  const predictionMarketSelectedArticles = /\bprediction market\b/i.test(task)
+    ? (() => {
+        const ordered = [
+          ...snapshotArticles,
+          ...(recentArticles.length > 0 ? recentArticles : backgroundArticles),
+          ...merged,
+        ];
+        const selected: GdeltArticleSnapshot[] = [];
+        const seen = new Set<string>();
+        for (const article of ordered) {
+          if (!isStronglyRelevantCurrentEventArticle(article, task, options?.understanding)) continue;
+          const key = normalizeArticleKey(article);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          selected.push(article);
+          if (selected.length >= 4) break;
+        }
+        return selected;
+      })()
+    : [];
+  const rankedEvidenceArticles = mergeCurrentEventArticles([
+    snapshotArticles,
+    recentArticles.length > 0 ? recentArticles : backgroundArticles,
+  ]).filter((article) =>
+    isStronglyRelevantCurrentEventArticle(article, task, options?.understanding),
+  );
   const selectedArticles =
-    snapshotArticles.length > 0
-      ? snapshotArticles.slice(0, 4)
-      : (recentArticles.length > 0 ? recentArticles : backgroundArticles).slice(0, 4);
+    predictionMarketSelectedArticles.length > 0
+      ? predictionMarketSelectedArticles
+      : rankedEvidenceArticles.length > 0
+      ? rankedEvidenceArticles.slice(0, 4)
+      : snapshotArticles.length > 0
+        ? snapshotArticles.slice(0, 4)
+        : (recentArticles.length > 0 ? recentArticles : backgroundArticles).slice(0, 4);
   const selectedBackground =
     recentArticles.length > 0 ? backgroundArticles.slice(0, 2) : [];
   const framingSignals = deriveCurrentEventFramingSignals({
@@ -3430,6 +6124,7 @@ async function fetchFirecrawlArticleSnapshot(
   const rawUrl = getFirecrawlTargetUrl(article);
   if (!rawUrl) return null;
   const url = /news\.google\.com/i.test(rawUrl) ? await resolveArticleUrl(rawUrl) : rawUrl;
+  if (isGoogleConsentUrl(url)) return null;
 
   const cached = options?.bypassCache ? null : getCacheValue(firecrawlArticleCache.get(url));
   if (cached) {
@@ -3439,14 +6134,19 @@ async function fetchFirecrawlArticleSnapshot(
   try {
     const markdown = await fetchUrlViaFirecrawl(url);
     const summary = markdownToSnippet(markdown);
-    if (!summary) {
+    if (
+      !summary ||
+      isGoogleConsentInterstitialText(article.title) ||
+      isGoogleConsentInterstitialText(summary)
+    ) {
+      const metadataSnapshot = buildMetadataSnapshotFromArticle(article, url);
       if (!options?.bypassCache) {
         firecrawlArticleCache.set(url, {
-          value: null,
+          value: metadataSnapshot,
           expiresAt: Date.now() + FIRECRAWL_CACHE_TTL_MS,
         });
       }
-      return null;
+      return metadataSnapshot;
     }
 
     const snapshot = {
@@ -3468,13 +6168,14 @@ async function fetchFirecrawlArticleSnapshot(
       FIRECRAWL_CACHE_TTL_MS,
     );
   } catch {
+    const metadataSnapshot = buildMetadataSnapshotFromArticle(article, url);
     if (!options?.bypassCache) {
       firecrawlArticleCache.set(url, {
-        value: null,
+        value: metadataSnapshot,
         expiresAt: Date.now() + FIRECRAWL_CACHE_TTL_MS,
       });
     }
-    return null;
+    return metadataSnapshot;
   }
 }
 
@@ -3616,11 +6317,44 @@ const GENERIC_RSS_LABEL_TERMS = new Set([
 
 export function buildRssMatchTerms(task: string): string[] {
   const terms = new Set<string>();
-  const cleaned = task.toLowerCase().replace(/[^\w\s-]/g, ' ');
+  const predictionQuestion = isPredictionMarketResearchTask(task)
+    ? extractPredictionMarketQuestion(task)
+    : null;
+  const cleaned = (predictionQuestion || task).toLowerCase().replace(/[^\w\s-]/g, ' ');
   for (const raw of cleaned.split(/\s+/)) {
     const w = raw.trim();
     if (w.length < 2 || RSS_MATCH_STOPWORDS.has(w) || GENERIC_QUERY_STOPWORDS.has(w)) continue;
     terms.add(w);
+  }
+  if (isPredictionMarketResearchTask(task)) {
+    if (/\bxaut\b|\btether gold\b/i.test(cleaned)) {
+      terms.add('xaut');
+      terms.add('gold');
+      terms.add('bullion');
+      terms.add('tether gold');
+    }
+    if (
+      /\bPrediction market category in AgentFlow:\s*Crypto\b/i.test(task) &&
+      /\barc\b/i.test(cleaned) &&
+      /\b(mainnet|launch|testnet)\b/i.test(cleaned)
+    ) {
+      terms.add('arc');
+      terms.add('mainnet');
+      terms.add('blockchain');
+      terms.add('stablecoin');
+      terms.add('testnet');
+    }
+    if (/\b(world cup|fifa)\b/i.test(cleaned)) {
+      terms.add('fifa');
+      terms.add('world cup');
+      terms.add('odds');
+      terms.add('favorites');
+    }
+    if (/\b(gta 6|grand theft auto)\b/i.test(cleaned)) {
+      terms.add('gta');
+      terms.add('rockstar');
+      terms.add('release');
+    }
   }
   for (const label of classifyTopic(task).labels) {
     const l = label.toLowerCase().trim();
@@ -3642,6 +6376,11 @@ function parseRssItemBlock(block: string): {
   description: string;
   seenAt?: string;
 } | null {
+  const cleanRssField = (value: string): string =>
+    decodeXmlEntities(value)
+      .replace(/^<!\[CDATA\[/i, '')
+      .replace(/\]\]>$/i, '')
+      .trim();
   const rawTitle =
     block.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/i)?.[1] ||
     block.match(/<title>([\s\S]*?)<\/title>/i)?.[1] ||
@@ -3653,10 +6392,10 @@ function parseRssItemBlock(block: string): {
     '';
   const rawPubDate = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i)?.[1] || '';
 
-  const title = normalizeSourceText(decodeXmlEntities(rawTitle.trim()), { stripChrome: true });
-  const link = decodeXmlEntities(rawLink.trim());
+  const title = normalizeSourceText(cleanRssField(rawTitle.trim()), { stripChrome: true });
+  const link = cleanRssField(rawLink.trim());
   const description = normalizeSourceText(
-    stripHtml(decodeXmlEntities(rawDescription.trim())),
+    stripHtml(cleanRssField(rawDescription.trim())),
     { stripChrome: true, collapseWhitespace: true },
   );
   const seenAt =
@@ -3704,6 +6443,7 @@ async function fetchRSSFromRegistry(
           url: link,
           publisher: source.name,
           domain: source.baseUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, ''),
+          description,
           language: 'English',
           seen_at: seenAt,
         };
@@ -3729,10 +6469,50 @@ export async function fetchDynamicSources(task: string): Promise<GdeltArticleSna
   const cached = getCacheValue(dynamicRssCache.get(cacheKey));
   if (cached) return cached;
 
-  const { labels } = classifyTopic(task);
+  const predictionCategory = /\bprediction market\b/i.test(task)
+    ? extractPredictionMarketCategory(task)
+    : null;
+  const classificationTask = predictionCategory
+    ? normalizeLiveDataSearchTask(task)
+    : task;
+  const { labels } = classifyTopic(classificationTask);
   const protocolQueryShape = detectProtocolQueryShape(task);
   let sources = SOURCE_REGISTRY.filter((source) => source.enabled && source.rssUrls?.length);
-  if (labels.length > 0) {
+  const predictionCryptoTask =
+    /\bprediction market\b/i.test(task) && predictionCategory === 'crypto';
+  if (predictionCryptoTask) {
+    const cryptoOnly = sources.filter((s) =>
+      s.topics.some((topic) =>
+        ['crypto', 'defi', 'blockchain', 'token', 'web3', 'onchain', 'stablecoin', 'bitcoin', 'ethereum', 'markets'].includes(
+          topic,
+        ),
+      ),
+    );
+    if (cryptoOnly.length > 0) {
+      sources = cryptoOnly;
+    }
+  }
+  if (predictionCategory === 'sports') {
+    const sportsOnly = sources.filter((s) =>
+      s.topics.some((topic) =>
+        ['sports', 'football', 'soccer', 'betting', 'odds'].includes(topic),
+      ) || /\b(?:espn|cbs sports|sporting news|fifa|uefa|the analyst|oddschecker|action network|fox sports|bbc sport)\b/i.test(s.name),
+    );
+    if (sportsOnly.length > 0) {
+      sources = sportsOnly;
+    }
+  }
+  if (predictionCategory === 'games' || predictionCategory === 'gaming') {
+    const gamesOnly = sources.filter((s) =>
+      s.topics.some((topic) =>
+        ['gaming', 'games', 'entertainment', 'technology'].includes(topic),
+      ) || /\b(?:ign|gamespot|polygon|eurogamer|rockstar|playstation|xbox|steam)\b/i.test(s.name),
+    );
+    if (gamesOnly.length > 0) {
+      sources = gamesOnly;
+    }
+  }
+  if (!predictionCategory && labels.length > 0) {
     const narrowed = sources.filter((s) => s.topics.some((t) => labels.includes(t)));
     if (narrowed.length > 0) {
       sources = narrowed;
@@ -3786,6 +6566,19 @@ export async function fetchDynamicSources(task: string): Promise<GdeltArticleSna
   });
 
   const result = deduped.slice(0, 15);
+  if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(task)) {
+    console.error(
+      `[RETR][dynamic-rss] task="${task.slice(0, 80)}" selectedSources=${sources.length} raw=${all.length} deduped=${result.length}`,
+    );
+    if (result.length > 0) {
+      console.error(
+        `[RETR][dynamic-rss]   urls=${result
+          .slice(0, 8)
+          .map((item) => `${item.publisher || item.domain || '?'}::${item.title}`)
+          .join(' | ')}`,
+      );
+    }
+  }
   return setTimedCache(dynamicRssCache, cacheKey, result, DYNAMIC_RSS_CACHE_TTL_MS);
 }
 
@@ -3832,54 +6625,197 @@ function rankDynamicRssSources(task: string, sources: SourceConfig[]): SourceCon
   return scored.map((entry) => entry.source);
 }
 
-export async function fetchLiveData(task: string): Promise<string> {
+export async function fetchLiveData(
+  task: string,
+  options?: { originalTask?: string; understanding?: MarketUnderstanding | null },
+): Promise<string> {
+  const contextTask = options?.originalTask?.trim() || task;
+  const isPredictionMarketTask = /\bprediction market\b/i.test(contextTask);
   const sourceTask = normalizeLiveDataSearchTask(task);
   const normalizedTask = sourceTask.trim().toLowerCase();
   const bypassCurrentEventCache = shouldBypassCurrentEventCaches(sourceTask);
-  const cached = bypassCurrentEventCache ? null : getCacheValue(liveDataCache.get(normalizedTask));
+  const useLiveDataCache = !bypassCurrentEventCache && !isPredictionMarketTask;
+  const cached = useLiveDataCache ? getCacheValue(liveDataCache.get(normalizedTask)) : null;
   if (cached) {
     return cached;
   }
 
   const snapshotAt = new Date().toISOString();
-  const researchDomain = detectResearchDomain(sourceTask);
-  const shouldFetchCurrentEvents = shouldGatherCurrentEvents(sourceTask);
+  const researchDomain = detectResearchDomain(contextTask);
   // Prediction-market research needs Firecrawl/SearXNG evidence even when current events
   // are gathered, otherwise a price market collapses to a single CoinGecko snapshot.
-  const isPredictionMarketTask = /\bprediction market\b/i.test(task);
+  let predictionMarketUnderstanding = isPredictionMarketTask
+    ? options?.understanding ??
+      (await understandMarketResearch(contextTask, { timeoutMs: 20_000 }).catch(() => null))
+    : null;
+  const shouldFetchCurrentEvents =
+    shouldGatherCurrentEvents(contextTask) ||
+    isPredictionMarketTask;
   const shouldAlsoFetchFirecrawl =
     shouldFetchCurrentEvents && (isCreatorAudienceMetricTask(sourceTask) || isPredictionMarketTask);
-  const firecrawlQueryVariants = buildPrimaryFirecrawlQueryVariants(task);
+  const firecrawlQuerySeed = predictionMarketUnderstanding
+    ? buildPredictionMarketSearchSeed(contextTask, predictionMarketUnderstanding)
+    : isPredictionMarketTask
+      ? // Prediction-market task but LLM understanding failed: derive a deterministic
+        // subject seed instead of searching the literal market sentence.
+        buildPredictionMarketSearchSeed(contextTask, null)
+      : task;
+  const firecrawlQueryVariants = buildPrimaryFirecrawlQueryVariants(
+    firecrawlQuerySeed,
+    contextTask,
+    predictionMarketUnderstanding,
+  );
   const payload: Record<string, unknown> = {
     snapshot_at: snapshotAt,
     research_domain: researchDomain,
+    ...(predictionMarketUnderstanding
+      ? {
+          prediction_market_understanding: predictionMarketUnderstanding,
+          research_brief: buildPredictionMarketResearchBrief(
+            contextTask,
+            predictionMarketUnderstanding,
+          ),
+        }
+      : {}),
   };
 
   if (researchDomain === 'crypto') {
-    const [firecrawlEvidence, coingecko, bitcoinOnchain, defillama, wikipedia, currentEvents] =
+    const [firecrawlEvidence, registryArticleEvidence, officialSearchEvidence, officialFallbackEvidence, coingecko, bitcoinOnchain, defillama, wikipedia, currentEvents] =
       await Promise.allSettled([
         shouldFetchCurrentEvents && !isPredictionMarketTask
           ? Promise.resolve([] as FirecrawlArticleSnapshot[])
-          : fetchFirecrawlSearchSnapshots(firecrawlQueryVariants, sourceTask, {
+          : fetchFirecrawlSearchSnapshots(firecrawlQueryVariants, contextTask, {
               bypassCache: bypassCurrentEventCache,
+              understanding: predictionMarketUnderstanding,
             }),
+        isPredictionMarketTask
+          ? fetchPredictionMarketRegistryArticleEvidence(
+              contextTask,
+              predictionMarketUnderstanding,
+            )
+          : Promise.resolve([] as FirecrawlArticleSnapshot[]),
+        isPredictionMarketTask
+          ? fetchPredictionMarketOfficialSearchEvidence(
+              contextTask,
+              predictionMarketUnderstanding,
+            )
+          : Promise.resolve([] as FirecrawlArticleSnapshot[]),
+        isPredictionMarketTask
+          ? fetchPredictionMarketOfficialFallbackEvidence(
+              contextTask,
+              predictionMarketUnderstanding,
+            )
+          : Promise.resolve([] as FirecrawlArticleSnapshot[]),
         fetchCoinGeckoData(sourceTask),
         fetchBitcoinOnchainData(sourceTask),
-        fetchDefiLlamaData(sourceTask),
-        fetchWikipediaData(sourceTask, researchDomain),
+        shouldFetchDefiLlamaDataForTask(contextTask, predictionMarketUnderstanding)
+          ? fetchDefiLlamaData(sourceTask)
+          : Promise.resolve([] as DefiLlamaChainSnapshot[]),
+        fetchWikipediaData(
+          predictionMarketUnderstanding?.subject || sourceTask,
+          researchDomain,
+        ),
         shouldFetchCurrentEvents
-          ? fetchCurrentEventsData(task, { bypassCache: bypassCurrentEventCache })
+          ? fetchCurrentEventsData(contextTask, {
+              bypassCache: bypassCurrentEventCache,
+              understanding: predictionMarketUnderstanding,
+            })
           : Promise.resolve(null),
       ]);
 
-    if (firecrawlEvidence.status === 'fulfilled' && firecrawlEvidence.value.length > 0) {
-      const taskFilteredEvidence = filterLowValueEvidenceForTask(task, firecrawlEvidence.value);
-      const finalFirecrawlEvidence = filterPredictionMarketResearchEvidence(task, taskFilteredEvidence);
+    if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(contextTask)) {
+      console.error(
+        `[RETR][crypto] firecrawl=${firecrawlEvidence.status === 'fulfilled' ? firecrawlEvidence.value.length : 'ERR'} registry=${
+          registryArticleEvidence.status === 'fulfilled' ? registryArticleEvidence.value.length : 'ERR'
+        } officialSearch=${
+          officialSearchEvidence.status === 'fulfilled' ? officialSearchEvidence.value.length : 'ERR'
+        } officialFallback=${
+          officialFallbackEvidence.status === 'fulfilled' ? officialFallbackEvidence.value.length : 'ERR'
+        } currentEvents=${
+          currentEvents.status === 'fulfilled'
+            ? ((currentEvents.value?.article_snapshots?.length ?? 0) as number)
+            : 'ERR'
+        }`,
+      );
+    }
+
+    if (firecrawlEvidence.status === 'fulfilled') {
+      const currentEventsValue =
+        currentEvents.status === 'fulfilled' ? currentEvents.value : null;
+      const combinedEvidence = [
+        ...(firecrawlEvidence.value ?? []),
+        ...(registryArticleEvidence.status === 'fulfilled' ? registryArticleEvidence.value : []),
+        ...(officialSearchEvidence.status === 'fulfilled' ? officialSearchEvidence.value : []),
+        ...(officialFallbackEvidence.status === 'fulfilled' ? officialFallbackEvidence.value : []),
+      ];
+      const taskFilteredEvidence = filterLowValueEvidenceForTask(contextTask, combinedEvidence);
+      let finalFirecrawlEvidence = filterPredictionMarketResearchEvidence(
+        contextTask,
+        taskFilteredEvidence,
+        predictionMarketUnderstanding,
+      );
+      if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(contextTask)) {
+        console.error(
+          `[RETR][crypto] combined=${combinedEvidence.length} taskFiltered=${taskFilteredEvidence.length} filtered=${finalFirecrawlEvidence.length}`,
+        );
+      }
+      finalFirecrawlEvidence = mergePredictionMarketCurrentEventSnapshots(
+        contextTask,
+        currentEventsValue,
+        finalFirecrawlEvidence,
+        predictionMarketUnderstanding,
+      );
+      if (process.env.RETR_DEBUG && /\bprediction market\b/i.test(contextTask)) {
+        console.error(
+          `[RETR][crypto] afterCurrentEvents=${finalFirecrawlEvidence.length} currentSnapshots=${
+            currentEventsValue?.article_snapshots?.length ?? 0
+          }`,
+        );
+      }
+      if (finalFirecrawlEvidence.length < 3) {
+        const recoveredEvidence = await recoverPredictionMarketSnapshotsFromCurrentEvents(
+          contextTask,
+          currentEventsValue,
+          predictionMarketUnderstanding,
+        );
+        if (recoveredEvidence.length > 0) {
+          finalFirecrawlEvidence = selectPredictionMarketEvidenceWithHostDiversity(
+            contextTask,
+            filterPredictionMarketResearchEvidence(
+              contextTask,
+              [...finalFirecrawlEvidence, ...recoveredEvidence],
+              predictionMarketUnderstanding,
+            ),
+            PREDICTION_MARKET_EVIDENCE_LIMIT,
+          );
+        }
+      }
       if (finalFirecrawlEvidence.length > 0) {
-      payload.dynamic_sources = {
-        source: 'Firecrawl search (primary evidence)',
-        articles: finalFirecrawlEvidence,
-      };
+        const hasOfficialEvidence = finalFirecrawlEvidence.some((snapshot) =>
+          isOfficialPredictionMarketSource(snapshot, predictionMarketUnderstanding),
+        );
+        const hasNonOfficialEvidence = finalFirecrawlEvidence.some(
+          (snapshot) => !isOfficialPredictionMarketSource(snapshot, predictionMarketUnderstanding),
+        );
+        payload.dynamic_sources = {
+          source: hasNonOfficialEvidence
+            ? hasOfficialEvidence
+              ? 'Hybrid live search with supporting official evidence'
+              : registryArticleEvidence.status === 'fulfilled' &&
+                  registryArticleEvidence.value.length > 0
+                ? 'Registry RSS + hybrid live search'
+                : 'Hybrid live search (primary evidence)'
+            : 'Official-domain evidence only',
+          articles: finalFirecrawlEvidence,
+        };
+        if (predictionMarketUnderstanding) {
+          payload.source_diagnostics = buildPredictionMarketSourceDiagnostics(
+            contextTask,
+            predictionMarketUnderstanding,
+            finalFirecrawlEvidence,
+            getSearchBackendDiagnostics(),
+          );
+        }
       }
     }
 
@@ -3910,13 +6846,17 @@ export async function fetchLiveData(task: string): Promise<string> {
 
     if (currentEvents.status === 'fulfilled' && currentEvents.value) {
       payload.current_events = sanitizePredictionMarketCurrentEvents(
-        task,
+        contextTask,
         currentEvents.value,
+        predictionMarketUnderstanding,
       );
     }
   } else if (researchDomain === 'geopolitics') {
     const [currentEvents, wikipedia] = await Promise.allSettled([
-      fetchCurrentEventsData(sourceTask, { bypassCache: bypassCurrentEventCache }),
+      fetchCurrentEventsData(contextTask, {
+        bypassCache: bypassCurrentEventCache,
+        understanding: predictionMarketUnderstanding,
+      }),
       
       fetchWikipediaData(sourceTask, researchDomain),
     ]);
@@ -3965,39 +6905,146 @@ export async function fetchLiveData(task: string): Promise<string> {
   } else {
     const identityLookup = isSimpleIdentityLookup(sourceTask);
     const lookupTask = identityLookup ? normalizeIdentityLookupQuery(sourceTask) : sourceTask;
-    const [firecrawlEvidence, wikipedia, currentEvents] = await Promise.all([
+    const [firecrawlEvidence, registryArticleEvidence, sportsAuthorityEvidence, officialSearchEvidence, officialFallbackEvidence, wikipedia, currentEvents] = await Promise.all([
       (
         shouldFetchCurrentEvents && !shouldAlsoFetchFirecrawl
           ? Promise.resolve([] as FirecrawlArticleSnapshot[])
-          : fetchFirecrawlSearchSnapshots(firecrawlQueryVariants, sourceTask, {
+          : fetchFirecrawlSearchSnapshots(firecrawlQueryVariants, contextTask, {
               bypassCache: bypassCurrentEventCache,
+              understanding: predictionMarketUnderstanding,
             })
       ).catch(() => [] as FirecrawlArticleSnapshot[]),
-      fetchWikipediaData(lookupTask, researchDomain).catch(() => [] as WikipediaPageSnapshot[]),
+      isPredictionMarketTask
+        ? fetchPredictionMarketRegistryArticleEvidence(
+            contextTask,
+            predictionMarketUnderstanding,
+          ).catch(() => [] as FirecrawlArticleSnapshot[])
+        : Promise.resolve([] as FirecrawlArticleSnapshot[]),
+      isPredictionMarketTask
+        ? fetchPredictionMarketSportsAuthorityEvidence(contextTask, predictionMarketUnderstanding).catch(
+            () => [] as FirecrawlArticleSnapshot[],
+          )
+        : Promise.resolve([] as FirecrawlArticleSnapshot[]),
+      isPredictionMarketTask
+        ? fetchPredictionMarketOfficialSearchEvidence(
+            contextTask,
+            predictionMarketUnderstanding,
+          ).catch(() => [] as FirecrawlArticleSnapshot[])
+        : Promise.resolve([] as FirecrawlArticleSnapshot[]),
+      isPredictionMarketTask
+        ? fetchPredictionMarketOfficialFallbackEvidence(
+            contextTask,
+            predictionMarketUnderstanding,
+          ).catch(() => [] as FirecrawlArticleSnapshot[])
+        : Promise.resolve([] as FirecrawlArticleSnapshot[]),
+      fetchWikipediaData(
+        predictionMarketUnderstanding?.subject || lookupTask,
+        researchDomain,
+      ).catch(() => [] as WikipediaPageSnapshot[]),
       (
         !identityLookup && shouldFetchCurrentEvents
-          ? fetchCurrentEventsData(task, { bypassCache: bypassCurrentEventCache })
+          ? fetchCurrentEventsData(contextTask, {
+              bypassCache: bypassCurrentEventCache,
+              understanding: predictionMarketUnderstanding,
+            })
           : Promise.resolve(null)
       ).catch(() => null),
     ]);
 
     const creatorAudienceTask = isCreatorAudienceMetricTask(sourceTask);
-    const taskFilteredEvidence = filterLowValueEvidenceForTask(task, firecrawlEvidence);
+    const preferredPredictionEvidence =
+      extractPredictionMarketCategory(contextTask) === 'sports'
+        ? [
+            ...sportsAuthorityEvidence,
+            ...registryArticleEvidence,
+            ...officialSearchEvidence,
+            ...officialFallbackEvidence,
+            ...firecrawlEvidence,
+          ]
+        : [
+            ...registryArticleEvidence,
+            ...officialSearchEvidence,
+            ...officialFallbackEvidence,
+            ...firecrawlEvidence,
+            ...sportsAuthorityEvidence,
+          ];
+    const taskFilteredEvidence = filterLowValueEvidenceForTask(
+      contextTask,
+      preferredPredictionEvidence,
+    );
     const creatorAugmentedEvidence = creatorAudienceTask
       ? augmentCreatorAudienceEvidence(taskFilteredEvidence)
       : taskFilteredEvidence;
-    const finalFirecrawlEvidence = creatorAudienceTask
+    let finalFirecrawlEvidence = creatorAudienceTask
       ? filterCreatorAudienceEvidence(creatorAugmentedEvidence)
-      : filterPredictionMarketResearchEvidence(task, creatorAugmentedEvidence);
+      : filterPredictionMarketResearchEvidence(
+          contextTask,
+          creatorAugmentedEvidence,
+          predictionMarketUnderstanding,
+        );
+    finalFirecrawlEvidence = mergePredictionMarketCurrentEventSnapshots(
+      contextTask,
+      currentEvents,
+      finalFirecrawlEvidence,
+      predictionMarketUnderstanding,
+    );
+    if (
+      extractPredictionMarketCategory(contextTask) === 'sports' &&
+      sportsAuthorityEvidence.length > 0 &&
+      !hasAuthoritativeSportsOddsEvidence(contextTask, finalFirecrawlEvidence)
+    ) {
+      finalFirecrawlEvidence = selectPredictionMarketEvidenceWithHostDiversity(
+        contextTask,
+        filterPredictionMarketResearchEvidence(
+          contextTask,
+          [...sportsAuthorityEvidence, ...finalFirecrawlEvidence],
+          predictionMarketUnderstanding,
+        ),
+        PREDICTION_MARKET_EVIDENCE_LIMIT,
+      );
+    }
+    if (finalFirecrawlEvidence.length < 3) {
+      const recoveredEvidence = await recoverPredictionMarketSnapshotsFromCurrentEvents(
+        contextTask,
+        currentEvents,
+        predictionMarketUnderstanding,
+      );
+      if (recoveredEvidence.length > 0) {
+        finalFirecrawlEvidence = selectPredictionMarketEvidenceWithHostDiversity(
+          contextTask,
+          filterPredictionMarketResearchEvidence(
+            contextTask,
+            [...finalFirecrawlEvidence, ...recoveredEvidence],
+            predictionMarketUnderstanding,
+          ),
+          PREDICTION_MARKET_EVIDENCE_LIMIT,
+        );
+      }
+    }
     const creatorAudienceMetrics = creatorAudienceTask
       ? await fetchCreatorAudienceMetricSnapshot(finalFirecrawlEvidence)
       : null;
 
     if (finalFirecrawlEvidence.length > 0) {
       payload.dynamic_sources = {
-        source: 'Firecrawl search (primary evidence)',
+        source:
+          officialSearchEvidence.length > 0 || officialFallbackEvidence.length > 0
+          ? 'Official-domain search + Firecrawl evidence'
+          : sportsAuthorityEvidence.length > 0
+          ? 'Sports authority search + Firecrawl evidence'
+          : firecrawlEvidence.length > 0
+          ? 'Firecrawl search (primary evidence)'
+          : 'Filtered live article evidence',
         articles: finalFirecrawlEvidence,
       };
+      if (predictionMarketUnderstanding) {
+        payload.source_diagnostics = buildPredictionMarketSourceDiagnostics(
+          contextTask,
+          predictionMarketUnderstanding,
+          finalFirecrawlEvidence,
+          getSearchBackendDiagnostics(),
+        );
+      }
     }
 
     if (creatorAudienceMetrics) {
@@ -4012,9 +7059,22 @@ export async function fetchLiveData(task: string): Promise<string> {
     }
 
     if (currentEvents) {
-      payload.current_events = sanitizePredictionMarketCurrentEvents(task, currentEvents);
+      payload.current_events = sanitizePredictionMarketCurrentEvents(
+        contextTask,
+        currentEvents,
+        predictionMarketUnderstanding,
+      );
     }
 
+  }
+
+  if (predictionMarketUnderstanding && !payload.source_diagnostics) {
+    payload.source_diagnostics = buildPredictionMarketSourceDiagnostics(
+      contextTask,
+      predictionMarketUnderstanding,
+      [],
+      getSearchBackendDiagnostics(),
+    );
   }
 
   const hasSourceData = Boolean(
@@ -4030,7 +7090,7 @@ export async function fetchLiveData(task: string): Promise<string> {
   );
   const result = hasSourceData ? JSON.stringify(payload, null, 2) : '';
 
-  if (normalizedTask && !bypassCurrentEventCache && hasSourceData) {
+  if (normalizedTask && useLiveDataCache && hasSourceData) {
     liveDataCache.set(normalizedTask, {
       value: result,
       expiresAt: Date.now() + LIVE_DATA_CACHE_TTL_MS,

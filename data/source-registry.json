@@ -10784,6 +10784,315 @@
     "last_verified": "2026-05-23"
   },
   {
+    "name": "ESPN",
+    "baseUrl": "https://www.espn.com",
+    "topics": [
+      "sports",
+      "football",
+      "soccer",
+      "basketball",
+      "baseball",
+      "hockey"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 8,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 8,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://www.espn.com/espn/rss/news"
+    ],
+    "feed_url": "https://www.espn.com/espn/rss/news",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "CBS Sports",
+    "baseUrl": "https://www.cbssports.com",
+    "topics": [
+      "sports",
+      "football",
+      "soccer",
+      "basketball",
+      "baseball",
+      "betting",
+      "odds"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 8,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 8,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://www.cbssports.com/rss/headlines/"
+    ],
+    "feed_url": "https://www.cbssports.com/rss/headlines/",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "Sporting News",
+    "baseUrl": "https://www.sportingnews.com",
+    "topics": [
+      "sports",
+      "football",
+      "soccer",
+      "basketball",
+      "baseball",
+      "betting",
+      "odds"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 7,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 7,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://www.sportingnews.com/us/rss"
+    ],
+    "feed_url": "https://www.sportingnews.com/us/rss",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "Action Network",
+    "baseUrl": "https://www.actionnetwork.com",
+    "topics": [
+      "sports",
+      "betting",
+      "odds",
+      "football",
+      "soccer",
+      "basketball"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 8,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 7,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://www.actionnetwork.com/feed"
+    ],
+    "feed_url": "https://www.actionnetwork.com/feed",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "The Analyst",
+    "baseUrl": "https://theanalyst.com",
+    "topics": [
+      "sports",
+      "football",
+      "soccer",
+      "basketball",
+      "analytics",
+      "odds"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 8,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 8,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://theanalyst.com/feed/"
+    ],
+    "feed_url": "https://theanalyst.com/feed/",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "IGN",
+    "baseUrl": "https://www.ign.com",
+    "topics": [
+      "gaming",
+      "games",
+      "entertainment",
+      "technology"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 8,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 8,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://feeds.feedburner.com/ign/all"
+    ],
+    "feed_url": "https://feeds.feedburner.com/ign/all",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "GameSpot",
+    "baseUrl": "https://www.gamespot.com",
+    "topics": [
+      "gaming",
+      "games",
+      "entertainment",
+      "technology"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 8,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 8,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://www.gamespot.com/feeds/mashup/"
+    ],
+    "feed_url": "https://www.gamespot.com/feeds/mashup/",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "Eurogamer",
+    "baseUrl": "https://www.eurogamer.net",
+    "topics": [
+      "gaming",
+      "games",
+      "entertainment"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 7,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 7,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://www.eurogamer.net/feed"
+    ],
+    "feed_url": "https://www.eurogamer.net/feed",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "Video Games Chronicle",
+    "baseUrl": "https://www.videogameschronicle.com",
+    "topics": [
+      "gaming",
+      "games",
+      "entertainment"
+    ],
+    "trust": "medium_high",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 7,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 7,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://www.videogameschronicle.com/feed/"
+    ],
+    "feed_url": "https://www.videogameschronicle.com/feed/",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
+    "name": "Kotaku",
+    "baseUrl": "https://kotaku.com",
+    "topics": [
+      "gaming",
+      "games",
+      "entertainment"
+    ],
+    "trust": "medium",
+    "method": "rss_plus_scrape",
+    "cost": "low",
+    "speed": "fast",
+    "priority": 6,
+    "enabled": true,
+    "type": "publisher",
+    "freshness": "daily",
+    "result_type": "article",
+    "authority": 6,
+    "rate_limit": {
+      "calls": 30,
+      "window_seconds": 60
+    },
+    "rssUrls": [
+      "https://kotaku.com/rss"
+    ],
+    "feed_url": "https://kotaku.com/rss",
+    "requires_key": false,
+    "last_verified": "2026-06-16"
+  },
+  {
     "name": "Polymarket Gamma",
     "baseUrl": "https://polymarket.com",
     "endpoint": "https://gamma-api.polymarket.com/public-search?q={q}&limit=10",

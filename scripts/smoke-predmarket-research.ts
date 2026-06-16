@@ -40,17 +40,32 @@ const REQUEST_TIMEOUT_MS = Math.max(
 function buildPredmarketResearchPrompt(
   title: string,
   outcomes: MarketOutcome[] = [],
+  options?: {
+    category?: string | null;
+    provider?: string | null;
+  },
 ): string {
   const safeTitle = title.trim() || 'this prediction market';
   const outcomeLabels = outcomes
     .map((outcome) => outcome.label.trim())
     .filter(Boolean);
+  const category =
+    typeof options?.category === 'string' && options.category.trim()
+      ? options.category.trim()
+      : null;
+  const provider =
+    typeof options?.provider === 'string' && options.provider.trim()
+      ? options.provider.trim()
+      : null;
 
   return [
     `research the prediction market topic: ${safeTitle}`,
     outcomeLabels.length
       ? `Listed outcomes in AgentFlow: ${outcomeLabels.join(' / ')}.`
       : null,
+    category ? `Prediction market category in AgentFlow: ${category}.` : null,
+    provider ? `Prediction market provider in AgentFlow: ${provider}.` : null,
+    'Use the market category to disambiguate the subject before searching.',
     'Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.',
   ]
     .filter(Boolean)
@@ -290,7 +305,10 @@ async function main(): Promise<void> {
 
   for (let index = 0; index < activeMarkets.length; index++) {
     const market = activeMarkets[index]!;
-    const prompt = buildPredmarketResearchPrompt(market.title, market.outcomes);
+    const prompt = buildPredmarketResearchPrompt(market.title, market.outcomes, {
+      category: market.category,
+      provider: market.provider,
+    });
     const fileBase = `${String(index + 1).padStart(2, '0')}-${slug(market.title) || slug(market.address)}`;
     const reportPath = `${OUT_DIR}/${fileBase}.md`;
 

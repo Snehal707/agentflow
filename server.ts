@@ -593,6 +593,9 @@ const LIVE_DATA_TIMEOUT_MS_CREATOR_AUDIENCE = Number(
 const LIVE_DATA_TIMEOUT_MS_CURRENT_EVENTS = Number(
   process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS_CURRENT_EVENTS || 60_000,
 );
+const LIVE_DATA_TIMEOUT_MS_PREDICTION_MARKET = Number(
+  process.env.RESEARCH_LIVE_DATA_TIMEOUT_MS_PREDICTION_MARKET || 180_000,
+);
 const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15_000);
 const AGENT_JSON_LIMIT = process.env.AGENT_JSON_LIMIT?.trim() || '20mb';
 
@@ -895,7 +898,24 @@ function liveSourceDisplayPriority(value: string): number {
   return 0;
 }
 
-function summarizeLiveDataSourceNames(liveData: Record<string, unknown> | null): string[] {
+function suppressStructuredLiveSourceForTask(
+  task: string,
+  sourceName: 'coingecko' | 'defillama',
+): boolean {
+  if (!/\bprediction market\b/i.test(task)) return false;
+  const explicitMetricRequest =
+    /\b(defillama|tvl|total value locked|stablecoins?|liquidity|defi|on[-\s]?chain)\b/i.test(
+      task,
+    );
+  if (explicitMetricRequest) return false;
+  const launchOrMainnet = /\b(mainnet|testnet|launch date|launch before|pre[-\s]?mainnet)\b/i.test(task);
+  const priceTarget = /\b(reach|hit|market cap|valuation|price target|\$\d)\b/i.test(task);
+  if (sourceName === 'defillama' && (launchOrMainnet || priceTarget)) return true;
+  if (sourceName === 'coingecko' && launchOrMainnet) return true;
+  return false;
+}
+
+function summarizeLiveDataSourceNames(liveData: Record<string, unknown> | null, task = ''): string[] {
   if (!liveData) return [];
   const names = new Set<string>();
   const canonicalNames = new Set<string>();
@@ -919,10 +939,16 @@ function summarizeLiveDataSourceNames(liveData: Record<string, unknown> | null):
     add(article.domain);
   };
 
-  if (arrayValue(recordValue(liveData.coingecko)?.assets).length > 0) {
+  if (
+    arrayValue(recordValue(liveData.coingecko)?.assets).length > 0 &&
+    !suppressStructuredLiveSourceForTask(task, 'coingecko')
+  ) {
     names.add('CoinGecko');
   }
-  if (arrayValue(recordValue(liveData.defillama)?.chains).length > 0) {
+  if (
+    arrayValue(recordValue(liveData.defillama)?.chains).length > 0 &&
+    !suppressStructuredLiveSourceForTask(task, 'defillama')
+  ) {
     names.add('DefiLlama');
   }
   if (arrayValue(recordValue(liveData.wikipedia)?.pages).length > 0) {
@@ -974,7 +1000,27 @@ function getCurrentEventSnapshotCount(payload: Record<string, unknown> | null): 
 
 type LiveDataTimeoutClass = 'forecasting' | 'niche_protocol' | 'creator_audience' | 'current_events' | 'default';
 
+function hasPredictionMarketResearchScaffolding(task: string): boolean {
+  return (
+    /\bresearch the prediction market topic:/i.test(task) ||
+    /\bListed outcomes in AgentFlow:/i.test(task) ||
+    /\bPrediction market category in AgentFlow:/i.test(task) ||
+    /\bPrediction market provider in AgentFlow:/i.test(task) ||
+    /\bAgentFlow market address reference:/i.test(task)
+  );
+}
+
 function classifyLiveDataTimeout(task: string): { timeoutMs: number; queryClass: LiveDataTimeoutClass } {
+  if (
+    looksLikePredictionMarketResearch(task) ||
+    /\bprediction market\b/i.test(task) ||
+    hasPredictionMarketResearchScaffolding(task)
+  ) {
+    return {
+      timeoutMs: LIVE_DATA_TIMEOUT_MS_PREDICTION_MARKET,
+      queryClass: 'forecasting',
+    };
+  }
   if (detectForecastingIntent(task).forecasting) {
     return {
       timeoutMs: LIVE_DATA_TIMEOUT_MS_FORECASTING,
@@ -1016,9 +1062,22 @@ function requiresLiveEvidence(task: string): boolean {
   );
 }
 
+function cleanSparseEvidenceTopic(task: string): string {
+  return task
+    .replace(/\r?\n+/g, ' ')
+    .replace(/^research\s+(?:the\s+)?(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
+    .replace(/\bListed outcomes in AgentFlow:[\s\S]*?(?=\bPrediction market category in AgentFlow:|\bPrediction market provider in AgentFlow:|\bAgentFlow market address reference:|\bUse the market category to disambiguate the subject before searching\b|\bFocus on the real-world event\b|$)/i, ' ')
+    .replace(/\bPrediction market category in AgentFlow:[^\n.]*/i, ' ')
+    .replace(/\bPrediction market provider in AgentFlow:[^\n.]*/i, ' ')
+    .replace(/\bAgentFlow market address reference:[^\n.]*/i, ' ')
+    .replace(/\bUse the market category to disambiguate the subject before searching[\s\S]*$/i, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function buildSparseEvidenceResearch(task: string, asOf: string): string {
   return JSON.stringify({
-    topic: task,
+    topic: /\bprediction market\b/i.test(task) ? cleanSparseEvidenceTopic(task) : task,
     scope: {
       timeframe: `as of ${asOf.slice(0, 10)}`,
       entities: [],
@@ -5509,18 +5568,33 @@ function buildPredmarketResearchPrompt(
   title: string,
   marketAddress: `0x${string}`,
   outcomes: PredictionOutcomeChoice[] = [],
+  metadata?: {
+    category?: string | null;
+    provider?: string | null;
+  },
 ): string {
   const safeTitle = title.trim() || 'this prediction market';
   const outcomeLabels = outcomes
     .map((outcome) => outcome.label.trim())
     .filter(Boolean);
+  const category =
+    typeof metadata?.category === 'string' && metadata.category.trim()
+      ? metadata.category.trim()
+      : null;
+  const provider =
+    typeof metadata?.provider === 'string' && metadata.provider.trim()
+      ? metadata.provider.trim()
+      : null;
 
   return [
     `research the prediction market topic: ${safeTitle}`,
     outcomeLabels.length
       ? `Listed outcomes in AgentFlow: ${outcomeLabels.join(' / ')}.`
       : null,
+    category ? `Prediction market category in AgentFlow: ${category}.` : null,
+    provider ? `Prediction market provider in AgentFlow: ${provider}.` : null,
     marketAddress ? `AgentFlow market address reference: ${marketAddress}.` : null,
+    'Use the market category to disambiguate the subject before searching. For example: crypto markets should be researched as crypto/blockchain topics, sports markets as teams/tournaments, and macro/commodity markets by their real-world underlying drivers.',
     'Focus on the real-world event, relevant stats/news, timing, outcome probabilities, and what evidence would help someone compare the listed outcomes.',
   ]
     .filter(Boolean)
@@ -5531,6 +5605,10 @@ function buildPredmarketTradeActionGroup(
   title: string,
   marketAddress: `0x${string}`,
   outcomes: PredictionOutcomeChoice[] = [],
+  metadata?: {
+    category?: string | null;
+    provider?: string | null;
+  },
 ): {
   title?: string;
   actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
@@ -5545,7 +5623,10 @@ function buildPredmarketTradeActionGroup(
       ...(outcomeActions.length
         ? outcomeActions
         : [{ label: 'Trade', prompt: `tell me about ${marketAddress}` }]),
-      { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress, outcomes) },
+      {
+        label: 'Research',
+        prompt: buildPredmarketResearchPrompt(title, marketAddress, outcomes, metadata),
+      },
       { label: 'Details', prompt: `tell me about ${marketAddress}`, tone: 'secondary' },
     ],
   };
@@ -5577,12 +5658,16 @@ function extractPredmarketResearchContext(
     .replace(/^research\s+(?:this\s+)?(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
     .replace(/^research\s+the\s+(?:prediction\s+)?market(?:\s+topic)?[:\s-]*/i, '')
     .replace(/\bListed outcomes in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bPrediction market category in AgentFlow:[^\n]*/gi, '')
+    .replace(/\bPrediction market provider in AgentFlow:[^\n]*/gi, '')
     .replace(/\bMarket address for AgentFlow trade routing only:[^\n]*/gi, '')
     .replace(/\bAgentFlow market address reference:[^\n]*/gi, '')
     .replace(/\bDo not research the contract address itself[^\n]*/gi, '')
+    .replace(/\bUse the market category to disambiguate the subject before searching[^\n]*/gi, '')
     .replace(/\bFocus on the real-world event[^\n]*/gi, '')
     .replace(/\(\s*0x[a-fA-F0-9]{40}\s*\)/g, '')
     .replace(/\b0x[a-fA-F0-9]{40}\b/g, '')
+    .replace(/\n{2,}/g, '\n')
     .trim();
 
   if (!marketAddress && !withoutPrefix) {
@@ -5604,15 +5689,17 @@ function buildPredmarketListQuickActionGroups(
   const groups = buildPredmarketCategoryActionGroups();
   const marketMatches = Array.from(
     result.matchAll(
-      /###\s+[^\n]*?\s(.+?)\n[\s\S]*?- \*\*Outcomes:\*\* ([^\n]+)\n[\s\S]*?- \*\*Address:\*\* `?(0x[a-fA-F0-9]{40})`?/g,
+      /###\s+[^\n]*?\s(.+?)\n[\s\S]*?- \*\*Outcomes:\*\* ([^\n]+)\n[\s\S]*?- \*\*Category:\*\* ([^\n]+)\n- \*\*Provider:\*\* ([^\n]+)\n[\s\S]*?- \*\*Address:\*\* `?(0x[a-fA-F0-9]{40})`?/g,
     ),
   );
 
   for (const match of marketMatches) {
     const title = match[1]?.trim() || 'Market';
     const outcomes = parseOutcomeOptionsFromSummaryLine(match[2] || '');
-    const address = match[3] as `0x${string}`;
-    groups.push(buildPredmarketTradeActionGroup(title, address, outcomes));
+    const category = match[3]?.trim() || null;
+    const provider = match[4]?.trim() || null;
+    const address = match[5] as `0x${string}`;
+    groups.push(buildPredmarketTradeActionGroup(title, address, outcomes, { category, provider }));
   }
 
   if (/show more markets/i.test(result) || /There are \d+ more markets/i.test(result)) {
@@ -6522,6 +6609,7 @@ async function executeBrainResearchPipelineForChat(opts: BrainResearchPipelineCh
         research: reportPayload?.research ?? null,
         analysis: reportPayload?.analysis ?? null,
         liveData: reportPayload?.liveData ?? null,
+        sources: reportPayload?.sources ?? null,
       })}\n\n`,
     );
     // Note: do NOT also emit the report as a `delta`. The frontend appends both the
@@ -14747,7 +14835,7 @@ function createPublicApp(): express.Express {
       pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_research_debug_write_kicked_off');
       pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'before_live_data_source_summary');
       const parsedLiveData = researchResult.data.liveData ?? null;
-      const actualSources = summarizeLiveDataSourceNames(parsedLiveData);
+      const actualSources = summarizeLiveDataSourceNames(parsedLiveData, task);
       pushPipelineTimingTrace(pipelineTimingTrace, timingTraceStart, 'after_live_data_source_summary', {
         actualSourcesCount: actualSources.length,
       });
@@ -15007,6 +15095,7 @@ function createPublicApp(): express.Express {
         research: parsedResearch,
         analysis: parsedAnalysis,
         liveData: parsedLiveData,
+        sources: finalizedReport.sources,
       });
 
       await sendGAEvent('pipeline_complete', {
@@ -15095,6 +15184,9 @@ async function start(): Promise<void> {
     });
     let liveData = '';
     const liveDataTimeout = classifyLiveDataTimeout(task);
+    console.log(
+      `[Research] liveData timeout class=${liveDataTimeout.queryClass} timeoutMs=${liveDataTimeout.timeoutMs}`,
+    );
     try {
       liveData = await withTimeout(
         fetchLiveData(task),
@@ -15138,7 +15230,7 @@ async function start(): Promise<void> {
       ? ' Verify the user\'s premise before accepting it. If the evidence supports only tensions, reported planning, isolated strikes, or older background context, say that plainly instead of repeating the user\'s framing. If LIVE DATA current_events framing_signals are present, follow them exactly for broader conflict status, Strait of Hormuz route status, and Red Sea route status.'
       : '';
     const userMessage = liveData
-      ? `AS OF ${asOf}\nCURRENT DATE: ${asOf.slice(0, 10)}\n\nLIVE DATA JSON:\n${liveData}${contextBlock}${walletContextBlock}\n\nUSER TASK:\n${task}\n\nUse the LIVE DATA JSON above for current figures and dated evidence. Do not cite or mention any date after CURRENT DATE as if it has happened. When present, cite concrete titles and URLs from current_events.articles, current_events.article_snapshots, dynamic_sources.articles, wikipedia.pages, coingecko, defillama, and bitcoin_onchain; do not invent outlets. Retrieval layers are not evidence and must not be cited as sources.${geopoliticalEvidenceInstruction} When creator_audience_metrics is present, treat current_subscribers/current_subscribers_display and observed_at as direct evidence for the latest available audience count and mention that figure explicitly in the answer. When bitcoin_onchain is present, treat it as primary evidence for Bitcoin network transaction counts, block counts, fees, and on-chain activity windows; do not substitute market trading volume for on-chain transaction volume. When PORTFOLIO_CONTEXT is present, classify the user's exposure and explain impact through that exposure profile without revealing raw balances, full addresses, or PnL unless explicitly requested. Prefer official APIs, reputable publishers, Mempool.space for Bitcoin block/on-chain metrics, CoinGecko for token market data, DefiLlama for chain TVL and stablecoin liquidity, current-event article snapshots for recent developments, and Wikipedia for factual background.`
+      ? `AS OF ${asOf}\nCURRENT DATE: ${asOf.slice(0, 10)}\n\nLIVE DATA JSON:\n${liveData}${contextBlock}${walletContextBlock}\n\nUSER TASK:\n${task}\n\nUse the LIVE DATA JSON above for current figures and dated evidence. Do not cite or mention any date after CURRENT DATE as if it has happened. When present, cite concrete titles and URLs from current_events.articles, current_events.article_snapshots, dynamic_sources.articles, wikipedia.pages, coingecko, defillama, and bitcoin_onchain; do not invent outlets. Retrieval layers are not evidence and must not be cited as sources.${geopoliticalEvidenceInstruction} For prediction-market reports, do not infer event dates, launch dates, odds, or prices unless the value appears in LIVE DATA. For mainnet/testnet launch markets, do not treat DefiLlama TVL alone as evidence of mainnet readiness, ecosystem traction, or launch timing. When creator_audience_metrics is present, treat current_subscribers/current_subscribers_display and observed_at as direct evidence for the latest available audience count and mention that figure explicitly in the answer. When bitcoin_onchain is present, treat it as primary evidence for Bitcoin network transaction counts, block counts, fees, and on-chain activity windows; do not substitute market trading volume for on-chain transaction volume. When PORTFOLIO_CONTEXT is present, classify the user's exposure and explain impact through that exposure profile without revealing raw balances, full addresses, or PnL unless explicitly requested. Prefer official APIs, reputable publishers, Mempool.space for Bitcoin block/on-chain metrics, CoinGecko for token market data, DefiLlama for chain TVL and stablecoin liquidity only when directly relevant, current-event article snapshots for recent developments, and Wikipedia for factual background.`
       : `${task}${contextBlock}${walletContextBlock}`;
     return {
       task,
