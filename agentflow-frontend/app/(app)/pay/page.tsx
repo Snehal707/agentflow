@@ -384,10 +384,12 @@ export default function AgentPayPage() {
     if (!address || !isAuthenticated) {
       setPayContext(null);
       setBalanceInfo(null);
+      setHistory([]);
       return;
     }
     void loadContext();
     void loadBalance();
+    void loadHistory();
     // Loaders are intentionally omitted: they're rebuilt when the auth session
     // object changes identity, and including them re-fires this effect in a loop
     // (fetch → setState → re-render → new loader → fetch …). Re-running on auth

@@ -29,7 +29,7 @@ export type StoreAgentStats = {
   };
 };
 
-export type BusinessRecord = {
+export type AgentPayRecord = {
   wallet_address: string;
   business_name: string;
   invoice_email: string | null;
@@ -42,7 +42,7 @@ export type BusinessRecord = {
   require_dual_approval: boolean | null;
 };
 
-export type BusinessInvoice = {
+export type AgentPayInvoice = {
   id: string;
   business_wallet: string;
   vendor_name: string | null;
@@ -58,7 +58,7 @@ export type BusinessInvoice = {
   settled_at: string | null;
 };
 
-export type BusinessPublicPayment = {
+export type AgentPayPublicPayment = {
   id: string;
   payer_wallet: string | null;
   amount: number;
@@ -69,7 +69,7 @@ export type BusinessPublicPayment = {
 };
 
 /** Row from `transactions` (invoice_pay, swaps, etc.) */
-export type BusinessLedgerTransaction = {
+export type AgentPayLedgerTransaction = {
   id: string;
   from_wallet: string;
   to_wallet: string;
@@ -82,10 +82,10 @@ export type BusinessLedgerTransaction = {
   created_at: string;
 };
 
-export type BusinessDashboardResponse = {
-  business: BusinessRecord | null;
-  invoices: BusinessInvoice[];
-  public_payments: BusinessPublicPayment[];
+export type AgentPayDashboardResponse = {
+  business: AgentPayRecord | null;
+  invoices: AgentPayInvoice[];
+  public_payments: AgentPayPublicPayment[];
   message?: string;
   inbox_email?: string;
   arc_handle?: string;
@@ -94,9 +94,9 @@ export type BusinessDashboardResponse = {
   linked_telegram_display_name?: string | null;
 };
 
-export type BusinessRulesPatch = Partial<
+export type AgentPayRulesPatch = Partial<
   Pick<
-    BusinessRecord,
+    AgentPayRecord,
     | "auto_settle_below"
     | "require_approval_above"
     | "daily_settlement_cap"
@@ -106,7 +106,7 @@ export type BusinessRulesPatch = Partial<
   >
 >;
 
-export type BusinessOnboardInput = {
+export type AgentPayOnboardInput = {
   business_name: string;
   arc_handle: string;
   telegram_id?: string | null;
@@ -164,40 +164,40 @@ export async function fetchStoreAgentStats(slug: string): Promise<StoreAgentStat
   return readJson<StoreAgentStats>(response, "Agent stats fetch failed");
 }
 
-export async function fetchBusinessDashboard(
+export async function fetchAgentPayDashboard(
   authHeaders: Record<string, string>,
-): Promise<BusinessDashboardResponse> {
-  const response = await fetch("/api/business/me", {
+): Promise<AgentPayDashboardResponse> {
+  const response = await fetch("/api/agentpay/me", {
     headers: authHeaders,
     cache: "no-store",
   });
-  return readJson<BusinessDashboardResponse>(response, "Business dashboard failed");
+  return readJson<AgentPayDashboardResponse>(response, "AgentPay dashboard failed");
 }
 
-export async function fetchBusinessTransactions(
+export async function fetchAgentPayTransactions(
   authHeaders: Record<string, string>,
   options?: { limit?: number },
-): Promise<BusinessLedgerTransaction[]> {
+): Promise<AgentPayLedgerTransaction[]> {
   const limit = options?.limit ?? 50;
   const response = await fetch(
-    `/api/business/transactions?limit=${encodeURIComponent(String(limit))}`,
+    `/api/agentpay/transactions?limit=${encodeURIComponent(String(limit))}`,
     {
       headers: authHeaders,
       cache: "no-store",
     },
   );
-  const json = await readJson<{ transactions: BusinessLedgerTransaction[] }>(
+  const json = await readJson<{ transactions: AgentPayLedgerTransaction[] }>(
     response,
-    "Business transactions failed",
+    "AgentPay transactions failed",
   );
   return Array.isArray(json.transactions) ? json.transactions : [];
 }
 
-export async function updateBusinessRules(
+export async function updateAgentPayRules(
   authHeaders: Record<string, string>,
-  patch: BusinessRulesPatch,
-): Promise<BusinessRecord> {
-  const response = await fetch("/api/business/rules", {
+  patch: AgentPayRulesPatch,
+): Promise<AgentPayRecord> {
+  const response = await fetch("/api/agentpay/rules", {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
@@ -205,18 +205,18 @@ export async function updateBusinessRules(
     },
     body: JSON.stringify(patch),
   });
-  const json = await readJson<{ business: BusinessRecord }>(
+  const json = await readJson<{ business: AgentPayRecord }>(
     response,
-    "Business rules update failed",
+    "AgentPay rules update failed",
   );
   return json.business;
 }
 
-export async function onboardBusiness(
+export async function onboardAgentPay(
   authHeaders: Record<string, string>,
-  payload: BusinessOnboardInput,
-): Promise<BusinessDashboardResponse> {
-  const response = await fetch("/api/business/onboard", {
+  payload: AgentPayOnboardInput,
+): Promise<AgentPayDashboardResponse> {
+  const response = await fetch("/api/agentpay/onboard", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -224,32 +224,32 @@ export async function onboardBusiness(
     },
     body: JSON.stringify(payload),
   });
-  return readJson<BusinessDashboardResponse>(response, "Business onboarding failed");
+  return readJson<AgentPayDashboardResponse>(response, "AgentPay onboarding failed");
 }
 
-export async function approveBusinessInvoice(
+export async function approveAgentPayInvoice(
   authHeaders: Record<string, string>,
   invoiceId: string,
-): Promise<{ success: boolean; invoice: BusinessInvoice; txHash?: string }> {
-  const response = await fetch(`/api/business/invoices/${invoiceId}/approve`, {
+): Promise<{ success: boolean; invoice: AgentPayInvoice; txHash?: string }> {
+  const response = await fetch(`/api/agentpay/invoices/${invoiceId}/approve`, {
     method: "POST",
     headers: authHeaders,
   });
-  return readJson<{ success: boolean; invoice: BusinessInvoice; txHash?: string }>(
+  return readJson<{ success: boolean; invoice: AgentPayInvoice; txHash?: string }>(
     response,
     "Invoice approval failed",
   );
 }
 
-export async function rejectBusinessInvoice(
+export async function rejectAgentPayInvoice(
   authHeaders: Record<string, string>,
   invoiceId: string,
-): Promise<{ success: boolean; invoice: BusinessInvoice }> {
-  const response = await fetch(`/api/business/invoices/${invoiceId}/reject`, {
+): Promise<{ success: boolean; invoice: AgentPayInvoice }> {
+  const response = await fetch(`/api/agentpay/invoices/${invoiceId}/reject`, {
     method: "POST",
     headers: authHeaders,
   });
-  return readJson<{ success: boolean; invoice: BusinessInvoice }>(
+  return readJson<{ success: boolean; invoice: AgentPayInvoice }>(
     response,
     "Invoice rejection failed",
   );

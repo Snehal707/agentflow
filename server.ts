@@ -9704,6 +9704,7 @@ function createPublicApp(): express.Express {
   app.use('/api/telegram', telegramApiRouter);
   app.use('/api/settings', settingsApiRouter);
   app.use('/api/extension', extensionApiRouter);
+  app.use('/api/agentpay', businessApiRouter);
   app.use('/api/business', businessApiRouter);
   app.use('/api/pay', payApiRouter);
   // Agent Store API
