@@ -4,8 +4,10 @@ import { adminDb } from '../db/client';
 import type { JWTPayload } from './auth';
 import telegramLinkCode from './telegram-link-code';
 import {
+  loadCachedTelegramChatProfile,
   resolveTelegramBotUsername,
   resolveTelegramChatProfile,
+  saveCachedTelegramChatProfile,
 } from './telegram-profile';
 
 const LINK_TTL_SECONDS = 600;
@@ -55,10 +57,11 @@ export async function telegramUnlinkHandler(req: Request, res: Response) {
 export async function telegramStatusHandler(req: Request, res: Response) {
   try {
     const auth = (req as any).auth as JWTPayload;
+    const walletAddress = getAddress(auth.walletAddress);
     const { data, error } = await adminDb
       .from('users')
       .select('telegram_id')
-      .eq('wallet_address', auth.walletAddress)
+      .eq('wallet_address', walletAddress)
       .maybeSingle();
     if (error) {
       return res.status(500).json({ error: error.message });
@@ -66,7 +69,11 @@ export async function telegramStatusHandler(req: Request, res: Response) {
     const tid = data?.telegram_id as string | null | undefined;
     const linked = Boolean(tid && String(tid).trim());
     const botUsername = resolveTelegramBotUsername();
-    const telegramProfile = linked ? await resolveTelegramChatProfile(String(tid).trim()) : null;
+    const liveProfile = linked ? await resolveTelegramChatProfile(String(tid).trim()) : null;
+    if (liveProfile) {
+      void saveCachedTelegramChatProfile(walletAddress, liveProfile);
+    }
+    const telegramProfile = liveProfile ?? (await loadCachedTelegramChatProfile(walletAddress));
     return res.json({
       linked,
       telegramId: linked ? String(tid).trim() : undefined,

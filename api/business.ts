@@ -10,7 +10,11 @@ import {
 import { authMiddleware, type JWTPayload } from '../lib/auth';
 import { adminDb } from '../db/client';
 import { normalizeHandle } from '../lib/handles';
-import { resolveTelegramChatProfile } from '../lib/telegram-profile';
+import {
+  loadCachedTelegramChatProfile,
+  resolveTelegramChatProfile,
+  saveCachedTelegramChatProfile,
+} from '../lib/telegram-profile';
 import { executeInvoicePayment } from '../agents/invoice/subagents/executor';
 import { resolveInvoicePayeeWallet } from '../agents/invoice/subagents/resolve-payee';
 import {
@@ -225,7 +229,11 @@ async function loadUserTelegramLink(walletAddress: string): Promise<{
   }
 
   const telegramId = String(data?.telegram_id ?? '').trim() || null;
-  const profile = telegramId ? await resolveTelegramChatProfile(telegramId) : null;
+  const liveProfile = telegramId ? await resolveTelegramChatProfile(telegramId) : null;
+  if (liveProfile) {
+    void saveCachedTelegramChatProfile(walletAddress, liveProfile);
+  }
+  const profile = liveProfile ?? (await loadCachedTelegramChatProfile(walletAddress));
 
   return {
     telegramId,

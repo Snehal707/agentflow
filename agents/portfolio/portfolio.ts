@@ -11,7 +11,12 @@ import {
 import { arcTestnet } from 'viem/chains';
 import { fetchGatewayBalancesForDepositors } from '../../lib/gateway-balance';
 import { formatPortfolioSnapshotRecordsForChat } from '../../lib/format-portfolio-chat';
-import { getUserPositionsAcrossProviders } from '../../lib/predmarket/router';
+import {
+  getUserPositionsAcrossProviders,
+  previewRedeem,
+  previewRefund,
+  previewSell,
+} from '../../lib/predmarket/router';
 import type { UserMarketPosition } from '../../lib/predmarket/types';
 import { getProviderPosition, listAllVaults } from '../../lib/vault/router';
 
@@ -708,28 +713,37 @@ async function buildPredictionMarketPortfolioPositions(
 ): Promise<PortfolioPosition[]> {
   try {
     const positions = await getUserPositionsAcrossProviders(getAddress(walletAddress) as `0x${string}`);
-    return positions
+    return Promise.all(
+      positions
       .filter((position) => {
         const actionable = position.canRedeem || position.canRefund;
         const active = position.stage === 'active';
         return (active || actionable) && (hasPredictionMarketShares(position) || hasPredictionMarketNetDeposit(position) || actionable);
       })
-      .map((position) => {
+      .map(async (position) => {
         const netDeposit = Number(position.netDepositedFormatted || 0);
         const status = position.canRedeem
           ? 'Redeemable now'
           : position.canRefund
             ? 'Refundable now'
             : `Stage: ${position.stage}`;
+        const usdValue = await estimatePredictionMarketUsdValue(
+          getAddress(walletAddress) as `0x${string}`,
+          position,
+        );
+        const costBasisUsd = Number.isFinite(netDeposit) ? roundUsd(netDeposit) : null;
         return {
           id: `predmarket:${position.provider}:${position.market.address}`,
           kind: 'prediction_market',
           name: position.market.title || 'Prediction market position',
           protocol: position.provider || 'predmarket',
           amountFormatted: formatPredictionMarketOutcomeSummary(position),
-          usdValue: null,
-          costBasisUsd: Number.isFinite(netDeposit) ? roundUsd(netDeposit) : null,
-          pnlUsd: null,
+          usdValue,
+          costBasisUsd,
+          pnlUsd:
+            usdValue !== null && costBasisUsd !== null
+              ? roundUsd(usdValue - costBasisUsd)
+              : null,
           notes: [
             status,
             `Address: ${position.market.address}`,
@@ -740,10 +754,74 @@ async function buildPredictionMarketPortfolioPositions(
           canRedeem: position.canRedeem,
           canRefund: position.canRefund,
         } satisfies PortfolioPosition;
-      });
+      }),
+    );
   } catch (error) {
     console.warn('[portfolio] prediction market positions unavailable:', toMessage(error));
     return [];
+  }
+}
+
+async function estimatePredictionMarketUsdValue(
+  walletAddress: `0x${string}`,
+  position: UserMarketPosition,
+): Promise<number | null> {
+  try {
+    if (position.canRedeem) {
+      const preview = await previewRedeem(
+        position.provider,
+        position.market.address,
+        walletAddress,
+      );
+      const payout = Number(preview.expectedPayoutRaw) / 1e18;
+      return Number.isFinite(payout) ? roundUsd(payout) : null;
+    }
+
+    if (position.canRefund) {
+      const preview = await previewRefund(
+        position.provider,
+        position.market.address,
+        walletAddress,
+      );
+      const refund = Number(preview.expectedRefundRaw) / 1e18;
+      return Number.isFinite(refund) ? roundUsd(refund) : null;
+    }
+
+    if (position.stage !== 'active') {
+      return null;
+    }
+
+    let totalProceedsUsd = 0;
+    let hasPreview = false;
+
+    for (let index = 0; index < position.outcomes.length; index++) {
+      const outcome = position.outcomes[index];
+      const sharesRaw = outcome ? BigInt(outcome.sharesRaw) : 0n;
+      if (sharesRaw <= 0n) {
+        continue;
+      }
+      const preview = await previewSell(
+        position.provider,
+        position.market.address,
+        index,
+        sharesRaw,
+        0,
+      );
+      const proceeds = Number(preview.proceedsRaw) / 1e18;
+      if (Number.isFinite(proceeds)) {
+        totalProceedsUsd += proceeds;
+        hasPreview = true;
+      }
+    }
+
+    return hasPreview ? roundUsd(totalProceedsUsd) : null;
+  } catch (error) {
+    console.warn(
+      '[portfolio] prediction market valuation unavailable:',
+      position.market.address,
+      toMessage(error),
+    );
+    return null;
   }
 }
 

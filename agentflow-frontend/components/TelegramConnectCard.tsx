@@ -21,6 +21,49 @@ type TelegramStatus = {
   botUsername?: string;
 };
 
+type CachedTelegramIdentity = Pick<
+  TelegramStatus,
+  "telegramId" | "telegramUsername" | "telegramDisplayName"
+>;
+
+function telegramIdentityStorageKey(address: string): string {
+  return `agentflow:telegram-identity:${address.toLowerCase()}`;
+}
+
+function loadCachedTelegramIdentity(address: string | undefined): CachedTelegramIdentity | null {
+  if (!address || typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(telegramIdentityStorageKey(address));
+    return raw ? (JSON.parse(raw) as CachedTelegramIdentity) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedTelegramIdentity(address: string | undefined, status: TelegramStatus): void {
+  if (
+    !address ||
+    typeof window === "undefined" ||
+    (!status.telegramUsername && !status.telegramDisplayName)
+  ) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(
+      telegramIdentityStorageKey(address),
+      JSON.stringify({
+        telegramId: status.telegramId,
+        telegramUsername: status.telegramUsername,
+        telegramDisplayName: status.telegramDisplayName,
+      } satisfies CachedTelegramIdentity),
+    );
+  } catch {
+    // The live status still works when storage is unavailable.
+  }
+}
+
 async function fetchTelegramJson<T>(
   paths: readonly string[],
   init?: RequestInit,
@@ -75,13 +118,27 @@ export function TelegramConnectCard() {
       headers,
       cache: "no-store",
     });
-    setStatus(json);
+    const cachedIdentity = loadCachedTelegramIdentity(address);
+    const sameLinkedChat =
+      !cachedIdentity?.telegramId ||
+      !json.telegramId ||
+      cachedIdentity.telegramId === json.telegramId;
+    const nextStatus: TelegramStatus =
+      json.linked && sameLinkedChat
+        ? {
+            ...json,
+            telegramUsername: json.telegramUsername || cachedIdentity?.telegramUsername,
+            telegramDisplayName: json.telegramDisplayName || cachedIdentity?.telegramDisplayName,
+          }
+        : json;
+    setStatus(nextStatus);
+    saveCachedTelegramIdentity(address, nextStatus);
     setError(null);
     if (json.botUsername) {
       setBotUsername(json.botUsername.replace(/^@/, ""));
     }
-    return json;
-  }, [getAuthHeaders]);
+    return nextStatus;
+  }, [address, getAuthHeaders]);
 
   useEffect(() => {
     const pub = process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME?.replace(/^@/, "").trim();

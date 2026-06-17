@@ -42,9 +42,27 @@ async function refreshSavedSession(existing: AgentAuthSession): Promise<AgentAut
 export function useAgentJwt() {
   const { address, isConnected } = useAccount();
   const { signMessageAsync } = useSignMessage();
-  const [session, setSession] = useState<AgentAuthSession | null>(null);
+  const [session, setSession] = useState<AgentAuthSession | null>(() => loadAuthSession());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const applyStoredSession = useCallback(() => {
+    if (!isConnected || !address) {
+      setSession(null);
+      setError(null);
+      return;
+    }
+
+    const existing = loadAuthSession();
+    if (!existing || existing.walletAddress.toLowerCase() !== address.toLowerCase()) {
+      setSession(null);
+      setError(null);
+      return;
+    }
+
+    setSession(existing);
+    setError(null);
+  }, [address, isConnected]);
 
   const syncSessionForWallet = useCallback(() => {
     if (!isConnected || !address) {
@@ -93,13 +111,13 @@ export function useAgentJwt() {
   useEffect(() => {
     const eventName = authSessionEventName();
     const handleSessionChange = () => {
-      void syncSessionForWallet();
+      applyStoredSession();
     };
     window.addEventListener(eventName, handleSessionChange);
     return () => {
       window.removeEventListener(eventName, handleSessionChange);
     };
-  }, [syncSessionForWallet]);
+  }, [applyStoredSession]);
 
   const signIn = useCallback(async () => {
     if (!address) {

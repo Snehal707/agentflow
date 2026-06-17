@@ -43,6 +43,11 @@ import {
 import { APP_BASE_URL, APP_URLS, appUrl } from './app-urls';
 import { redisPendingExists } from './chatSessionRedis';
 import telegramLinkCode from './telegram-link-code';
+import {
+  buildTelegramChatProfile,
+  saveCachedTelegramChatProfile,
+  type TelegramChatProfile,
+} from './telegram-profile';
 import { clearPendingAction, executeTool, loadPendingAction } from './tool-executor';
 import { extractAgentpayRemark } from './agentpay-remark';
 import { generateInvoiceNumber } from './invoice-number';
@@ -68,6 +73,27 @@ const PUBLIC_API_BASE_URL = (
 const TELEGRAM_POLL_LOCK_KEY = 'telegram:poll:lock';
 const TELEGRAM_POLL_LOCK_TTL_SEC = 90;
 const TELEGRAM_POLL_LOCK_HEARTBEAT_SEC = 30;
+
+function extractTelegramProfileFromMessage(msg: {
+  chat?: {
+    username?: string | null;
+    first_name?: string | null;
+    last_name?: string | null;
+    title?: string | null;
+  };
+  from?: {
+    username?: string | null;
+    first_name?: string | null;
+    last_name?: string | null;
+  };
+}): TelegramChatProfile | null {
+  return buildTelegramChatProfile({
+    username: msg.chat?.username ?? msg.from?.username,
+    first_name: msg.chat?.first_name ?? msg.from?.first_name,
+    last_name: msg.chat?.last_name ?? msg.from?.last_name,
+    title: msg.chat?.title,
+  });
+}
 const TELEGRAM_MEDIA_TARGET_TTL_SEC = 60 * 30;
 const TELEGRAM_MAX_CSV_BYTES = 1 * 1024 * 1024;
 
@@ -783,6 +809,7 @@ async function applyTelegramLinkCode(
   bot: ReturnType<typeof createTelegramBotForPolling>,
   chatId: number,
   rawInput: string,
+  chatProfile?: TelegramChatProfile | null,
 ): Promise<void> {
   let raw = rawInput.trim();
   if (!raw) {
@@ -842,6 +869,7 @@ async function applyTelegramLinkCode(
         await send(bot, chatId, `Failed: ${error.message}`);
         return;
       }
+      await saveCachedTelegramChatProfile(existing.wallet_address, chatProfile);
       await adminDb
         .from('businesses')
         .update({ telegram_id: chatIdStr })
@@ -855,6 +883,7 @@ async function applyTelegramLinkCode(
         await send(bot, chatId, `Failed: ${error.message}`);
         return;
       }
+      await saveCachedTelegramChatProfile(normalized, chatProfile);
       await adminDb
         .from('businesses')
         .update({ telegram_id: chatIdStr })
@@ -2723,7 +2752,7 @@ export async function startTelegramBot(): Promise<void> {
       .catch(() => {});
 
     if (arg && telegramLinkCode.parseTelegramLinkCode(arg).ok) {
-      await applyTelegramLinkCode(bot, chatId, arg);
+      await applyTelegramLinkCode(bot, chatId, arg, extractTelegramProfileFromMessage(msg));
       return;
     }
 
@@ -2752,6 +2781,7 @@ export async function startTelegramBot(): Promise<void> {
           .from('businesses')
           .update({ telegram_id: chatIdStr })
           .eq('wallet_address', addr);
+        await saveCachedTelegramChatProfile(addr, extractTelegramProfileFromMessage(msg));
         await send(bot, chatId, `${TELEGRAM_LINK_SUCCESS_MESSAGE}\n${addr}`);
         return;
       } catch (e: any) {
@@ -2855,7 +2885,7 @@ export async function startTelegramBot(): Promise<void> {
       await sendLinkCodeForceReply(bot, chatId);
       return;
     }
-    await applyTelegramLinkCode(bot, chatId, raw);
+    await applyTelegramLinkCode(bot, chatId, raw, extractTelegramProfileFromMessage(msg));
   });
 
   bot.onText(/^\/unlink(?:@\w+)?$/i, async (msg) => {
@@ -2950,6 +2980,14 @@ export async function startTelegramBot(): Promise<void> {
 
   bot.on('message', async (msg) => {
     const plain = (msg.text ?? msg.caption ?? '').trim();
+    const extractedTelegramProfile = extractTelegramProfileFromMessage(msg);
+    if (extractedTelegramProfile) {
+      const linkedRow = await getLinkedWalletRow(String(msg.chat.id));
+      if (linkedRow?.wallet_address) {
+        void saveCachedTelegramChatProfile(linkedRow.wallet_address, extractedTelegramProfile);
+      }
+    }
+
     if (plain && isReplyToLinkPrompt(msg) && !plain.startsWith('/')) {
       const linked = await getLinkedWalletRow(String(msg.chat.id));
       if (linked) {
@@ -2969,7 +3007,7 @@ export async function startTelegramBot(): Promise<void> {
         );
         return;
       }
-      await applyTelegramLinkCode(bot, msg.chat.id, plain);
+      await applyTelegramLinkCode(bot, msg.chat.id, plain, extractTelegramProfileFromMessage(msg));
       return;
     }
 
