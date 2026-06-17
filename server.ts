@@ -136,6 +136,7 @@ import {
 import { sendGAEvent } from './lib/gaServer';
 import { detectWalletIntent } from './lib/orchestrator';
 import authApiRouter from './api/auth';
+import accessApiRouter from './api/access';
 import walletApiRouter from './api/wallet';
 import extensionApiRouter from './api/extension';
 import businessApiRouter from './api/business';
@@ -9698,6 +9699,7 @@ function createPublicApp(): express.Express {
   app.use(express.json({ limit: AGENT_JSON_LIMIT }));
   app.use(corsMiddleware);
   app.use('/api/auth', authApiRouter);
+  app.use('/api/access', accessApiRouter);
   app.use('/api/wallet', walletApiRouter);
   app.use('/api/telegram', telegramApiRouter);
   app.use('/api/settings', settingsApiRouter);
@@ -10733,6 +10735,24 @@ function createPublicApp(): express.Express {
       typeof req.body?.walletAddress === 'string' && isAddress(req.body.walletAddress)
         ? getAddress(req.body.walletAddress)
         : undefined;
+    if (!walletAddress) {
+      return res.status(401).send('connect wallet first');
+    }
+
+    const { count: accessCount, error: accessError } = await adminDb
+      .from('access_codes')
+      .select('id', { count: 'exact', head: true })
+      .eq('claimed_by', getAddress(walletAddress))
+      .eq('revoked', false);
+
+    if (accessError) {
+      return res.status(500).json({ error: accessError.message });
+    }
+
+    if (Number(accessCount ?? 0) === 0) {
+      return res.status(403).send('enter access code');
+    }
+
     const messages = Array.isArray(req.body?.messages)
       ? req.body.messages
           .filter(
