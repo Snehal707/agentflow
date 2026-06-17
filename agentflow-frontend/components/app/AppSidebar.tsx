@@ -154,11 +154,6 @@ export function AppSidebar({
       <div className={`border-t border-white/5 pt-4 ${collapsed ? "px-3" : "px-6"}`}>
         {footer ?? (
           <div className={collapsed ? "flex flex-col items-center gap-3 pb-2" : "pb-2"}>
-            {!collapsed ? (
-              <p className="mb-3 px-2 text-[9px] font-black uppercase tracking-[0.24em] text-white/24">
-                Community
-              </p>
-            ) : null}
             <div className={`flex ${collapsed ? "flex-col gap-3" : "items-center gap-3 px-2"}`}>
               {socialLinks.map((link) => (
                 <a
