@@ -3,7 +3,8 @@
 // and so the RAG accuracy guard can assert the docs against the real default.
 export const VISION_DAILY_LIMIT_DEFAULT = 5;
 export const TRANSCRIBE_DAILY_LIMIT_DEFAULT = 5;
+export const CHAT_DAILY_LIMIT_DEFAULT = 100;
 
 // Default pay-per-task rate limits (per wallet) when the env overrides are unset.
-export const PAY_PER_TASK_DAILY_LIMIT_DEFAULT = 200;
+export const PAY_PER_TASK_DAILY_LIMIT_DEFAULT = 50;
 export const PAY_PER_TASK_MINUTE_LIMIT_DEFAULT = 10;

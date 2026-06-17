@@ -150,7 +150,7 @@ import emailWebhookRouter from './api/webhooks/email';
 import { authMiddleware, generateJWT, verifyJWT, type JWTPayload } from './lib/auth';
 import { getOrCreateUserAgentWallet } from './lib/dcw';
 import { loadAgentOwnerWallet } from './lib/agent-owner-wallet';
-import { readDailyUsageCap } from './lib/usageCaps';
+import { incrementDailyUsageCap, readDailyUsageCap } from './lib/usageCaps';
 import { adminDb, getRedis } from './db/client';
 import { resolvePayee } from './lib/agentpay-payee';
 import { getPreferredAgentpayPaymentLinkHandle } from './lib/agentpay-registry';
@@ -176,7 +176,11 @@ import {
   isExplicitFullCapabilityRequest,
 } from './lib/agentflowProduct';
 import { answerProductQuestion, PRODUCT_KNOWLEDGE } from './lib/product-rag';
-import { VISION_DAILY_LIMIT_DEFAULT, TRANSCRIBE_DAILY_LIMIT_DEFAULT } from './lib/usageLimits';
+import {
+  CHAT_DAILY_LIMIT_DEFAULT,
+  TRANSCRIBE_DAILY_LIMIT_DEFAULT,
+  VISION_DAILY_LIMIT_DEFAULT,
+} from './lib/usageLimits';
 import { searchRag } from './lib/rag/search';
 import {
   canonicalRedisSessionId,
@@ -517,6 +521,16 @@ function internalOrAuthMiddleware(req: Request, res: Response, next: NextFunctio
     return;
   }
   authMiddleware(req, res, next);
+}
+
+function resolveOptionalAuth(req: Request): JWTPayload | null {
+  try {
+    const header = req.headers.authorization;
+    const token = header?.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : '';
+    return token ? verifyJWT(token) : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseInternalAdminWallets(): Set<string> {
@@ -4756,6 +4770,11 @@ function isPendingActionFollowup(message: string): boolean {
     /\bhow\s+do\s+i\s+continue\b/i.test(normalized) ||
     /\bwhat\s+did\s+you\s+just\s+quote\b/i.test(normalized)
   );
+}
+
+function isConfirmationReplyExemptFromChatCap(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  return /^(?:yes|no|confirm|cancel|y|n)$/i.test(normalized);
 }
 
 function formatPendingActionFollowup(
@@ -10696,6 +10715,7 @@ function createPublicApp(): express.Express {
 
   app.post('/api/chat/respond', async (req: Request, res: Response) => {
     const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    const requestAuth = resolveOptionalAuth(req);
     const quickActionIntent = parseQuickActionIntent(
       req.body?.quickActionContext?.actionId,
       message,
@@ -10758,6 +10778,33 @@ function createPublicApp(): express.Express {
     let brainEventId = '';
     const brainToolsTelemetry: BrainToolTelemetry[] = [];
     let brainTelemetryFinalized = false;
+
+    const chatDailyLimit = Number(process.env.CHAT_DAILY_LIMIT || CHAT_DAILY_LIMIT_DEFAULT);
+    const normalizedAuthWallet =
+      requestAuth?.walletAddress && isAddress(requestAuth.walletAddress)
+        ? getAddress(requestAuth.walletAddress)
+        : null;
+    const isConfirmationReply = isConfirmationReplyExemptFromChatCap(message);
+    const pendingActionForMessageCap =
+      normalizedAuthWallet && isConfirmationReply
+        ? await loadPendingAction(actionSessionId).catch(() => null)
+        : null;
+    const shouldSkipChatMessageCap = Boolean(pendingActionForMessageCap && isConfirmationReply);
+
+    if (normalizedAuthWallet && !shouldSkipChatMessageCap) {
+      const usageCap = await incrementDailyUsageCap({
+        scope: 'chat_messages',
+        walletAddress: normalizedAuthWallet,
+        limit: chatDailyLimit,
+      });
+      if (!usageCap.allowed) {
+        streamStaticSseReply(
+          res,
+          `You've reached your daily message limit of ${usageCap.limit}. Confirmation replies do not count, but new chat messages are capped until tomorrow.`,
+        );
+        return;
+      }
+    }
 
     maybeLogInputFilterDebug(message);
     const earlyRouterContinuationState = await loadRouterContinuationState(actionSessionId).catch(() => null);
