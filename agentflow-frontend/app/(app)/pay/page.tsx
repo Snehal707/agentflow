@@ -41,6 +41,7 @@ import { SessionStatusChip } from "@/components/app/SessionStatusChip";
 import { useSidebarPreference } from "@/lib/useSidebarPreference";
 
 type TabId = "send" | "receive" | "requests" | "history" | "scheduled" | "invoices" | "batch" | "split";
+type InvoiceView = "incoming" | "outgoing";
 
 const ChatPaymentPanel = dynamic(
   () => import("@/components/chat/ChatPaymentPanel").then((mod) => mod.ChatPaymentPanel),
@@ -98,6 +99,7 @@ export default function AgentPayPage() {
   } = useAgentJwt();
 
   const [tab, setTab] = useState<TabId>("send");
+  const [invoiceView, setInvoiceView] = useState<InvoiceView>("outgoing");
   const [payContext, setPayContext] = useState<PayContextResponse | null>(null);
   const [paymentRailOpen, setPaymentRailOpen] = useState(false);
   const [paymentEntries, setPaymentEntries] = useState<NonNullable<LiveChatMessage["paymentMeta"]>["entries"]>([]);
@@ -1986,11 +1988,35 @@ export default function AgentPayPage() {
                       </div>
                     ) : (
                       <>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setInvoiceView("incoming")}
+                            className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                              invoiceView === "incoming"
+                                ? "border-[#f2ca50] bg-[#f2ca50]/12 text-[#f2ca50]"
+                                : "border-white/12 bg-white/5 text-white/65 hover:border-white/20 hover:text-white"
+                            }`}
+                          >
+                            To Pay ({receivedInvoices.length})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setInvoiceView("outgoing")}
+                            className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                              invoiceView === "outgoing"
+                                ? "border-[#f2ca50] bg-[#f2ca50]/12 text-[#f2ca50]"
+                                : "border-white/12 bg-white/5 text-white/65 hover:border-white/20 hover:text-white"
+                            }`}
+                          >
+                            Sent ({sentInvoices.length})
+                          </button>
+                        </div>
                         {/* Received invoices (you owe) */}
-                        {receivedInvoices.length > 0 && (
+                        {invoiceView === "incoming" && receivedInvoices.length > 0 && (
                           <div className="space-y-3">
                             <div className="text-xs font-medium text-[#aaabb0] uppercase tracking-wider">
-                              Invoices to Pay
+                              Invoices to pay
                             </div>
                             {receivedInvoices.map((inv: any) => {
                               const detail = inv.invoices as any;
@@ -2104,18 +2130,28 @@ export default function AgentPayPage() {
                           </div>
                         )}
 
+                        {invoiceView === "incoming" && receivedInvoices.length === 0 ? (
+                          <div className="rounded-2xl border border-white/10 bg-[#111318] p-6 text-center space-y-2">
+                            <div className="text-2xl">📥</div>
+                            <div className="text-sm text-[#aaabb0]">
+                              No invoices to pay.
+                            </div>
+                          </div>
+                        ) : null}
+
                         {/* Sent invoices (you created) */}
-                        <div className="space-y-3">
+                        {invoiceView === "outgoing" ? (
+                          <div className="space-y-3">
                           {sentInvoices.length > 0 && (
                             <div className="text-xs font-medium text-[#aaabb0] uppercase tracking-wider">
-                              Sent Invoices
+                              Sent invoices
                             </div>
                           )}
-                          {sentInvoices.length === 0 && receivedInvoices.length === 0 ? (
+                          {sentInvoices.length === 0 ? (
                             <div className="rounded-2xl border border-white/10 bg-[#111318] p-6 text-center space-y-2">
                               <div className="text-2xl">📄</div>
                               <div className="text-sm text-[#aaabb0]">
-                                No invoices yet.
+                                No sent invoices.
                               </div>
                               <div className="text-xs text-[#f2ca50]">
                                 Try: &quot;create invoice for alice.arc 50 USDC for design work&quot;
@@ -2180,7 +2216,8 @@ export default function AgentPayPage() {
                               </div>
                             ))
                           )}
-                        </div>
+                          </div>
+                        ) : null}
                       </>
                     )}
                     <div className="rounded-2xl border border-[#f2ca50]/20 bg-[#111318] p-4 text-center">
