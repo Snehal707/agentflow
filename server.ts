@@ -2930,7 +2930,25 @@ function parseQuickActionIntent(actionId: unknown, rawMessage: string): AgentFlo
     return null;
   }
 
-  switch (actionId.trim()) {
+  const trimmedActionId = actionId.trim();
+  const predictionMarketAddress = extractPredictionMarketAddress(rawMessage);
+  const predictionOutcome = extractPredictionOutcomeChoice(rawMessage);
+  const amountMatch = rawMessage.match(/\b(?:bet|buy)\s+(\d+(?:\.\d+)?)\s*(?:USDC|\$)\b/i);
+  const sharesMatch = rawMessage.match(/\bsell\s+(\d+(?:\.\d+)?)\s+shares?\b/i);
+  const basePredmarketSlots = {
+    provider: 'achmarket',
+    ...(predictionMarketAddress ? { market: { address: predictionMarketAddress } } : {}),
+    ...(predictionOutcome
+      ? {
+          outcome: {
+            index: predictionOutcome.index,
+            label: predictionOutcome.label,
+          },
+        }
+      : {}),
+  };
+
+  switch (trimmedActionId) {
     case AgentFlowIntentName.VaultList:
       return {
         domain: AgentFlowDomain.Vault,
@@ -2945,6 +2963,88 @@ function parseQuickActionIntent(actionId: unknown, rawMessage: string): AgentFlo
         domain: AgentFlowDomain.Vault,
         intent: AgentFlowIntentName.VaultPosition,
         slots: {},
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    case AgentFlowIntentName.PredmarketList:
+      return {
+        domain: AgentFlowDomain.Predmarket,
+        intent: AgentFlowIntentName.PredmarketList,
+        slots: { provider: 'achmarket' },
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    case AgentFlowIntentName.PredmarketDetail:
+      return {
+        domain: AgentFlowDomain.Predmarket,
+        intent: AgentFlowIntentName.PredmarketDetail,
+        slots: basePredmarketSlots as any,
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    case AgentFlowIntentName.PredmarketPosition:
+      return {
+        domain: AgentFlowDomain.Predmarket,
+        intent: AgentFlowIntentName.PredmarketPosition,
+        slots: { provider: 'achmarket' },
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    case AgentFlowIntentName.PredmarketBuy:
+      return {
+        domain: AgentFlowDomain.Predmarket,
+        intent: AgentFlowIntentName.PredmarketBuy,
+        slots: {
+          ...basePredmarketSlots,
+          ...(amountMatch
+            ? {
+                amount: {
+                  value: Number(amountMatch[1]),
+                  currency: 'USDC',
+                },
+              }
+            : {}),
+        } as any,
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    case AgentFlowIntentName.PredmarketSell:
+      return {
+        domain: AgentFlowDomain.Predmarket,
+        intent: AgentFlowIntentName.PredmarketSell,
+        slots: {
+          ...basePredmarketSlots,
+          ...(sharesMatch
+            ? {
+                shares: {
+                  value: Number(sharesMatch[1]),
+                },
+              }
+            : {}),
+        } as any,
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    case AgentFlowIntentName.PredmarketRedeem:
+      return {
+        domain: AgentFlowDomain.Predmarket,
+        intent: AgentFlowIntentName.PredmarketRedeem,
+        slots: basePredmarketSlots as any,
+        confidence: 1,
+        source: 'fastpath',
+        raw_message: rawMessage,
+      };
+    case AgentFlowIntentName.PredmarketRefund:
+      return {
+        domain: AgentFlowDomain.Predmarket,
+        intent: AgentFlowIntentName.PredmarketRefund,
+        slots: basePredmarketSlots as any,
         confidence: 1,
         source: 'fastpath',
         raw_message: rawMessage,
@@ -5293,18 +5393,22 @@ function buildPredictionAmountChoiceReply(
           {
             label: '1 USDC',
             prompt: `bet 1 USDC on ${outcomePrompt} for ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketBuy,
           },
           {
             label: '5 USDC',
             prompt: `bet 5 USDC on ${outcomePrompt} for ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketBuy,
           },
           {
             label: '10 USDC',
             prompt: `bet 10 USDC on ${outcomePrompt} for ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketBuy,
           },
           {
             label: 'Details',
             prompt: `tell me about ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketDetail,
             tone: 'secondary',
           },
         ],
@@ -5331,10 +5435,12 @@ function buildPredictionOutcomeChoiceReply(
             prompt: amount
               ? `bet ${amount} USDC on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`
               : `bet on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketBuy,
           })),
           {
             label: 'Details',
             prompt: `tell me about ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketDetail,
             tone: 'secondary' as const,
           },
         ],
@@ -5345,17 +5451,31 @@ function buildPredictionOutcomeChoiceReply(
 
 function buildPredmarketCategoryActionGroups(): Array<{
   title?: string;
-  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+  actions: Array<{
+    label: string;
+    prompt: string;
+    actionId?: string;
+    tone?: 'primary' | 'secondary';
+  }>;
 }> {
   return [
     {
       title: 'Browse categories',
       actions: [
-        { label: 'All', prompt: 'show prediction markets', tone: 'secondary' },
-        { label: 'Crypto', prompt: 'show crypto markets' },
-        { label: 'Sports', prompt: 'show sports markets' },
-        { label: 'Politics', prompt: 'show politics markets' },
-        { label: 'Entertainment', prompt: 'show entertainment markets' },
+        {
+          label: 'All',
+          prompt: 'show prediction markets',
+          actionId: AgentFlowIntentName.PredmarketList,
+          tone: 'secondary',
+        },
+        { label: 'Crypto', prompt: 'show crypto markets', actionId: AgentFlowIntentName.PredmarketList },
+        { label: 'Sports', prompt: 'show sports markets', actionId: AgentFlowIntentName.PredmarketList },
+        { label: 'Politics', prompt: 'show politics markets', actionId: AgentFlowIntentName.PredmarketList },
+        {
+          label: 'Entertainment',
+          prompt: 'show entertainment markets',
+          actionId: AgentFlowIntentName.PredmarketList,
+        },
       ],
     },
   ];
@@ -5500,8 +5620,17 @@ function buildPredmarketClarifyReply(): DirectAgentFlowRoute {
       {
         title: 'Choose next step',
         actions: [
-          { label: 'Browse live markets', prompt: 'show prediction markets' },
-          { label: 'My positions', prompt: 'show my prediction market positions', tone: 'secondary' },
+          {
+            label: 'Browse live markets',
+            prompt: 'show prediction markets',
+            actionId: AgentFlowIntentName.PredmarketList,
+          },
+          {
+            label: 'My positions',
+            prompt: 'show my prediction market positions',
+            actionId: AgentFlowIntentName.PredmarketPosition,
+            tone: 'secondary',
+          },
           { label: 'How it works', prompt: 'how do prediction markets work?', tone: 'secondary' },
         ],
       },
@@ -5611,23 +5740,34 @@ function buildPredmarketTradeActionGroup(
   },
 ): {
   title?: string;
-  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+  actions: Array<{
+    label: string;
+    prompt: string;
+    actionId?: string;
+    tone?: 'primary' | 'secondary';
+  }>;
 } {
   const outcomeActions = outcomes.map((outcome) => ({
     label: outcome.label,
     prompt: `bet on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`,
+    actionId: AgentFlowIntentName.PredmarketBuy,
   }));
   return {
     title: title.length > 52 ? `${title.slice(0, 49)}...` : title,
     actions: [
       ...(outcomeActions.length
         ? outcomeActions
-        : [{ label: 'Trade', prompt: `tell me about ${marketAddress}` }]),
+        : [{ label: 'Trade', prompt: `tell me about ${marketAddress}`, actionId: AgentFlowIntentName.PredmarketDetail }]),
       {
         label: 'Research',
         prompt: buildPredmarketResearchPrompt(title, marketAddress, outcomes, metadata),
       },
-      { label: 'Details', prompt: `tell me about ${marketAddress}`, tone: 'secondary' },
+      {
+        label: 'Details',
+        prompt: `tell me about ${marketAddress}`,
+        actionId: AgentFlowIntentName.PredmarketDetail,
+        tone: 'secondary',
+      },
     ],
   };
 }
@@ -5635,10 +5775,16 @@ function buildPredmarketTradeActionGroup(
 function buildPredmarketOutcomeActions(
   marketAddress: `0x${string}`,
   outcomes: PredictionOutcomeChoice[],
-): Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }> {
+): Array<{
+  label: string;
+  prompt: string;
+  actionId?: string;
+  tone?: 'primary' | 'secondary';
+}> {
   return outcomes.map((outcome) => ({
     label: outcome.label,
     prompt: `bet on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`,
+    actionId: AgentFlowIntentName.PredmarketBuy,
   }));
 }
 
@@ -5684,7 +5830,12 @@ function buildPredmarketListQuickActionGroups(
   result: string,
 ): Array<{
   title?: string;
-  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+  actions: Array<{
+    label: string;
+    prompt: string;
+    actionId?: string;
+    tone?: 'primary' | 'secondary';
+  }>;
 }> {
   const groups = buildPredmarketCategoryActionGroups();
   const marketMatches = Array.from(
@@ -5706,8 +5857,17 @@ function buildPredmarketListQuickActionGroups(
     groups.push({
       title: 'More results',
       actions: [
-        { label: 'Show more markets', prompt: 'show more markets' },
-        { label: 'Show all markets', prompt: 'show all markets', tone: 'secondary' },
+        {
+          label: 'Show more markets',
+          prompt: 'show more markets',
+          actionId: AgentFlowIntentName.PredmarketList,
+        },
+        {
+          label: 'Show all markets',
+          prompt: 'show all markets',
+          actionId: AgentFlowIntentName.PredmarketList,
+          tone: 'secondary',
+        },
       ],
     });
   }
@@ -5720,7 +5880,12 @@ function buildPredmarketDetailQuickActionGroups(
   marketAddress: `0x${string}`,
 ): Array<{
   title?: string;
-  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+  actions: Array<{
+    label: string;
+    prompt: string;
+    actionId?: string;
+    tone?: 'primary' | 'secondary';
+  }>;
 }> {
   const titleMatch = result.match(/^##\s+(.+)$/m);
   const title = titleMatch?.[1]?.trim() || 'Prediction market';
@@ -5735,9 +5900,15 @@ function buildPredmarketDetailQuickActionGroups(
           ...outcomes.map((outcome) => ({
             label: outcome.label,
             prompt: `bet on ${formatPredictionOutcomePrompt(outcome)} for ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketBuy,
           })),
           { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress) },
-          { label: 'Show more markets', prompt: 'show more markets', tone: 'secondary' },
+          {
+            label: 'Show more markets',
+            prompt: 'show more markets',
+            actionId: AgentFlowIntentName.PredmarketList,
+            tone: 'secondary',
+          },
         ],
       },
     ];
@@ -5747,9 +5918,18 @@ function buildPredmarketDetailQuickActionGroups(
       {
         title: 'Resolved market',
         actions: [
-          { label: 'Redeem', prompt: `redeem ${marketAddress}` },
+          {
+            label: 'Redeem',
+            prompt: `redeem ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketRedeem,
+          },
           { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress) },
-          { label: 'Show positions', prompt: 'show my prediction market positions', tone: 'secondary' },
+          {
+            label: 'Show positions',
+            prompt: 'show my prediction market positions',
+            actionId: AgentFlowIntentName.PredmarketPosition,
+            tone: 'secondary',
+          },
         ],
       },
     ];
@@ -5759,9 +5939,18 @@ function buildPredmarketDetailQuickActionGroups(
       {
         title: 'Closed market',
         actions: [
-          { label: 'Refund', prompt: `refund ${marketAddress}` },
+          {
+            label: 'Refund',
+            prompt: `refund ${marketAddress}`,
+            actionId: AgentFlowIntentName.PredmarketRefund,
+          },
           { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress) },
-          { label: 'Show positions', prompt: 'show my prediction market positions', tone: 'secondary' },
+          {
+            label: 'Show positions',
+            prompt: 'show my prediction market positions',
+            actionId: AgentFlowIntentName.PredmarketPosition,
+            tone: 'secondary',
+          },
         ],
       },
     ];
@@ -5771,8 +5960,17 @@ function buildPredmarketDetailQuickActionGroups(
       title: 'Next step',
       actions: [
         { label: 'Research', prompt: buildPredmarketResearchPrompt(title, marketAddress) },
-        { label: 'Show prediction markets', prompt: 'show prediction markets' },
-        { label: 'Show more markets', prompt: 'show more markets', tone: 'secondary' },
+        {
+          label: 'Show prediction markets',
+          prompt: 'show prediction markets',
+          actionId: AgentFlowIntentName.PredmarketList,
+        },
+        {
+          label: 'Show more markets',
+          prompt: 'show more markets',
+          actionId: AgentFlowIntentName.PredmarketList,
+          tone: 'secondary',
+        },
       ],
     },
   ];
@@ -5781,7 +5979,12 @@ function buildPredmarketDetailQuickActionGroups(
 function buildPredmarketSellAction(
   positionStr: string,
   address: `0x${string}`,
-): { label: string; prompt: string; tone: 'primary' } | null {
+): {
+  label: string;
+  prompt: string;
+  actionId?: string;
+  tone: 'primary';
+} | null {
   // Parse the first "<shares> <label> shares" entry. The label may carry an emoji
   // prefix and/or multiple words (e.g. "🌍 Others"), so capture everything up to
   // " shares" and then strip non-word symbols to get a usable outcome token.
@@ -5808,6 +6011,7 @@ function buildPredmarketSellAction(
   return {
     label: 'Sell',
     prompt: `sell ${shares} shares ${outcomeRef} for ${address}`,
+    actionId: AgentFlowIntentName.PredmarketSell,
     tone: 'primary',
   };
 }
@@ -5816,11 +6020,21 @@ function buildPredmarketPositionQuickActionGroups(
   result: string,
 ): Array<{
   title?: string;
-  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+  actions: Array<{
+    label: string;
+    prompt: string;
+    actionId?: string;
+    tone?: 'primary' | 'secondary';
+  }>;
 }> {
   const groups: Array<{
     title?: string;
-    actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+    actions: Array<{
+      label: string;
+      prompt: string;
+      actionId?: string;
+      tone?: 'primary' | 'secondary';
+    }>;
   }> = [];
   const matches = Array.from(
     result.matchAll(
@@ -5839,9 +6053,18 @@ function buildPredmarketPositionQuickActionGroups(
       groups.push({
         title: shortTitle,
         actions: [
-          { label: 'Redeem', prompt: `redeem ${address}` },
+          {
+            label: 'Redeem',
+            prompt: `redeem ${address}`,
+            actionId: AgentFlowIntentName.PredmarketRedeem,
+          },
           { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
-          { label: 'Details', prompt: `tell me about ${address}`, tone: 'secondary' },
+          {
+            label: 'Details',
+            prompt: `tell me about ${address}`,
+            actionId: AgentFlowIntentName.PredmarketDetail,
+            tone: 'secondary',
+          },
         ],
       });
       continue;
@@ -5851,9 +6074,18 @@ function buildPredmarketPositionQuickActionGroups(
       groups.push({
         title: shortTitle,
         actions: [
-          { label: 'Refund', prompt: `refund ${address}` },
+          {
+            label: 'Refund',
+            prompt: `refund ${address}`,
+            actionId: AgentFlowIntentName.PredmarketRefund,
+          },
           { label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) },
-          { label: 'Details', prompt: `tell me about ${address}`, tone: 'secondary' },
+          {
+            label: 'Details',
+            prompt: `tell me about ${address}`,
+            actionId: AgentFlowIntentName.PredmarketDetail,
+            tone: 'secondary',
+          },
         ],
       });
       continue;
@@ -5863,12 +6095,18 @@ function buildPredmarketPositionQuickActionGroups(
     const sellAction = status.includes('active')
       ? buildPredmarketSellAction(positionStr, address)
       : null;
-    const actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }> = [];
+    const actions: Array<{
+      label: string;
+      prompt: string;
+      actionId?: string;
+      tone?: 'primary' | 'secondary';
+    }> = [];
     if (sellAction) actions.push(sellAction);
     actions.push({ label: 'Research', prompt: buildPredmarketResearchPrompt(title, address) });
     actions.push({
       label: 'Details',
       prompt: `tell me about ${address}`,
+      actionId: AgentFlowIntentName.PredmarketDetail,
       ...(sellAction ? { tone: 'secondary' as const } : {}),
     });
     groups.push({ title: shortTitle, actions });
@@ -5921,7 +6159,12 @@ async function buildPredmarketResearchQuickActionGroups(
 ): Promise<
   | Array<{
   title?: string;
-  actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+  actions: Array<{
+    label: string;
+    prompt: string;
+    actionId?: string;
+    tone?: 'primary' | 'secondary';
+  }>;
     }>
   | undefined
 > {
@@ -5938,7 +6181,12 @@ async function buildPredmarketResearchQuickActionGroupsFromContext(
 ): Promise<
   Array<{
     title?: string;
-    actions: Array<{ label: string; prompt: string; tone?: 'primary' | 'secondary' }>;
+    actions: Array<{
+      label: string;
+      prompt: string;
+      actionId?: string;
+      tone?: 'primary' | 'secondary';
+    }>;
   }>
 > {
   const resolvedMarketAddress =
