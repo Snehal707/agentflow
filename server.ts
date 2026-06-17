@@ -2910,6 +2910,7 @@ type DirectAgentFlowRoute =
   | {
       type: 'reply';
       text: string;
+      continuationState?: RouterContinuationState;
       quickActionGroups?: Array<{
         title?: string;
         actions: Array<{
@@ -4920,6 +4921,8 @@ function buildRouterContinuationKey(sessionId: string): string {
 
 function isRouterContinuationIntent(intent: AgentFlowIntentName): boolean {
   return [
+    AgentFlowIntentName.PredmarketBuy,
+    AgentFlowIntentName.PredmarketSell,
     AgentFlowIntentName.AgentpaySend,
     AgentFlowIntentName.AgentpayRequest,
     AgentFlowIntentName.AgentpayPaymentLink,
@@ -5054,8 +5057,40 @@ function tryBuildRouterContinuationMessage(
   const description =
     typeof slots.description === 'string' && slots.description.trim() ? slots.description.trim() : null;
   const remark = typeof slots.remark === 'string' && slots.remark.trim() ? slots.remark.trim() : null;
+  const marketSlot =
+    slots.market && typeof slots.market === 'object' ? (slots.market as Record<string, unknown>) : null;
+  const marketAddress =
+    marketSlot && typeof marketSlot.address === 'string' && marketSlot.address.trim()
+      ? marketSlot.address.trim()
+      : null;
+  const outcomeSlot =
+    slots.outcome && typeof slots.outcome === 'object' ? (slots.outcome as Record<string, unknown>) : null;
+  const outcomeIndex =
+    outcomeSlot && typeof outcomeSlot.index === 'number' && Number.isInteger(outcomeSlot.index)
+      ? outcomeSlot.index
+      : null;
+  const outcomeLabel =
+    outcomeSlot && typeof outcomeSlot.label === 'string' && outcomeSlot.label.trim()
+      ? outcomeSlot.label.trim()
+      : null;
+  const outcomePrompt =
+    outcomeIndex != null && outcomeLabel
+      ? formatPredictionOutcomePrompt({ index: outcomeIndex, label: outcomeLabel })
+      : outcomeLabel;
 
   switch (state.intent) {
+    case AgentFlowIntentName.PredmarketBuy: {
+      if (state.slotsMissing.includes('amount.value') && amount && marketAddress && outcomePrompt) {
+        return `bet ${amount.value} ${amount.currency} on ${outcomePrompt} for ${marketAddress}`;
+      }
+      return null;
+    }
+    case AgentFlowIntentName.PredmarketSell: {
+      if (state.slotsMissing.includes('shares.value') && amount && marketAddress && outcomePrompt) {
+        return `sell ${amount.value} shares ${outcomePrompt} for ${marketAddress}`;
+      }
+      return null;
+    }
     case AgentFlowIntentName.AgentpaySend:
     case AgentFlowIntentName.AgentpayRequest:
     case AgentFlowIntentName.AgentpayPaymentLink: {
@@ -5269,6 +5304,20 @@ function parseOutcomeOptionsForMarketFromListResult(
   return [];
 }
 
+function parseOutcomeOptionsFromPredmarketResearchPrompt(
+  content: string,
+  marketAddress: `0x${string}` | null = null,
+): PredictionOutcomeChoice[] {
+  if (marketAddress && !content.includes(marketAddress)) {
+    return [];
+  }
+  const outcomesLineMatch = content.match(/\bListed outcomes in AgentFlow:\s*([^\n]+)/i);
+  if (!outcomesLineMatch) {
+    return [];
+  }
+  return parseOutcomeOptionsFromSummaryLine(outcomesLineMatch[1]);
+}
+
 function extractPredictionOutcomeOptionsFromHistory(
   history: BrainConversationMessage[] = [],
   marketAddress: `0x${string}` | null = null,
@@ -5283,6 +5332,13 @@ function extractPredictionOutcomeOptionsFromHistory(
       if (listOptions.length) {
         return listOptions;
       }
+    }
+    const researchPromptOptions = parseOutcomeOptionsFromPredmarketResearchPrompt(
+      content,
+      marketAddress,
+    );
+    if (researchPromptOptions.length) {
+      return researchPromptOptions;
     }
     const detailOptions = parseOutcomeOptionsFromDetailResult(content);
     if (detailOptions.length) {
@@ -5383,9 +5439,25 @@ function buildPredictionAmountChoiceReply(
   outcome: PredictionOutcomeChoice,
 ): DirectAgentFlowRoute {
   const outcomePrompt = formatPredictionOutcomePrompt(outcome);
+  const text = `How much do you want to bet on ${outcome.label} for this market?\n\nChoose an amount below, or type a custom amount like \`bet 3 USDC on ${outcomePrompt} for ${marketAddress}\`.`;
   return {
     type: 'reply',
-    text: `How much do you want to bet on ${outcome.label} for this market?\n\nChoose an amount below, or type a custom amount like \`bet 3 USDC on ${outcomePrompt} for ${marketAddress}\`.`,
+    text,
+    continuationState: {
+      intent: AgentFlowIntentName.PredmarketBuy,
+      rawMessage: `bet on ${outcomePrompt} for ${marketAddress}`,
+      slots: {
+        provider: 'achmarket',
+        market: { address: marketAddress },
+        outcome: {
+          index: outcome.index,
+          label: outcome.label,
+        },
+      },
+      slotsMissing: ['amount.value'],
+      clarification: text,
+      createdAt: new Date().toISOString(),
+    },
     quickActionGroups: [
       {
         title: outcome.label,
@@ -5423,9 +5495,28 @@ function buildPredictionOutcomeChoiceReply(
   outcomes: PredictionOutcomeChoice[],
 ): DirectAgentFlowRoute {
   const amountText = amount ? `for your ${amount} USDC bet` : 'for this market';
+  const text = `Which outcome do you want ${amountText}?\n\nChoose one below.`;
   return {
     type: 'reply',
-    text: `Which outcome do you want ${amountText}?\n\nChoose one below.`,
+    text,
+    continuationState:
+      amount && Number.isFinite(Number(amount)) && Number(amount) > 0
+        ? {
+            intent: AgentFlowIntentName.PredmarketBuy,
+            rawMessage: `bet ${amount} USDC for ${marketAddress}`,
+            slots: {
+              provider: 'achmarket',
+              market: { address: marketAddress },
+              amount: {
+                value: Number(amount),
+                currency: 'USDC',
+              },
+            },
+            slotsMissing: ['outcome'],
+            clarification: text,
+            createdAt: new Date().toISOString(),
+          }
+        : undefined,
     quickActionGroups: [
       {
         title: 'Pick an outcome',
@@ -7303,6 +7394,13 @@ function parseDirectAgentFlowRoute(
   if (!normalized) {
     return null;
   }
+  const predictionMarketAddress =
+    extractPredictionMarketAddress(message) ?? extractRecentPredictionContextAddress(history);
+  const predictionOutcome = extractPredictionOutcomeChoice(
+    message,
+    history,
+    predictionMarketAddress,
+  );
   if (isAmbiguousPredictionMarketIntent(normalized)) {
     return buildPredmarketClarifyReply();
   }
@@ -7634,13 +7732,6 @@ function parseDirectAgentFlowRoute(
     };
   }
 
-  const predictionMarketAddress =
-    extractPredictionMarketAddress(message) ?? extractRecentPredictionContextAddress(history);
-  const predictionOutcome = extractPredictionOutcomeChoice(
-    message,
-    history,
-    predictionMarketAddress,
-  );
   if (
     /\bhow\b[\s\S]{0,80}\bredeem\b/i.test(normalized) ||
     /\bwhen\b[\s\S]{0,80}\bredeem\b/i.test(normalized) ||
@@ -7659,6 +7750,15 @@ function parseDirectAgentFlowRoute(
         'If you do not hold the winning side, there is nothing to redeem for that wallet.',
       ].join('\n'),
     };
+  }
+  if (
+    predictionMarketAddress &&
+    predictionOutcome &&
+    !/\b(?:bet|buy|sell|redeem|refund|details?|show|tell me about|what is|what's|research)\b/i.test(
+      normalized,
+    )
+  ) {
+    return buildPredictionAmountChoiceReply(predictionMarketAddress, predictionOutcome);
   }
   if (
     predictionMarketAddress &&
@@ -8880,10 +8980,34 @@ function isExplicitReportRerunRequest(message: string): boolean {
 function shouldUseReportContextTurn(
   message: string,
   previousReport: string | null,
+  history: BrainConversationMessage[] = [],
 ): boolean {
   if (!previousReport) return false;
   const normalized = message.trim().toLowerCase();
   if (!normalized) return false;
+  const recentPredmarketAddress =
+    extractPredictionMarketAddress(message) ?? extractRecentPredictionContextAddress(history);
+  const recentPredmarketOutcome = extractPredictionOutcomeChoice(
+    message,
+    history,
+    recentPredmarketAddress,
+  );
+  if (
+    recentPredmarketAddress &&
+    recentPredmarketOutcome &&
+    !/\b(?:source|sources|report|claim|claims|why|how|what|which|odds|ranking|rankings|because)\b/i.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+  if (
+    /^(?:bet|buy|sell|redeem|refund|show prediction markets|show my prediction market positions|tell me about)\b/i.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
   if (isExplicitReportRerunRequest(normalized)) return false;
   if (/\b(?:research|deep research|analy[sz]e|investigate|look into|generate report|make a report)\b/i.test(normalized)) {
     return false;
@@ -10753,8 +10877,12 @@ function createPublicApp(): express.Express {
     const earlyPreviousReport = findLatestStoredResearchReport(
       messages as BrainConversationMessage[],
     );
-    const reserveForReportContext = shouldUseReportContextTurn(message, earlyPreviousReport);
     const earlyPortfolioHistory = messages as BrainConversationMessage[];
+    const reserveForReportContext = shouldUseReportContextTurn(
+      message,
+      earlyPreviousReport,
+      earlyPortfolioHistory,
+    );
     const earlyPortfolioSnapshot = findRecentPortfolioSnapshotMessage(earlyPortfolioHistory);
     const earlyPortfolioClarificationReply =
       shouldClarifyPortfolioRequest(message)
@@ -12829,6 +12957,12 @@ function createPublicApp(): express.Express {
           const postRouterDirectRoute = parseDirectAgentFlowRoute(message, messages);
           if (postRouterDirectRoute?.type === 'reply') {
             const responseText = postRouterDirectRoute.text;
+            if (postRouterDirectRoute.continuationState) {
+              await storeRouterContinuationState(
+                actionSessionId,
+                postRouterDirectRoute.continuationState,
+              );
+            }
             await appendBrainConversationTurn(memorySessionId, message, responseText);
             await updateBrainEvent(brainEventId, {
               intent_label: validation.intent.intent,
@@ -13788,7 +13922,7 @@ function createPublicApp(): express.Express {
       console.log('[report-context] previousReport:', Boolean(previousReport));
       console.log(
         '[report-context] shouldUse:',
-        shouldUseReportContextTurn(message, previousReport),
+        shouldUseReportContextTurn(message, previousReport, historyForBrain),
       );
 
       if (isReportRenderingComplaint(message)) {
@@ -13820,7 +13954,7 @@ function createPublicApp(): express.Express {
         }
       }
 
-      if (shouldUseReportContextTurn(message, previousReport)) {
+      if (shouldUseReportContextTurn(message, previousReport, historyForBrain)) {
         console.log('[report-context] handling post-report follow-up');
         const reportTurnKind = classifyReportContextTurn(message);
         let responseText: string;
@@ -13981,6 +14115,9 @@ function createPublicApp(): express.Express {
 
         if (directRoute.type === 'reply') {
           responseText = directRoute.text;
+          if (directRoute.continuationState) {
+            await storeRouterContinuationState(actionSessionId, directRoute.continuationState);
+          }
           if (directRoute.quickActionGroups?.length) {
             meta = { quickActionGroups: directRoute.quickActionGroups };
           }
