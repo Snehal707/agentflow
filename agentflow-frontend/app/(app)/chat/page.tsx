@@ -1706,7 +1706,7 @@ function friendlyChatErrorMessage(error: unknown, fallback: string): string {
     /* Not JSON; keep the original message. */
   }
 
-  return message.length > 240 ? `${message.slice(0, 237).trimEnd()}...` : message;
+  return message.length > 1200 ? `${message.slice(0, 1197).trimEnd()}...` : message;
 }
 
 function attachmentSummaryLabel(attachment: PendingChatAttachment): string {

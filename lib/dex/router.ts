@@ -1,4 +1,4 @@
-import { getAddress } from 'viem';
+import { formatUnits, getAddress } from 'viem';
 import { swaparcProvider } from './providers/swaparc';
 import { achswapProvider } from './providers/achswap';
 import { lunexProvider, LunexRateLimitError } from './providers/lunex';
@@ -60,6 +60,14 @@ function getImpliedRate(
   }
 
   return amountOut / amountIn;
+}
+
+function formatCompactAmount(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  if (value === 0) return '0';
+  if (value >= 100) return value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  if (value >= 1) return value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  return value.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 function getLogicalStableDecimals(token: `0x${string}`): number | null {
@@ -204,6 +212,9 @@ export async function getBestQuote(params: QuoteParams): Promise<QuoteResult> {
     });
 
     if (!safeStableQuotes.length) {
+      const inputDecimals = getLogicalStableDecimals(params.tokenIn) ?? plausible[0].tokenInDecimals;
+      const inputAmount = Number(formatUnits(params.amountInRaw, inputDecimals));
+      const [inputSymbol, outputSymbol] = stablePairKey.split('-');
       const quoteSummary = plausible
         .map((quote) => {
           const impliedRate = getImpliedRate(
@@ -217,11 +228,18 @@ export async function getBestQuote(params: QuoteParams): Promise<QuoteResult> {
           return `${quote.provider}=${formattedRate}`;
         })
         .join(', ');
+      const outputSummary = plausible
+        .map((quote) => {
+          const amountOut = Number(formatUnits(quote.expectedOutRaw, quote.tokenOutDecimals));
+          return `${quote.provider}=${formatCompactAmount(amountOut)} ${outputSymbol}`;
+        })
+        .join(', ');
 
       throw new Error(
         `No safe ${stablePairKey} quote available right now. ` +
-          `Observed provider rates: ${quoteSummary}. ` +
-          `Liquidity appears off-peg for this pair on the current testnet routes.`,
+          `For ${formatCompactAmount(inputAmount)} ${inputSymbol} in, current providers return ` +
+          `${outputSummary} (${quoteSummary} ${outputSymbol} per ${inputSymbol}). ` +
+          `AgentFlow blocks this because USDC and EURC should stay near parity, and these routes are currently off-peg on testnet.`,
       );
     }
 

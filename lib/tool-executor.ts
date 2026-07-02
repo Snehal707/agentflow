@@ -1572,10 +1572,7 @@ export async function executeTool(
           console.log('[tool-executor] raw swap sim:', JSON.stringify(simulation));
 
           if (!previewResponse.ok || !simulation?.success || !simulation.payload) {
-            const result = truncateText(
-              simulation?.error || 'Swap simulation failed.',
-              300,
-            );
+            const result = simulation?.error || 'Swap simulation failed.';
             console.log('[tool-executor] result:', result);
             return result;
           }
