@@ -3,6 +3,7 @@ import { swaparcProvider } from './providers/swaparc';
 import { achswapProvider } from './providers/achswap';
 import { lunexProvider, LunexRateLimitError } from './providers/lunex';
 import { resolveArcTokenSymbol } from '../swap-symbols';
+import { evaluateStableRateBand, getStablePairKey } from '../swap-sanity';
 import type { DexProvider, QuoteParams, QuoteResult, SwapParams, SwapResult } from './types';
 
 const providers: DexProvider[] = [swaparcProvider, achswapProvider, lunexProvider];
@@ -39,6 +40,26 @@ function isPlausibleQuote(
 
   const impliedRate = amountOut / amountIn;
   return impliedRate >= 0.5 && impliedRate <= 2.0;
+}
+
+function getImpliedRate(
+  quote: QuoteResult,
+  tokenIn: `0x${string}`,
+  tokenOut: `0x${string}`,
+  amountInRaw: bigint,
+): number | null {
+  const normalizedTokenInDecimals =
+    getLogicalStableDecimals(tokenIn) ?? quote.tokenInDecimals;
+  const normalizedTokenOutDecimals =
+    getLogicalStableDecimals(tokenOut) ?? quote.tokenOutDecimals;
+  const amountIn = Number(amountInRaw) / 10 ** normalizedTokenInDecimals;
+  const amountOut = Number(quote.expectedOutRaw) / 10 ** normalizedTokenOutDecimals;
+
+  if (!Number.isFinite(amountIn) || !Number.isFinite(amountOut) || amountIn <= 0 || amountOut <= 0) {
+    return null;
+  }
+
+  return amountOut / amountIn;
 }
 
 function getLogicalStableDecimals(token: `0x${string}`): number | null {
@@ -123,13 +144,12 @@ export async function getBestQuote(params: QuoteParams): Promise<QuoteResult> {
     );
 
     if (!ok) {
-      const normalizedTokenInDecimals =
-        getLogicalStableDecimals(params.tokenIn) ?? quote.tokenInDecimals;
-      const normalizedTokenOutDecimals =
-        getLogicalStableDecimals(params.tokenOut) ?? quote.tokenOutDecimals;
-      const amountIn = Number(params.amountInRaw) / 10 ** normalizedTokenInDecimals;
-      const amountOut = Number(quote.expectedOutRaw) / 10 ** normalizedTokenOutDecimals;
-      const impliedRate = amountOut / amountIn;
+      const impliedRate = getImpliedRate(
+        quote,
+        params.tokenIn,
+        params.tokenOut,
+        params.amountInRaw,
+      );
       console.warn(
         '[DEX_ROUTER_IMPLAUSIBLE_QUOTE]',
         JSON.stringify({
@@ -138,8 +158,8 @@ export async function getBestQuote(params: QuoteParams): Promise<QuoteResult> {
           tokenOut: params.tokenOut,
           amountInRaw: params.amountInRaw.toString(),
           expectedOutRaw: quote.expectedOutRaw.toString(),
-          tokenInDecimals: normalizedTokenInDecimals,
-          tokenOutDecimals: normalizedTokenOutDecimals,
+          tokenInDecimals: getLogicalStableDecimals(params.tokenIn) ?? quote.tokenInDecimals,
+          tokenOutDecimals: getLogicalStableDecimals(params.tokenOut) ?? quote.tokenOutDecimals,
           impliedRate,
         }),
       );
@@ -150,6 +170,67 @@ export async function getBestQuote(params: QuoteParams): Promise<QuoteResult> {
 
   if (!plausible.length) {
     throw new Error('No valid quotes available for this swap');
+  }
+
+  const stablePairKey = getStablePairKey(params.tokenIn, params.tokenOut);
+  if (stablePairKey) {
+    const safeStableQuotes = plausible.filter((quote) => {
+      const impliedRate = getImpliedRate(
+        quote,
+        params.tokenIn,
+        params.tokenOut,
+        params.amountInRaw,
+      );
+      if (impliedRate === null) {
+        return false;
+      }
+
+      const rateCheck = evaluateStableRateBand({ pairKey: stablePairKey, quotedRate: impliedRate });
+      if (!rateCheck.ok) {
+        console.warn(
+          '[DEX_ROUTER_UNSAFE_STABLE_QUOTE]',
+          JSON.stringify({
+            provider: quote.provider,
+            pair: stablePairKey,
+            amountInRaw: params.amountInRaw.toString(),
+            expectedOutRaw: quote.expectedOutRaw.toString(),
+            impliedRate,
+            configuredMin: rateCheck.min,
+            configuredMax: rateCheck.max,
+          }),
+        );
+      }
+      return rateCheck.ok;
+    });
+
+    if (!safeStableQuotes.length) {
+      const quoteSummary = plausible
+        .map((quote) => {
+          const impliedRate = getImpliedRate(
+            quote,
+            params.tokenIn,
+            params.tokenOut,
+            params.amountInRaw,
+          );
+          const formattedRate =
+            impliedRate === null ? 'n/a' : impliedRate.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+          return `${quote.provider}=${formattedRate}`;
+        })
+        .join(', ');
+
+      throw new Error(
+        `No safe ${stablePairKey} quote available right now. ` +
+          `Observed provider rates: ${quoteSummary}. ` +
+          `Liquidity appears off-peg for this pair on the current testnet routes.`,
+      );
+    }
+
+    safeStableQuotes.sort((left, right) => {
+      if (left.expectedOutRaw === right.expectedOutRaw) return 0;
+      return left.expectedOutRaw > right.expectedOutRaw ? -1 : 1;
+    });
+
+    return safeStableQuotes[0];
   }
 
   plausible.sort((left, right) => {

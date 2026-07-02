@@ -12,6 +12,10 @@ const MAX_RESTARTS_PER_MINUTE = 5;
 
 dotenv.config({ path: path.join(repoRoot, ".env") });
 
+const HERMES_PORT = String(
+  process.env.AGENTFLOW_HERMES_PORT || process.env.API_SERVER_PORT || "8000",
+);
+
 function runPowerShell(command) {
   return spawnSync(
     "powershell.exe",
@@ -29,7 +33,7 @@ $gateway = Get-CimInstance Win32_Process | Where-Object {
 foreach ($proc in $gateway) {
   $targets += $proc.ProcessId
 }
-$listener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
+$listener = Get-NetTCPConnection -LocalPort ${HERMES_PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
 if ($listener) {
   $targets += $listener
 }
@@ -94,7 +98,7 @@ const hermesEnv = {
   API_SERVER_ENABLED: "true",
   API_SERVER_HOST: apiServerHost,
   API_SERVER_KEY: apiServerKey,
-  API_SERVER_PORT: "8000",
+  API_SERVER_PORT: HERMES_PORT,
   PYTHONUTF8: "1",
   TERMINAL_CWD: "",
   TELEGRAM_BOT_TOKEN: "",

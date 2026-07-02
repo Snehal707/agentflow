@@ -12,6 +12,10 @@ const frontendNodeBin = path.join(repoRoot, "agentflow-frontend", "node_modules"
 const supervisorLockPath = path.join(repoRoot, ".dev-stack.lock.json");
 dotenv.config({ path: path.join(repoRoot, ".env") });
 
+const HERMES_PORT = Number(process.env.AGENTFLOW_HERMES_PORT || process.env.API_SERVER_PORT || 8000);
+const HERMES_URL =
+  process.env.AGENTFLOW_HERMES_URL || `http://127.0.0.1:${HERMES_PORT}`;
+
 const shouldClean =
   /^(1|true|yes|on)$/i.test(String(process.env.AGENTFLOW_STACK_CLEAN || "").trim()) ||
   process.argv.includes("--clean");
@@ -104,8 +108,8 @@ const CRITICAL_HEALTH_TARGETS = [
   },
   {
     name: "hermes",
-    url: "http://127.0.0.1:8000/health",
-    port: 8000,
+    url: `${HERMES_URL.replace(/\/+$/, "")}/health`,
+    port: HERMES_PORT,
     startupGraceMs: 60_000,
     starter: () => startHermes(),
   },
@@ -366,11 +370,16 @@ function startFrontend() {
 }
 
 function startHermes() {
-  console.log("[dev:stack] starting Hermes sibling on :8000");
+  console.log(`[dev:stack] starting Hermes sibling on :${HERMES_PORT}`);
   return spawn(process.execPath, ["scripts/start-hermes.cjs"], {
     cwd: repoRoot,
     stdio: "inherit",
-    env: process.env,
+    env: {
+      ...process.env,
+      AGENTFLOW_HERMES_PORT: String(HERMES_PORT),
+      AGENTFLOW_HERMES_URL: HERMES_URL,
+      API_SERVER_PORT: String(HERMES_PORT),
+    },
     shell: false,
   });
 }
@@ -381,6 +390,8 @@ function startBackendProcess(spec) {
     stdio: "inherit",
     env: {
       ...process.env,
+      AGENTFLOW_HERMES_PORT: String(HERMES_PORT),
+      AGENTFLOW_HERMES_URL: HERMES_URL,
       EMBEDDED_AGENT_SERVERS: "false",
       PATH: [repoNodeBin, frontendNodeBin, process.env.PATH || ""].join(path.delimiter),
     },
@@ -431,7 +442,7 @@ async function bootstrap() {
   }
 
   if ((await isTargetResponsive(criticalHealthTargetByName.get("hermes"))).ok) {
-    console.log("[dev:stack] Hermes already healthy on :8000; reusing existing process.");
+    console.log(`[dev:stack] Hermes already healthy on :${HERMES_PORT}; reusing existing process.`);
   } else {
     const hermes = startHermes();
     hermes.on("error", (err) => {
