@@ -8,6 +8,7 @@ import {
   parseAbiItem,
 } from 'viem';
 import { authMiddleware, type JWTPayload } from '../lib/auth';
+import { sendServerError } from '../lib/http-errors';
 import { adminDb } from '../db/client';
 import { normalizeHandle } from '../lib/handles';
 import {
@@ -361,7 +362,7 @@ router.get('/me', authMiddleware, async (req, res) => {
       linked_telegram_display_name: linkedTelegram.telegramDisplayName,
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'business me failed' });
+    return sendServerError(res, 'business/me', e, 'business me failed');
   }
 });
 
@@ -383,12 +384,12 @@ router.get('/transactions', authMiddleware, async (req, res) => {
       .limit(limit);
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'business', error, 'Request failed');
     }
 
     return res.json({ transactions: data ?? [] });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'transactions list failed' });
+    return sendServerError(res, 'business/transactions', e, 'transactions list failed');
   }
 });
 
@@ -447,7 +448,7 @@ router.post('/onboard', authMiddleware, async (req, res) => {
       .single();
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'business', error, 'Request failed');
     }
 
     const business = await syncBusinessTelegramFromLinkedUser(
@@ -466,7 +467,7 @@ router.post('/onboard', authMiddleware, async (req, res) => {
       linked_telegram_display_name: linkedTelegram.telegramDisplayName,
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'business onboarding failed' });
+    return sendServerError(res, 'business/onboard', e, 'business onboarding failed');
   }
 });
 
@@ -512,7 +513,7 @@ router.patch('/rules', authMiddleware, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'business', error, 'Request failed');
     }
     if (!updatedBusiness) {
       return res.status(404).json({ error: 'Business row not found for this wallet' });
@@ -526,7 +527,7 @@ router.patch('/rules', authMiddleware, async (req, res) => {
 
     return res.json({ business: data });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'rules update failed' });
+    return sendServerError(res, 'business/rules', e, 'rules update failed');
   }
 });
 
@@ -543,7 +544,7 @@ router.post('/invoices/:invoiceId/approve', authMiddleware, async (req, res) => 
       .maybeSingle();
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'business', error, 'Request failed');
     }
     if (!invoice) {
       return res.status(404).json({ error: 'Invoice not found for this business wallet' });
@@ -602,7 +603,7 @@ router.post('/invoices/:invoiceId/approve', authMiddleware, async (req, res) => 
       payeeWalletAddress,
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'invoice approve failed' });
+    return sendServerError(res, 'business/invoice-approve', e, 'invoice approve failed');
   }
 });
 
@@ -619,7 +620,7 @@ router.post('/invoices/:invoiceId/reject', authMiddleware, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'business', error, 'Request failed');
     }
     if (!invoice) {
       return res.status(404).json({ error: 'Invoice not found for this business wallet' });
@@ -639,7 +640,7 @@ router.post('/invoices/:invoiceId/reject', authMiddleware, async (req, res) => {
       .single();
 
     if (updateError) {
-      return res.status(500).json({ error: updateError.message });
+      return sendServerError(res, 'business/invoice-reject', updateError, 'invoice reject failed');
     }
 
     await notifyInvoiceReviewNeeded({
@@ -654,7 +655,7 @@ router.post('/invoices/:invoiceId/reject', authMiddleware, async (req, res) => {
 
     return res.json({ success: true, invoice: updated });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'invoice reject failed' });
+    return sendServerError(res, 'business/invoice-reject', e, 'invoice reject failed');
   }
 });
 

@@ -3,6 +3,7 @@ import { getAddress } from 'viem';
 import { adminDb } from '../db/client';
 import type { JWTPayload } from './auth';
 import telegramLinkCode from './telegram-link-code';
+import { sendServerError } from './http-errors';
 import {
   loadCachedTelegramChatProfile,
   resolveTelegramBotUsername,
@@ -27,7 +28,7 @@ export async function telegramGenerateCodeHandler(req: Request, res: Response) {
       ...(botUsername ? { botUsername } : {}),
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'generate-code failed' });
+    return sendServerError(res, 'telegram/generate-code', error, 'generate-code failed');
   }
 }
 
@@ -39,18 +40,18 @@ export async function telegramUnlinkHandler(req: Request, res: Response) {
       .update({ telegram_id: null })
       .eq('wallet_address', auth.walletAddress);
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'telegram/unlink', error, 'unlink failed');
     }
     const { error: businessError } = await adminDb
       .from('businesses')
       .update({ telegram_id: null })
       .eq('wallet_address', auth.walletAddress);
     if (businessError) {
-      return res.status(500).json({ error: businessError.message });
+      return sendServerError(res, 'telegram/unlink', businessError, 'unlink failed');
     }
     return res.json({ success: true });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'unlink failed' });
+    return sendServerError(res, 'telegram/unlink', error, 'unlink failed');
   }
 }
 
@@ -64,7 +65,7 @@ export async function telegramStatusHandler(req: Request, res: Response) {
       .eq('wallet_address', walletAddress)
       .maybeSingle();
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'telegram/status', error, 'status failed');
     }
     const tid = data?.telegram_id as string | null | undefined;
     const linked = Boolean(tid && String(tid).trim());
@@ -82,6 +83,6 @@ export async function telegramStatusHandler(req: Request, res: Response) {
       ...(botUsername ? { botUsername } : {}),
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'status failed' });
+    return sendServerError(res, 'telegram/status', error, 'status failed');
   }
 }

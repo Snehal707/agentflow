@@ -4,6 +4,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
+import { toClientMessage } from '../../lib/http-errors';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
 import { getFacilitatorBaseUrl } from '../../lib/facilitator-url';
@@ -57,7 +58,7 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
     }
     next();
   } catch (error) {
-    res.status(500).json({ error: toMessage(error) });
+    res.status(500).json({ error: toClientMessage('batch', error) });
   }
 };
 
@@ -125,7 +126,7 @@ app.post(
       const result = await previewBatch({ sessionId, walletAddress, payments });
       return res.json(result);
     } catch (error) {
-      return res.status(500).json({ action: 'error', message: toMessage(error) });
+      return res.status(500).json({ action: 'error', message: toClientMessage('batch', error) });
     }
   },
 );
@@ -176,7 +177,7 @@ app.post(
     const status = result.action === 'error' ? 400 : 200;
     return res.status(status).json(result);
   } catch (error) {
-    return res.status(500).json({ action: 'error', message: toMessage(error) });
+    return res.status(500).json({ action: 'error', message: toClientMessage('batch', error) });
   }
 });
 

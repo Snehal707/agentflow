@@ -5,6 +5,7 @@ import { authMiddleware, type JWTPayload } from '../lib/auth';
 import { buildMemoryContext, streamHermes } from '../lib/hermes';
 import { ARC } from '../lib/arc-config';
 import { fetchUrlViaFirecrawl } from '../lib/firecrawl';
+import { sendServerError } from '../lib/http-errors';
 
 const router = Router();
 
@@ -100,9 +101,11 @@ router.post('/analyze', authMiddleware, async (req, res) => {
     });
   } catch (error: any) {
     if (!res.headersSent) {
-      return res.status(500).json({ error: error?.message ?? 'extension analyze failed' });
+      return sendServerError(res, 'extension/analyze', error, 'extension analyze failed');
     }
-    res.write(`data: ${JSON.stringify({ error: error?.message ?? 'extension analyze failed' })}\n\n`);
+    // Headers already sent (SSE): log the detail, emit only a generic message.
+    console.warn('[extension/analyze]', error instanceof Error ? error.message : String(error));
+    res.write(`data: ${JSON.stringify({ error: 'extension analyze failed' })}\n\n`);
     res.end();
   }
 });

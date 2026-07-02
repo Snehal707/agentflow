@@ -5,6 +5,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
+import { toClientMessage } from '../../lib/http-errors';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { ARC } from '../../lib/arc-config';
 import { adminDb } from '../../db/client';
@@ -73,7 +74,7 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
     }
     next();
   } catch (error) {
-    res.status(500).json({ error: toMessage(error) });
+    res.status(500).json({ error: toClientMessage('swap', error) });
   }
 };
 
@@ -512,7 +513,7 @@ app.post(
     } catch (error) {
       return res.status(500).json({
         success: false,
-        error: toMessage(error),
+        error: toClientMessage('swap', error),
       });
     }
   },

@@ -5,6 +5,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
+import { toClientMessage } from '../../lib/http-errors';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
 import { analyzeAttachmentForChat } from '../../lib/mediaAgentUtils';
@@ -163,7 +164,7 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
     }
     next();
   } catch (error) {
-    res.status(500).json({ error: toMessage(error) });
+    res.status(500).json({ error: toClientMessage('vision', error) });
   }
 };
 
@@ -348,7 +349,7 @@ app.post(
       await recordVisionReputation(20);
       return res.status(500).json({
         success: false,
-        error: toMessage(error),
+        error: toClientMessage('vision', error),
       });
     }
   },

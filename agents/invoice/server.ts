@@ -8,6 +8,7 @@ import { fetchResendAttachmentDownloadUrl } from '../../lib/resend-inbound';
 import { runInvoicePipeline, type InvoiceParseInput } from './pipeline';
 import type { NormalizedInvoice } from '../../lib/invoice-types';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
+import { sendServerError } from '../../lib/http-errors';
 import { resolveAgentRunUrl, runInvoiceVendorResearchFollowup } from '../../lib/a2a-followups';
 import { getFacilitatorBaseUrl } from '../../lib/facilitator-url';
 import type { RunInvoicePipelineResult } from './pipeline';
@@ -58,10 +59,6 @@ function scheduleInvoiceVendorResearchIfEligible(result: RunInvoicePipelineResul
       }
     })();
   });
-}
-
-function toMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 app.get('/health', (_req, res) => {
@@ -139,7 +136,7 @@ app.post(
       scheduleInvoiceVendorResearchIfEligible(result);
       return res.json(result);
     } catch (err) {
-      return res.status(500).json({ error: toMessage(err) });
+      return sendServerError(res, 'invoice-agent', err, 'Request failed');
     }
   },
 );
@@ -203,7 +200,7 @@ app.post(
       scheduleInvoiceVendorResearchIfEligible(result);
       return res.json(result);
     } catch (err) {
-      return res.status(500).json({ error: toMessage(err) });
+      return sendServerError(res, 'invoice-agent', err, 'Request failed');
     }
   },
 );

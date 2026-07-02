@@ -5,6 +5,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
+import { toClientMessage } from '../../lib/http-errors';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { ARC } from '../../lib/arc-config';
 import { getOrCreateUserAgentWallet } from '../../lib/dcw';
@@ -100,7 +101,7 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
     }
     next();
   } catch (error) {
-    res.status(500).json({ error: toMessage(error) });
+    res.status(500).json({ error: toClientMessage('vault', error) });
   }
 };
 
@@ -361,7 +362,7 @@ app.post('/run', (req: Request, res: Response, next: NextFunction) => {
           },
         });
       } catch (error) {
-        return res.status(502).json({ success: false, error: toMessage(error) });
+        return res.status(502).json({ success: false, error: toClientMessage('vault', error) });
       }
     }
 
@@ -394,7 +395,7 @@ app.post('/run', (req: Request, res: Response, next: NextFunction) => {
         },
       });
     } catch (error) {
-      return res.status(502).json({ success: false, error: toMessage(error) });
+      return res.status(502).json({ success: false, error: toClientMessage('vault', error) });
     }
   } catch (error) {
     console.error('[vault.handler.error]', {
@@ -418,6 +419,3 @@ app.listen(port, () => {
   console.log(`Vault agent running on :${port}`);
 });
 
-function toMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}

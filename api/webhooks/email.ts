@@ -65,7 +65,13 @@ router.post(
 
     let payload: { type?: string; data?: ResendInboundData };
 
-    const skipVerify = process.env.SKIP_WEBHOOK_VERIFY === 'true';
+    // Local-dev convenience only. Signature verification is NEVER skippable in
+    // production, even if SKIP_WEBHOOK_VERIFY leaks into the prod environment.
+    const skipVerify =
+      process.env.SKIP_WEBHOOK_VERIFY === 'true' && process.env.NODE_ENV !== 'production';
+    if (process.env.SKIP_WEBHOOK_VERIFY === 'true' && process.env.NODE_ENV === 'production') {
+      console.warn('[webhooks/email] SKIP_WEBHOOK_VERIFY ignored in production');
+    }
     const secret =
       process.env.RESEND_WEBHOOK_SECRET?.trim() ||
       process.env.RESEND_INBOUND_SIGNING_SECRET?.trim();
@@ -121,7 +127,7 @@ router.post(
       }
     } catch (e) {
       console.error('[webhooks/email] attachment fetch failed', e);
-      return res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+      return res.status(500).json({ error: 'Attachment processing failed' });
     }
 
     if (!resolved.length) {
@@ -139,7 +145,7 @@ router.post(
       return res.status(200).json({ ok: true, result });
     } catch (e) {
       console.error('[webhooks/email] pipeline failed', e);
-      return res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+      return res.status(500).json({ error: 'Invoice processing failed' });
     }
   },
 );

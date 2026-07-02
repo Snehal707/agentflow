@@ -47,6 +47,8 @@ import {
 import { getFacilitatorBaseUrl } from '../lib/facilitator-url';
 import { resolveAgentPrivateKey } from '../lib/agentPrivateKey';
 import { userDataDbForRequest } from '../lib/user-scoped-db';
+import { matchesBrainInternalKey } from '../lib/internal-key';
+import { sendServerError } from '../lib/http-errors';
 
 const ARC_USDC = '0x3600000000000000000000000000000000000000' as const;
 
@@ -171,7 +173,7 @@ router.get('/name/check/:name', async (req, res) => {
     const registrationFeeUsdc = Number(feeWei) / 1e6;
     return res.json({ available, name: display, registrationFeeUsdc });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'name check failed' });
+    return sendServerError(res, 'pay/name-check', e, 'name check failed');
   }
 });
 
@@ -183,7 +185,7 @@ router.get('/name/resolve/:name', async (req, res) => {
     }
     return res.json({ address: resolved });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'resolve failed' });
+    return sendServerError(res, 'pay/resolve', e, 'resolve failed');
   }
 });
 
@@ -228,9 +230,7 @@ router.post('/name/register', authMiddleware, async (req, res) => {
     }
     const approveDone = await waitForTransaction(approveId, 'agentpay-registry-approve');
     if (approveDone.state !== 'COMPLETE') {
-      return res.status(500).json({
-        error: approveDone.errorReason || 'USDC approve failed',
-      });
+      return sendServerError(res, 'pay/registry-approve', approveDone.errorReason, 'USDC approve failed');
     }
 
     const regTx = await executeTransaction({
@@ -247,14 +247,12 @@ router.post('/name/register', authMiddleware, async (req, res) => {
     }
     const regDone = await waitForTransaction(regId, 'agentpay-registry-register');
     if (regDone.state !== 'COMPLETE' || !regDone.txHash) {
-      return res.status(500).json({
-        error: regDone.errorReason || 'Register failed',
-      });
+      return sendServerError(res, 'pay/name-register', regDone.errorReason, 'Register failed');
     }
 
     return res.json({ txHash: regDone.txHash, name: `${clean}.arc` });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'register failed' });
+    return sendServerError(res, 'pay/name-register', e, 'register failed');
   }
 });
 
@@ -270,7 +268,7 @@ router.get('/name/my', authMiddleware, async (req, res) => {
     );
     return res.json(registered);
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'my name failed' });
+    return sendServerError(res, 'pay/name-my', e, 'my name failed');
   }
 });
 
@@ -314,9 +312,7 @@ router.post('/name/renew', authMiddleware, async (req, res) => {
     }
     const approveDone = await waitForTransaction(approveId, 'agentpay-registry-renew-approve');
     if (approveDone.state !== 'COMPLETE') {
-      return res.status(500).json({
-        error: approveDone.errorReason || 'USDC approve failed',
-      });
+      return sendServerError(res, 'pay/registry-approve', approveDone.errorReason, 'USDC approve failed');
     }
 
     const renewTx = await executeTransaction({
@@ -333,9 +329,7 @@ router.post('/name/renew', authMiddleware, async (req, res) => {
     }
     const renewDone = await waitForTransaction(renewId, 'agentpay-registry-renew');
     if (renewDone.state !== 'COMPLETE' || !renewDone.txHash) {
-      return res.status(500).json({
-        error: renewDone.errorReason || 'Renew failed',
-      });
+      return sendServerError(res, 'pay/name-renew', renewDone.errorReason, 'Renew failed');
     }
 
     const rawName = await getOwnerRegisteredName(getAddress(ua.address as `0x${string}`));
@@ -348,7 +342,7 @@ router.post('/name/renew', authMiddleware, async (req, res) => {
     }
     return res.json({ txHash: renewDone.txHash, newExpiry });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'renew failed' });
+    return sendServerError(res, 'pay/name-renew', e, 'renew failed');
   }
 });
 
@@ -379,11 +373,11 @@ router.put('/name/dcw', authMiddleware, async (req, res) => {
     }
     const done = await waitForTransaction(txId, 'agentpay-registry-update-dcw');
     if (done.state !== 'COMPLETE' || !done.txHash) {
-      return res.status(500).json({ error: done.errorReason || 'updateDCW failed' });
+      return sendServerError(res, 'pay/name-dcw', done.errorReason, 'updateDCW failed');
     }
     return res.json({ txHash: done.txHash });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'update dcw failed' });
+    return sendServerError(res, 'pay/name-dcw', e, 'update dcw failed');
   }
 });
 
@@ -398,7 +392,7 @@ router.get('/context', authMiddleware, async (req, res) => {
       .eq('wallet_address', w)
       .maybeSingle();
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
     const chainArc = getAgentPayRegistryAddress()
       ? await readRegisteredArcNameForOwner(userAgentWalletAddress).catch(() => ({
@@ -414,7 +408,7 @@ router.get('/context', authMiddleware, async (req, res) => {
       chain_arc_expires_at: chainArc.expiresAt,
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'context failed' });
+    return sendServerError(res, 'pay/context', e, 'context failed');
   }
 });
 
@@ -456,7 +450,7 @@ router.post('/send', authMiddleware, executionGuardMiddleware, async (req, res) 
     if (typeof msg === 'string' && msg.includes('Agent wallet not ready')) {
       return res.status(400).json({ error: msg });
     }
-    return res.status(500).json({ error: msg });
+    return sendServerError(res, 'pay/send', e, 'send failed');
   }
 });
 
@@ -560,9 +554,7 @@ router.post('/brain/execute', authMiddleware, executionGuardMiddleware, async (r
       remark: pending.remark || undefined,
     });
   } catch (e: any) {
-    return res.status(500).json({
-      error: e instanceof Error ? e.message : e?.message ?? 'Payment failed',
-    });
+    return sendServerError(res, 'pay/brain-execute', e, 'Payment failed');
   }
 });
 
@@ -660,7 +652,7 @@ router.post('/schedule/brain/execute', authMiddleware, async (req, res) => {
     if (typeof msg === 'string' && msg.includes('not registered on AgentPay')) {
       return res.status(400).json({ error: msg });
     }
-    return res.status(500).json({ error: msg });
+    return sendServerError(res, 'pay/schedule-brain-execute', e, 'schedule execute failed');
   }
 });
 
@@ -703,7 +695,7 @@ async function handleCreatePaymentRequest(
       .single();
 
     if (error) {
-      res.status(500).json({ error: error.message });
+      sendServerError(res, 'pay/create-request', error, 'Request failed');
       return;
     }
 
@@ -714,7 +706,7 @@ async function handleCreatePaymentRequest(
       res.status(400).json({ error: msg });
       return;
     }
-    res.status(500).json({ error: msg });
+    sendServerError(res, 'pay/create-request', e, 'request failed');
   }
 }
 
@@ -785,7 +777,7 @@ async function handleSchedulePost(
       res.status(400).json({ error: msg });
       return;
     }
-    res.status(500).json({ error: msg });
+    sendServerError(res, 'pay/schedule-post', e, 'schedule failed');
   }
 }
 
@@ -798,14 +790,12 @@ async function handleScheduleList(
     const rows = await getScheduledPayments(payerWallet);
     res.json({ schedules: rows });
   } catch (e: any) {
-    res.status(500).json({ error: e?.message ?? 'list failed' });
+    sendServerError(res, 'pay/schedule-list', e, 'list failed');
   }
 }
 
 router.post('/request', (req, res) => {
-  const internalKey = String(req.headers['x-agentflow-brain-internal'] ?? '').trim();
-  const expected = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-  if (expected && internalKey === expected) {
+  if (matchesBrainInternalKey(req.headers['x-agentflow-brain-internal'] as string | undefined)) {
     const walletAddress = String(req.body?.walletAddress ?? '').trim();
     if (!walletAddress || !looksLikeAddress(walletAddress)) {
       res.status(400).json({ error: 'walletAddress is required' });
@@ -834,9 +824,7 @@ router.post('/request', (req, res) => {
 });
 
 router.post('/schedule', (req, res) => {
-  const internalKey = String(req.headers['x-agentflow-brain-internal'] ?? '').trim();
-  const expected = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-  if (expected && internalKey === expected) {
+  if (matchesBrainInternalKey(req.headers['x-agentflow-brain-internal'] as string | undefined)) {
     const walletAddress = String(req.body?.walletAddress ?? '').trim();
     if (!walletAddress || !looksLikeAddress(walletAddress)) {
       res.status(400).json({ error: 'walletAddress is required' });
@@ -876,9 +864,7 @@ router.post('/schedule', (req, res) => {
 });
 
 router.get('/schedule', (req, res) => {
-  const internalKey = String(req.headers['x-agentflow-brain-internal'] ?? '').trim();
-  const expected = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-  if (expected && internalKey === expected) {
+  if (matchesBrainInternalKey(req.headers['x-agentflow-brain-internal'] as string | undefined)) {
     const walletAddress = String(req.query.walletAddress ?? '').trim();
     if (!walletAddress || !looksLikeAddress(walletAddress)) {
       res.status(400).json({ error: 'walletAddress query param is required' });
@@ -907,14 +893,12 @@ router.get('/schedule', (req, res) => {
 });
 
 router.delete('/schedule/:id', (req, res) => {
-  const internalKey = String(req.headers['x-agentflow-brain-internal'] ?? '').trim();
-  const expected = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
   const id = String(req.params.id ?? '').trim();
   if (!id) {
     res.status(400).json({ error: 'id is required' });
     return;
   }
-  if (expected && internalKey === expected) {
+  if (matchesBrainInternalKey(req.headers['x-agentflow-brain-internal'] as string | undefined)) {
     const walletAddress = String(req.query.walletAddress ?? '').trim();
     if (!walletAddress || !looksLikeAddress(walletAddress)) {
       res.status(400).json({ error: 'walletAddress query param is required' });
@@ -933,8 +917,11 @@ router.delete('/schedule/:id', (req, res) => {
         res.json({ ok: true });
       } catch (e: any) {
         const message = e?.message ?? 'cancel failed';
-        const status = /not found|already cancelled/i.test(message) ? 404 : 500;
-        res.status(status).json({ error: message });
+        if (/not found|already cancelled/i.test(message)) {
+          res.status(404).json({ error: message });
+        } else {
+          sendServerError(res, 'pay/schedule-cancel', e, 'cancel failed');
+        }
       }
     })();
     return;
@@ -964,8 +951,11 @@ router.delete('/schedule/:id', (req, res) => {
         res.json({ ok: true });
       } catch (e: any) {
         const message = e?.message ?? 'cancel failed';
-        const status = /not found|already cancelled/i.test(message) ? 404 : 500;
-        res.status(status).json({ error: message });
+        if (/not found|already cancelled/i.test(message)) {
+          res.status(404).json({ error: message });
+        } else {
+          sendServerError(res, 'pay/schedule-cancel', e, 'cancel failed');
+        }
       }
     })();
   });
@@ -1002,7 +992,7 @@ router.get('/requests', authMiddleware, async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (inErr) {
-      return res.status(500).json({ error: inErr.message });
+      return sendServerError(res, 'pay/requests', inErr, 'requests failed');
     }
 
     // Outgoing: requests this user initiated. `initiated_by` is stored as the
@@ -1018,7 +1008,7 @@ router.get('/requests', authMiddleware, async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (outErr) {
-      return res.status(500).json({ error: outErr.message });
+      return sendServerError(res, 'pay/requests', outErr, 'requests failed');
     }
 
     const authLower = authAddr.toLowerCase();
@@ -1036,7 +1026,7 @@ router.get('/requests', authMiddleware, async (req, res) => {
 
     return res.json({ incoming: inc, outgoing: out });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'requests failed' });
+    return sendServerError(res, 'pay/requests', e, 'requests failed');
   }
 });
 
@@ -1112,7 +1102,7 @@ router.post('/approve/:requestId', authMiddleware, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
     if (!row) {
       return res.status(404).json({ error: 'Request not found' });
@@ -1171,7 +1161,7 @@ router.post('/approve/:requestId', authMiddleware, async (req, res) => {
 
     if (upErr) {
       await guard.release();
-      return res.status(500).json({ error: upErr.message });
+      return sendServerError(res, 'pay', upErr, 'Request failed');
     }
 
     void finalizePaymentRequestApproval({
@@ -1185,7 +1175,7 @@ router.post('/approve/:requestId', authMiddleware, async (req, res) => {
 
     return res.json({ accepted: true, status: 'processing' });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'approve failed' });
+    return sendServerError(res, 'pay/approve', e, 'approve failed');
   }
 });
 
@@ -1201,7 +1191,7 @@ router.post('/decline/:requestId', authMiddleware, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
     if (!row) {
       return res.status(404).json({ error: 'Request not found' });
@@ -1233,12 +1223,12 @@ router.post('/decline/:requestId', authMiddleware, async (req, res) => {
       .eq('id', requestId);
 
     if (upErr) {
-      return res.status(500).json({ error: upErr.message });
+      return sendServerError(res, 'pay', upErr, 'Request failed');
     }
 
     return res.json({ success: true });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'decline failed' });
+    return sendServerError(res, 'pay/decline', e, 'decline failed');
   }
 });
 
@@ -1281,7 +1271,7 @@ router.get('/history', authMiddleware, async (req, res) => {
     const { data, error } = await q;
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
 
     const txs = (data ?? []).map((row: any) => ({
@@ -1292,7 +1282,7 @@ router.get('/history', authMiddleware, async (req, res) => {
 
     return res.json({ transactions: txs });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'history failed' });
+    return sendServerError(res, 'pay/history', e, 'history failed');
   }
 });
 
@@ -1321,7 +1311,7 @@ router.post('/export', authMiddleware, async (req, res) => {
       .limit(5000);
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
 
     const rows = (data ?? []).map((row: any) => {
@@ -1344,7 +1334,7 @@ router.post('/export', authMiddleware, async (req, res) => {
     const buf = await rowsToXlsxBuffer(rows.length ? rows : [{ Date: '', Note: 'No rows' }]);
     sendBinaryXlsxResponse(res, buf);
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'export failed' });
+    return sendServerError(res, 'pay/export', e, 'export failed');
   }
 });
 
@@ -1406,7 +1396,7 @@ router.get('/invoices', authMiddleware, async (req, res) => {
       .select('id, invoice_number, vendor_name, vendor_handle, amount, currency, status, arc_tx_id, line_items, created_at, settled_at')
       .or(sentFilter)
       .order('created_at', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return sendServerError(res, 'pay/invoices', error, 'invoices fetch failed');
 
     // Received: invoice-linked payment requests where this user is the payer.
     // Match both EOA and DCW since .arc resolution writes DCW into from_wallet.
@@ -1425,11 +1415,11 @@ router.get('/invoices', authMiddleware, async (req, res) => {
       .not('invoice_id', 'is', null)
       .order('created_at', { ascending: false })
       .limit(50);
-    if (recErr) return res.status(500).json({ error: recErr.message });
+    if (recErr) return sendServerError(res, 'pay/invoices', recErr, 'invoices fetch failed');
 
     return res.json({ sent: sent ?? [], received: received ?? [] });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'invoices fetch failed' });
+    return sendServerError(res, 'pay/invoices', e, 'invoices fetch failed');
   }
 });
 
@@ -1469,7 +1459,7 @@ router.get('/contacts/resolve/:name', authMiddleware, async (req, res) => {
       .ilike('name', raw.toLowerCase())
       .maybeSingle();
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
     if (!data?.address) {
       return res.status(404).json({ error: 'Contact not found' });
@@ -1480,7 +1470,7 @@ router.get('/contacts/resolve/:name', authMiddleware, async (req, res) => {
       label: data.label != null ? String(data.label) : null,
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'resolve failed' });
+    return sendServerError(res, 'pay/resolve', e, 'resolve failed');
   }
 });
 
@@ -1494,11 +1484,11 @@ router.get('/contacts', authMiddleware, async (req, res) => {
       .eq('wallet_address', authAddr)
       .order('name', { ascending: true });
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
     return res.json({ contacts: data ?? [] });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'contacts list failed' });
+    return sendServerError(res, 'pay/contacts', e, 'contacts list failed');
   }
 });
 
@@ -1534,11 +1524,11 @@ router.post('/contacts', authMiddleware, async (req, res) => {
       if (/duplicate|unique/i.test(error.message)) {
         return res.status(409).json({ error: 'A contact with this name already exists' });
       }
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
     return res.status(201).json(data);
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'contact create failed' });
+    return sendServerError(res, 'pay/contact-create', e, 'contact create failed');
   }
 });
 
@@ -1558,7 +1548,7 @@ router.put('/contacts/:id', authMiddleware, async (req, res) => {
       .eq('wallet_address', authAddr)
       .maybeSingle();
     if (exErr) {
-      return res.status(500).json({ error: exErr.message });
+      return sendServerError(res, 'pay/contacts-export', exErr, 'export failed');
     }
     if (!existing) {
       return res.status(404).json({ error: 'Contact not found' });
@@ -1599,11 +1589,11 @@ router.put('/contacts/:id', authMiddleware, async (req, res) => {
       .select()
       .single();
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
     return res.json(data);
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'contact update failed' });
+    return sendServerError(res, 'pay/contact-update', e, 'contact update failed');
   }
 });
 
@@ -1622,14 +1612,14 @@ router.delete('/contacts/:id', authMiddleware, async (req, res) => {
       .eq('wallet_address', authAddr)
       .select('id');
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'pay', error, 'Request failed');
     }
     if (!deletedRows?.length) {
       return res.status(404).json({ error: 'Contact not found' });
     }
     return res.json({ ok: true });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'contact delete failed' });
+    return sendServerError(res, 'pay/contact-delete', e, 'contact delete failed');
   }
 });
 
@@ -1785,7 +1775,7 @@ router.post('/record-external', async (req, res) => {
       if (/duplicate|unique/i.test(insErr.message)) {
         return res.json({ ok: true, recorded: false });
       }
-      return res.status(500).json({ error: insErr.message });
+      return sendServerError(res, 'pay/record-external', insErr, 'record-external failed');
     }
 
     return res.json({
@@ -1795,7 +1785,7 @@ router.post('/record-external', async (req, res) => {
       explorerLink: explorerLinkTx(txHash),
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'record-external failed' });
+    return sendServerError(res, 'pay/record-external', e, 'record-external failed');
   }
 });
 
@@ -1813,7 +1803,7 @@ router.get('/:handle', async (req, res) => {
     if (!address) return res.status(404).json({ error: 'Not found' });
     return res.json({ handle: `${raw}.arc`, walletAddress: address, business: null });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'Profile load failed' });
+    return sendServerError(res, 'pay/profile', e, 'Profile load failed');
   }
 });
 

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { adminDb } from '../db/client';
 import { fetchOnChainReputationByAgentIds } from '../lib/reputation';
 import { CORE_AGENT_SPECS, type CoreAgentSlug } from '../lib/coreAgentSpecs';
+import { sendServerError } from '../lib/http-errors';
 
 export { CORE_AGENT_SPECS };
 
@@ -73,7 +74,7 @@ router.get('/agents', async (_req, res) => {
       agents: await applyOnChainReputation(merged),
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'agent store list failed' });
+    return sendServerError(res, 'agent-store/list', e, 'agent store list failed');
   }
 });
 
@@ -101,7 +102,7 @@ router.get('/agent/:slug', async (req, res) => {
 
     return res.json({ agent });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'agent lookup failed' });
+    return sendServerError(res, 'agent-store/lookup', e, 'agent lookup failed');
   }
 });
 
@@ -180,7 +181,7 @@ router.get('/agent/:slug/stats', async (req, res) => {
       },
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'agent stats lookup failed' });
+    return sendServerError(res, 'agent-store/stats', e, 'agent stats lookup failed');
   }
 });
 
@@ -509,7 +510,7 @@ router.get('/leaderboard', async (_req, res) => {
     await redis.set(cacheKey, JSON.stringify(leaderboard), 'EX', 300);
     return res.json(leaderboard);
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'leaderboard failed' });
+    return sendServerError(res, 'agent-store/leaderboard', e, 'leaderboard failed');
   }
 });
 

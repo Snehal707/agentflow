@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useAccount, useSignMessage } from "wagmi";
-import { buildAuthMessage } from "@/lib/authMessage";
 import {
   authSessionEventName,
   authHeadersForWallet,
@@ -127,7 +126,23 @@ export function useAgentJwt() {
     setLoading(true);
     setError(null);
     try {
-      const message = buildAuthMessage(address);
+      // Step 1: fetch a server-issued, single-use challenge. The message we sign
+      // must come from the server (nonce + domain bound) so it can't be replayed.
+      const nonceResponse = await fetch("/api/auth/nonce", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ walletAddress: address }),
+        cache: "no-store",
+      });
+      const nonceJson = (await nonceResponse.json()) as {
+        message?: string;
+        error?: string;
+      };
+      if (!nonceResponse.ok || !nonceJson.message) {
+        throw new Error(nonceJson.error || "Could not start sign-in");
+      }
+
+      const message = nonceJson.message;
       const signature = await signMessageAsync({ message });
       const response = await fetch("/api/auth/verify-signature", {
         method: "POST",

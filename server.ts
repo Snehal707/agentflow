@@ -135,6 +135,9 @@ import {
 } from './lib/x402AttemptLedger';
 import { sendGAEvent } from './lib/gaServer';
 import { detectWalletIntent } from './lib/orchestrator';
+import { matchesBrainInternalKey } from './lib/internal-key';
+import { ipRateLimit } from './lib/ip-rate-limit';
+import { sendServerError } from './lib/http-errors';
 import authApiRouter from './api/auth';
 import accessApiRouter from './api/access';
 import walletApiRouter from './api/wallet';
@@ -148,7 +151,7 @@ import portfolioApiRouter from './api/portfolio';
 import settingsApiRouter from './api/settings';
 import telegramApiRouter from './api/telegram';
 import emailWebhookRouter from './api/webhooks/email';
-import { authMiddleware, generateJWT, verifyJWT, type JWTPayload } from './lib/auth';
+import { authMiddleware, generateJWT, logJwtSecretStatus, verifyJWT, type JWTPayload } from './lib/auth';
 import { getOrCreateUserAgentWallet } from './lib/dcw';
 import { loadAgentOwnerWallet } from './lib/agent-owner-wallet';
 import { incrementDailyUsageCap, readDailyUsageCap } from './lib/usageCaps';
@@ -509,9 +512,7 @@ const INVOICE_AGENT_BASE_URL =
  * walletAddress is taken from req.body.walletAddress in that case.
  */
 function internalOrAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-  const sentKey = (req.headers['x-agentflow-brain-internal'] as string | undefined)?.trim();
-  if (internalKey && sentKey === internalKey) {
+  if (matchesBrainInternalKey(req.headers['x-agentflow-brain-internal'] as string | undefined)) {
     const walletAddress = String(req.body?.walletAddress ?? '').trim();
     (req as any).auth = {
       walletAddress,
@@ -553,18 +554,36 @@ function isLoopbackAddress(value: string | undefined): boolean {
   );
 }
 
+function hasForwardingHeaders(req: Request): boolean {
+  return Boolean(
+    req.headers['x-forwarded-for'] ||
+      req.headers['x-forwarded-host'] ||
+      req.headers['forwarded'] ||
+      req.headers['x-real-ip'],
+  );
+}
+
 function isLocalAdminBypassAllowed(req: Request): boolean {
   if (!/^true$/i.test(String(process.env.INTERNAL_ADMIN_BYPASS_LOCAL ?? '').trim())) {
     return false;
   }
 
-  const forwardedFor = String(req.headers['x-forwarded-for'] ?? '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
-  const remoteIp = req.ip || req.socket.remoteAddress || '';
+  // Local-dev convenience ONLY. Never honor the bypass in production: a
+  // same-host reverse proxy (e.g. the Next.js frontend) can make public
+  // requests arrive on loopback and impersonate a local admin.
+  if (process.env.NODE_ENV === 'production') {
+    return false;
+  }
 
-  return [remoteIp, ...forwardedFor].every((value) => isLoopbackAddress(value));
+  // Any forwarding header means the request traversed a proxy rather than
+  // coming straight from a local tool — refuse the bypass regardless of the
+  // apparent remote IP.
+  if (hasForwardingHeaders(req)) {
+    return false;
+  }
+
+  const remoteIp = req.ip || req.socket.remoteAddress || '';
+  return isLoopbackAddress(remoteIp);
 }
 
 function adminAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
@@ -1134,6 +1153,7 @@ async function tryBuildWalletIntentReply(input: {
   walletAddress?: Address;
   signature?: string;
   signatureMessage?: string;
+  bearerToken?: string;
 }): Promise<string | null> {
   if (!input.walletAddress) {
     return null;
@@ -1152,18 +1172,17 @@ async function tryBuildWalletIntentReply(input: {
 
     pendingEmergencyWithdrawConfirmations.delete(confirmationKey);
 
-    if (!input.signature || !input.signatureMessage) {
-      return 'Confirmation received. To complete emergency withdrawal I still need a wallet-signed emergency withdrawal message, because this flow verifies wallet ownership before moving funds.';
+    if (!input.bearerToken) {
+      return 'Confirmation received, but your AgentFlow session has expired. Please sign in with this wallet again, then retry the emergency withdrawal.';
     }
 
     const response = await fetch(`http://127.0.0.1:${PUBLIC_PORT}/api/wallet/emergency-withdraw`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        walletAddress: normalizedWallet,
-        signature: input.signature,
-        message: input.signatureMessage,
-      }),
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: input.bearerToken,
+      },
+      body: JSON.stringify({}),
     });
     const json = (await response.json().catch(() => ({}))) as {
       dcwTxHash?: string;
@@ -9193,11 +9212,19 @@ function createRunId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** Extra origins (VPS, prod domain) — must match `Origin` header exactly. */
+/**
+ * Explicit origin allowlist (VPS, prod domain) — must match `Origin` header
+ * exactly. Extend for new deploys via CORS_ALLOWED_ORIGINS (comma-separated)
+ * instead of editing code.
+ */
 const CORS_EXTRA_ALLOWED_ORIGINS = new Set([
   'http://178.104.240.191',
   'https://agentflow.one',
   'http://agentflow.one',
+  ...String(process.env.CORS_ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
 ]);
 
 function isAllowedOrigin(origin: string | undefined): boolean {
@@ -9206,9 +9233,13 @@ function isAllowedOrigin(origin: string | undefined): boolean {
   try {
     const url = new URL(origin);
     const host = url.hostname.toLowerCase();
-    if (host === 'localhost' || host === '127.0.0.1') return true;
-    if (host.endsWith('.vercel.app')) return true;
-    if (url.protocol === 'https:') return true;
+    // Local development only.
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+    // Vercel preview/production deployments of the AgentFlow frontend.
+    // NOTE: previously ANY https origin was allowed — that let any website on
+    // the internet script this API with a stolen token. Now restricted to the
+    // frontend's own hosting plus the explicit allowlist above.
+    if (url.protocol === 'https:' && host.endsWith('.vercel.app')) return true;
     return false;
   } catch {
     return false;
@@ -9677,9 +9708,7 @@ function createAgentApp(
       next();
       return;
     }
-    const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-    const reqKey = (req.headers['x-agentflow-brain-internal'] as string | undefined)?.trim();
-    if (internalKey && reqKey === internalKey) {
+    if (matchesBrainInternalKey(req.headers['x-agentflow-brain-internal'] as string | undefined)) {
       next();
       return;
     }
@@ -9698,7 +9727,9 @@ function createPublicApp(): express.Express {
   app.use('/api/webhooks/email', emailWebhookRouter);
   app.use(express.json({ limit: AGENT_JSON_LIMIT }));
   app.use(corsMiddleware);
-  app.use('/api/auth', authApiRouter);
+  // Per-IP throttle on the unauthenticated auth surface (login + nonce minting)
+  // to blunt brute-force and nonce-spam. Generous enough for normal sign-in.
+  app.use('/api/auth', ipRateLimit({ windowSec: 60, max: 30, prefix: 'auth' }), authApiRouter);
   app.use('/api/access', accessApiRouter);
   app.use('/api/wallet', walletApiRouter);
   app.use('/api/telegram', telegramApiRouter);
@@ -9789,7 +9820,7 @@ function createPublicApp(): express.Express {
       }
       return res.json(job);
     } catch (e: any) {
-      return res.status(500).json({ error: e?.message ?? 'status failed' });
+      return sendServerError(res, 'server/status', e, 'status failed');
     }
   });
 
@@ -9798,7 +9829,7 @@ function createPublicApp(): express.Express {
       const stats = await getQueueStats();
       return res.json(stats);
     } catch (e: any) {
-      return res.status(500).json({ error: e?.message ?? 'queue stats failed' });
+      return sendServerError(res, 'server/queue-stats', e, 'queue stats failed');
     }
   });
 
@@ -9827,11 +9858,11 @@ function createPublicApp(): express.Express {
 
       const { data: invoices, error } = await query;
       if (error) {
-        return res.status(500).json({ error: error.message });
+        return sendServerError(res, 'server/invoice-status', error, 'invoice status failed');
       }
       return res.json({ invoices: invoices ?? [] });
     } catch (e: any) {
-      return res.status(500).json({ error: e?.message ?? 'invoice status failed' });
+      return sendServerError(res, 'server/invoice-status', e, 'invoice status failed');
     }
   });
 
@@ -9854,8 +9885,8 @@ function createPublicApp(): express.Express {
       const data = await agentRes.json().catch(() => ({ action: 'error', message: 'Invalid response from schedule agent' }));
       res.status(agentRes.ok ? 200 : agentRes.status).json(data);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(503).json({ action: 'error', message: `Schedule agent unavailable: ${msg}` });
+      console.warn('[schedule-proxy]', err instanceof Error ? err.message : String(err));
+      res.status(503).json({ action: 'error', message: 'Schedule agent unavailable' });
     }
   });
 
@@ -9884,8 +9915,8 @@ function createPublicApp(): express.Express {
         },
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(503).json({ success: false, message: `Schedule agent unavailable: ${msg}` });
+      console.warn('[schedule-proxy]', err instanceof Error ? err.message : String(err));
+      res.status(503).json({ success: false, message: 'Schedule agent unavailable' });
     }
   });
 
@@ -9908,8 +9939,8 @@ function createPublicApp(): express.Express {
       const data = await agentRes.json().catch(() => ({ action: 'error', message: 'Invalid response from split agent' }));
       res.status(agentRes.ok ? 200 : agentRes.status).json(data);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(503).json({ action: 'error', message: `Split agent unavailable: ${msg}` });
+      console.warn('[split-proxy]', err instanceof Error ? err.message : String(err));
+      res.status(503).json({ action: 'error', message: 'Split agent unavailable' });
     }
   });
 
@@ -9958,8 +9989,8 @@ function createPublicApp(): express.Express {
         },
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(503).json({ action: 'error', message: `Split agent unavailable: ${msg}` });
+      console.warn('[split-proxy]', err instanceof Error ? err.message : String(err));
+      res.status(503).json({ action: 'error', message: 'Split agent unavailable' });
     }
   });
 
@@ -9996,8 +10027,8 @@ function createPublicApp(): express.Express {
       const data = await agentRes.json().catch(() => ({ action: 'error', message: 'Invalid response from batch agent' }));
       res.status(agentRes.ok ? 200 : agentRes.status).json(data);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(503).json({ action: 'error', message: `Batch agent unavailable: ${msg}` });
+      console.warn('[batch-proxy]', err instanceof Error ? err.message : String(err));
+      res.status(503).json({ action: 'error', message: 'Batch agent unavailable' });
     }
   });
 
@@ -10042,8 +10073,8 @@ function createPublicApp(): express.Express {
         },
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(503).json({ action: 'error', message: `Batch agent unavailable: ${msg}` });
+      console.warn('[batch-proxy]', err instanceof Error ? err.message : String(err));
+      res.status(503).json({ action: 'error', message: 'Batch agent unavailable' });
     }
   });
 
@@ -10143,8 +10174,9 @@ function createPublicApp(): express.Express {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      console.warn('[invoice-create]', msg);
       await getRedis().del(`invoice:pending:${sessionId}`).catch(() => null);
-      res.status(500).json({ success: false, message: `Invoice creation failed: ${msg}` });
+      res.status(500).json({ success: false, message: 'Invoice creation failed' });
     }
   });
 
@@ -10236,7 +10268,7 @@ function createPublicApp(): express.Express {
           existingRequestId: error.existingRequestId || null,
         });
       }
-      return res.status(500).json({ error: getErrorMessage(error) });
+      return sendServerError(res, 'server', error, 'Request failed');
     }
   });
 
@@ -10256,7 +10288,7 @@ function createPublicApp(): express.Express {
       }
       return res.json({ ok: true, record });
     } catch (error) {
-      return res.status(500).json({ error: getErrorMessage(error) });
+      return sendServerError(res, 'server', error, 'Request failed');
     }
   });
 
@@ -10273,7 +10305,7 @@ function createPublicApp(): express.Express {
       }
       return res.json({ ok: true, record });
     } catch (error) {
-      return res.status(500).json({ error: getErrorMessage(error) });
+      return sendServerError(res, 'server', error, 'Request failed');
     }
   });
 
@@ -10307,7 +10339,7 @@ function createPublicApp(): express.Express {
         transcribe,
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10323,7 +10355,7 @@ function createPublicApp(): express.Express {
       const report = await buildSemanticMemoryMetricsReport();
       return res.json(report);
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10332,7 +10364,7 @@ function createPublicApp(): express.Express {
       const report = await buildSemanticMemoryMetricsReport();
       return res.json(report);
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10343,7 +10375,7 @@ function createPublicApp(): express.Express {
       const cases = await buildSemanticMemoryReviewCases(limit);
       return res.json({ cases });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10354,7 +10386,7 @@ function createPublicApp(): express.Express {
       const cases = await buildSemanticMemoryReviewCases(limit);
       return res.json({ cases });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10372,7 +10404,7 @@ function createPublicApp(): express.Express {
       await saveSemanticMemoryReviewLabel(caseId, label as any, note);
       return res.json({ ok: true });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10390,7 +10422,7 @@ function createPublicApp(): express.Express {
       await saveSemanticMemoryReviewLabel(caseId, label as any, note);
       return res.json({ ok: true });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10407,7 +10439,7 @@ function createPublicApp(): express.Express {
       );
       return res.status(200).send(JSON.stringify(dataset, null, 2));
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10424,7 +10456,7 @@ function createPublicApp(): express.Express {
       );
       return res.status(200).send(JSON.stringify(dataset, null, 2));
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10435,7 +10467,7 @@ function createPublicApp(): express.Express {
       const cases = await buildConversationReviewCases(limit);
       return res.json({ cases });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10453,7 +10485,7 @@ function createPublicApp(): express.Express {
       await saveConversationReviewLabel(caseId, label as any, note);
       return res.json({ ok: true });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10470,7 +10502,7 @@ function createPublicApp(): express.Express {
       );
       return res.status(200).send(JSON.stringify(dataset, null, 2));
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10481,7 +10513,7 @@ function createPublicApp(): express.Express {
       const entries = await loadChatFeedbackEntries(limit);
       return res.json({ entries });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10497,7 +10529,7 @@ function createPublicApp(): express.Express {
       );
       return res.status(200).send(JSON.stringify(entries, null, 2));
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10519,7 +10551,7 @@ function createPublicApp(): express.Express {
       const result = await executeTool('get_balance', {}, walletCtx, sessionId);
       return res.json({ result });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10541,7 +10573,7 @@ function createPublicApp(): express.Express {
       const result = await executeTool('get_portfolio', {}, walletCtx, sessionId);
       return res.json({ result });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10552,7 +10584,7 @@ function createPublicApp(): express.Express {
         supportedBridgeSources: listSupportedBridgeSourcesDetailed(),
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10571,7 +10603,7 @@ function createPublicApp(): express.Express {
       const rows = await fetchPayHistoryForBrain(walletAddress, limit);
       return res.json({ transactions: rows });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10609,7 +10641,7 @@ function createPublicApp(): express.Express {
       );
       return res.json({ result });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10646,7 +10678,7 @@ function createPublicApp(): express.Express {
       );
       return res.json({ result });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10657,7 +10689,7 @@ function createPublicApp(): express.Express {
           'The legacy backend bridge endpoint has been removed. Use the web app native Circle BridgeKit flow to bridge USDC to Arc.',
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10687,7 +10719,7 @@ function createPublicApp(): express.Express {
       );
       return res.json({ result });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -10712,7 +10744,7 @@ function createPublicApp(): express.Express {
       await rememberUserProfileFact(walletAddress, key, value);
       return res.json({ ok: true });
     } catch (error) {
-      return res.status(500).json({ error: getErrorMessage(error) });
+      return sendServerError(res, 'server', error, 'Request failed');
     }
   });
 
@@ -10747,7 +10779,7 @@ function createPublicApp(): express.Express {
       .eq('revoked', false);
 
     if (accessError) {
-      return res.status(500).json({ error: accessError.message });
+      return sendServerError(res, 'server/access', accessError, 'Request failed');
     }
 
     if (Number(accessCount ?? 0) === 0) {
@@ -11204,6 +11236,10 @@ function createPublicApp(): express.Express {
       signatureMessage:
         typeof req.body?.signatureMessage === 'string'
           ? req.body.signatureMessage
+          : undefined,
+      bearerToken:
+        typeof req.headers.authorization === 'string'
+          ? req.headers.authorization
           : undefined,
     });
     if (walletIntentReply) {
@@ -14651,7 +14687,7 @@ function createPublicApp(): express.Express {
         brainTelemetryFinalized = true;
       }
       if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ error: getErrorMessage(err) })}\n\n`)
+        res.write(`data: ${JSON.stringify({ error: 'Request failed' })}\n\n`)
         res.end()
       }
     }
@@ -14674,7 +14710,7 @@ function createPublicApp(): express.Express {
       console.info('[BRAIN_FEEDBACK_RECEIVED]', { event_id: eventId, feedback });
       return res.json({ ok: true });
     } catch (error) {
-      return res.status(500).json({ error: getErrorMessage(error) });
+      return sendServerError(res, 'server', error, 'Request failed');
     }
   });
 
@@ -14696,7 +14732,7 @@ function createPublicApp(): express.Express {
         chainId: CHAIN_ID,
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   };
 
@@ -14734,7 +14770,7 @@ function createPublicApp(): express.Express {
         circleWalletAddress: created.address,
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -14757,7 +14793,7 @@ function createPublicApp(): express.Express {
         circleWalletAddress: existing.address,
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -14847,7 +14883,7 @@ function createPublicApp(): express.Express {
         newBalance,
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -14877,7 +14913,7 @@ function createPublicApp(): express.Express {
         rawGatewayBalance: gatewayBalance,
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -14948,7 +14984,7 @@ function createPublicApp(): express.Express {
         },
       });
     } catch (err) {
-      return res.status(500).json({ error: getErrorMessage(err) });
+      return sendServerError(res, 'server', err, 'Request failed');
     }
   });
 
@@ -14966,9 +15002,7 @@ function createPublicApp(): express.Express {
       return res.status(404).json({ error: 'Not found' });
     }
     if (step === 'analyst' || step === 'writer') {
-      const internalKey = process.env.AGENTFLOW_BRAIN_INTERNAL_KEY?.trim();
-      const reqKey = (req.headers['x-agentflow-brain-internal'] as string | undefined)?.trim();
-      if (!internalKey || reqKey !== internalKey) {
+      if (!matchesBrainInternalKey(req.headers['x-agentflow-brain-internal'] as string | undefined)) {
         return res.status(404).json({ error: 'Not found' });
       }
     }
@@ -15818,6 +15852,7 @@ async function start(): Promise<void> {
   publicApp.listen(PUBLIC_PORT, () => {
     console.log(`[Boot] Public API listening on :${PUBLIC_PORT}`);
     console.log(`[Boot] Seller address for x402 payouts: ${sellerAddress}`);
+    logJwtSecretStatus();
     setInterval(() => {
       void processResearchQueue().catch((e) =>
         console.error('[research-queue] processor error:', e),

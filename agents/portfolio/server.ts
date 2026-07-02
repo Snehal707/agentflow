@@ -5,6 +5,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
+import { toClientMessage } from '../../lib/http-errors';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
 import { getFacilitatorBaseUrl } from '../../lib/facilitator-url';
@@ -51,7 +52,7 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
     }
     next();
   } catch (error) {
-    res.status(500).json({ error: toMessage(error) });
+    res.status(500).json({ error: toClientMessage('portfolio', error) });
   }
 };
 
@@ -179,7 +180,7 @@ app.post(
       scannedWalletAddress: portfolioWalletAddress,
     });
   } catch (error) {
-    return res.status(500).json({ success: false, error: toMessage(error) });
+    return res.status(500).json({ success: false, error: toClientMessage('portfolio', error) });
   }
   },
 );
@@ -188,6 +189,3 @@ app.listen(port, () => {
   console.log(`Portfolio agent running on :${port}`);
 });
 
-function toMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}

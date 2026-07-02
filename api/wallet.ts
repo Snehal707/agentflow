@@ -25,6 +25,7 @@ import {
 } from '../lib/gateway-balance';
 import { getArcUnifiedBalanceForDepositors } from '../lib/arc-app-kit';
 import { executionGuardMiddleware } from '../lib/execution-guard';
+import { sendServerError } from '../lib/http-errors';
 
 const router = Router();
 const ARC_USDC = '0x3600000000000000000000000000000000000000';
@@ -274,7 +275,7 @@ router.post('/create', authMiddleware, async (req, res) => {
       userAgentWalletId: wallet.wallet_id,
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'wallet create failed' });
+    return sendServerError(res, 'wallet/create', error, 'wallet create failed');
   }
 });
 
@@ -300,7 +301,7 @@ router.get('/usage', authMiddleware, async (req, res) => {
       .eq('date', dateStr);
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'wallet/usage', error, 'usage failed');
     }
 
     const agents = (rows ?? []).map((r) => ({
@@ -321,7 +322,7 @@ router.get('/usage', authMiddleware, async (req, res) => {
       remainingApprox: Math.max(0, dailyLimit - worstUsed),
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'usage failed' });
+    return sendServerError(res, 'wallet/usage', error, 'usage failed');
   }
 });
 
@@ -377,21 +378,19 @@ router.post('/withdraw', authMiddleware, executionGuardMiddleware, async (req, r
   }
 });
 
-router.post('/emergency-withdraw', async (req, res) => {
+router.post('/emergency-withdraw', authMiddleware, async (req, res) => {
   try {
-    const walletAddress = String(req.body?.walletAddress ?? '');
-    const message = String(req.body?.message ?? '');
-    const signature = String(req.body?.signature ?? '');
-    const amountUsdc = Number(req.body?.amountUsdc ?? 0);
-    const toAddress = String(req.body?.toAddress ?? walletAddress);
-
-    const result = await performWithdraw({
-      walletAddress,
-      message,
-      signature,
-      amountUsdc,
-      toAddress,
-      emergency: true,
+    const auth = (req as any).auth as JWTPayload | undefined;
+    if (!auth?.walletAddress || !isAddress(auth.walletAddress)) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    // Emergency withdrawal always sweeps ALL funds (execution wallet + Gateway)
+    // to the authenticated wallet's own EOA. The destination and amount are NOT
+    // caller-controlled: identity comes from the JWT and funds can only go back
+    // to the signer's own wallet, so a replayed/phished signature can never
+    // redirect funds to a third party.
+    const result = await performEmergencyWithdrawAll({
+      walletAddress: getAddress(auth.walletAddress),
     });
     return res.json(result);
   } catch (error: any) {
@@ -859,7 +858,7 @@ router.post('/gateway/deposit', authMiddleware, executionGuardMiddleware, async 
       ...result,
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'gateway deposit info failed' });
+    return sendServerError(res, 'wallet/gateway-deposit', error, 'gateway deposit info failed');
   }
 });
 
@@ -1147,22 +1146,8 @@ function getExplorerTxLink(txHash: string): string {
 
 async function performEmergencyWithdrawAll(input: {
   walletAddress: string;
-  message: string;
-  signature: string;
 }): Promise<Record<string, unknown>> {
   const normalizedWallet = normalizeAddressOrThrow(input.walletAddress, 'walletAddress');
-  if (!input.message || !input.signature) {
-    throw new Error('message and signature are required');
-  }
-
-  const validSig = await verifyMessage({
-    address: normalizedWallet,
-    message: input.message,
-    signature: input.signature as `0x${string}`,
-  });
-  if (!validSig) {
-    throw new Error('Invalid signature');
-  }
 
   const client = createPublicClient({ chain, transport: http(ARC.rpc) });
   const executionWallet = await getOrCreateUserAgentWallet(normalizedWallet);
@@ -1249,52 +1234,3 @@ async function performEmergencyWithdrawAll(input: {
   };
 }
 
-function installEmergencyWithdrawWrapper(): void {
-  const stack = (router as any).stack as Array<{
-    route?: {
-      path?: string;
-      methods?: Record<string, boolean>;
-      stack?: Array<{ handle?: (...args: unknown[]) => unknown }>;
-    };
-  }>;
-
-  const emergencyLayer = stack?.find(
-    (layer) => layer.route?.path === '/emergency-withdraw' && layer.route?.methods?.post,
-  );
-  const existingHandle = emergencyLayer?.route?.stack?.[0]?.handle;
-
-  if (!emergencyLayer?.route?.stack?.length || !existingHandle) {
-    return;
-  }
-
-  const currentHandle = emergencyLayer.route.stack[0].handle as any;
-  if (currentHandle?.__agentflowV3EmergencyWrapper) {
-    return;
-  }
-
-  const wrappedHandle = async (req: any, res: any, next: any) => {
-    const amountUsdc = Number(req.body?.amountUsdc ?? 0);
-    if (Number.isFinite(amountUsdc) && amountUsdc > 0) {
-      return existingHandle(req, res, next);
-    }
-
-    try {
-      const walletAddress = String(req.body?.walletAddress ?? '');
-      const message = String(req.body?.message ?? '');
-      const signature = String(req.body?.signature ?? '');
-      const result = await performEmergencyWithdrawAll({
-        walletAddress,
-        message,
-        signature,
-      });
-      return res.json(result);
-    } catch (error: any) {
-      return res.status(400).json({ error: error?.message ?? 'emergency withdraw failed' });
-    }
-  };
-
-  (wrappedHandle as any).__agentflowV3EmergencyWrapper = true;
-  emergencyLayer.route.stack[0].handle = wrappedHandle;
-}
-
-installEmergencyWithdrawWrapper();

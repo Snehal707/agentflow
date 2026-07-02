@@ -4,6 +4,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
+import { toClientMessage } from '../../lib/http-errors';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
 import { getScheduledPayments, cancelScheduledPayment } from '../../lib/scheduled-payments';
@@ -50,7 +51,7 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
     }
     next();
   } catch (error) {
-    res.status(500).json({ error: toMessage(error) });
+    res.status(500).json({ error: toClientMessage('schedule', error) });
   }
 };
 
@@ -114,7 +115,7 @@ app.post(
       const result = await handleScheduleTask(task, walletAddress);
       return res.json(result);
     } catch (error) {
-      return res.status(500).json({ action: 'error', message: toMessage(error) });
+      return res.status(500).json({ action: 'error', message: toClientMessage('schedule', error) });
     }
   },
 );
@@ -146,7 +147,7 @@ app.post(
     const status = result.success ? 200 : 400;
     return res.status(status).json(result);
   } catch (error) {
-    return res.status(500).json({ success: false, message: toMessage(error) });
+    return res.status(500).json({ success: false, message: toClientMessage('schedule', error) });
   }
 });
 
@@ -166,7 +167,7 @@ app.get('/list', internalKeyMiddleware, authMiddleware, async (req: Request, res
     const payments = await getScheduledPayments(walletAddress);
     return res.json({ payments });
   } catch (error) {
-    return res.status(500).json({ error: toMessage(error) });
+    return res.status(500).json({ error: toClientMessage('schedule', error) });
   }
 });
 
@@ -190,7 +191,7 @@ app.delete('/cancel/:id', internalKeyMiddleware, authMiddleware, async (req: Req
     await cancelScheduledPayment(id, walletAddress);
     return res.json({ success: true, message: `Scheduled payment ${id} cancelled.` });
   } catch (error) {
-    return res.status(500).json({ success: false, message: toMessage(error) });
+    return res.status(500).json({ success: false, message: toClientMessage('schedule', error) });
   }
 });
 
@@ -198,6 +199,3 @@ app.listen(port, () => {
   console.log(`Schedule agent running on :${port}`);
 });
 
-function toMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}

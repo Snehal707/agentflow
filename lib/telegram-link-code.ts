@@ -1,8 +1,12 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { getAddress, isAddress } from 'viem';
 
 const DEFAULT_LINK_TTL_SECONDS = 600;
 const PREFIX = 'AF-';
+/** Payload = 20-byte wallet + 4-byte expiry. */
+const PAYLOAD_BYTES = 24;
+/** 128-bit HMAC tag — enough that forging a code is infeasible, not just impractical. */
+const SIG_BYTES = 16;
 
 function getSecret(): string {
   const secret =
@@ -20,10 +24,10 @@ export function createTelegramLinkCode(
   const normalized = getAddress(walletAddress);
   const expiresAtSeconds = Math.floor((Date.now() + ttlSeconds * 1000) / 1000);
   const walletBytes = Buffer.from(normalized.slice(2), 'hex');
-  const payload = Buffer.alloc(24);
+  const payload = Buffer.alloc(PAYLOAD_BYTES);
   walletBytes.copy(payload, 0);
   payload.writeUInt32BE(expiresAtSeconds, 20);
-  const signature = createHmac('sha256', getSecret()).update(payload).digest().subarray(0, 6);
+  const signature = createHmac('sha256', getSecret()).update(payload).digest().subarray(0, SIG_BYTES);
   return `${PREFIX}${Buffer.concat([payload, signature]).toString('base64url')}`;
 }
 
@@ -38,16 +42,17 @@ export function parseTelegramLinkCode(input: string): {
 
   try {
     const decoded = Buffer.from(raw, 'base64url');
-    if (decoded.length !== 30) {
+    if (decoded.length !== PAYLOAD_BYTES + SIG_BYTES) {
       return { ok: false, reason: 'invalid' };
     }
-    const payload = decoded.subarray(0, 24);
-    const signature = decoded.subarray(24);
+    const payload = decoded.subarray(0, PAYLOAD_BYTES);
+    const signature = decoded.subarray(PAYLOAD_BYTES);
     const expectedSignature = createHmac('sha256', getSecret())
       .update(payload)
       .digest()
-      .subarray(0, 6);
-    if (!signature.equals(expectedSignature)) {
+      .subarray(0, SIG_BYTES);
+    // Constant-time compare (both are fixed-length SIG_BYTES buffers).
+    if (signature.length !== expectedSignature.length || !timingSafeEqual(signature, expectedSignature)) {
       return { ok: false, reason: 'invalid' };
     }
     const walletAddress = `0x${payload.subarray(0, 20).toString('hex')}`;

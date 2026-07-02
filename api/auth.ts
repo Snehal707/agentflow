@@ -1,8 +1,33 @@
 import { Router } from 'express';
 import { getAddress, isAddress, verifyMessage } from 'viem';
 import { generateJWT, verifyJWT } from '../lib/auth';
+import { consumeAuthChallenge, issueAuthChallenge } from '../lib/auth-nonce';
+import { sendServerError } from '../lib/http-errors';
 
 const router = Router();
+
+/**
+ * Step 1 of login: mint a single-use, wallet-bound nonce and return the exact
+ * message the client must sign. This is what defeats signature replay — the
+ * client can no longer pick an arbitrary message.
+ */
+router.post('/nonce', async (req, res) => {
+  try {
+    const walletAddress = String(req.body?.walletAddress ?? '');
+    if (!isAddress(walletAddress)) {
+      return res.status(400).json({ error: 'Valid walletAddress is required' });
+    }
+    const challenge = await issueAuthChallenge('login', getAddress(walletAddress));
+    return res.json({
+      walletAddress: getAddress(walletAddress),
+      nonce: challenge.nonce,
+      issuedAt: challenge.issuedAt,
+      message: challenge.message,
+    });
+  } catch (error: any) {
+    return sendServerError(res, 'auth/nonce', error, 'nonce issuance failed');
+  }
+});
 
 router.post('/verify-signature', async (req, res) => {
   try {
@@ -18,6 +43,16 @@ router.post('/verify-signature', async (req, res) => {
     }
 
     const normalized = getAddress(walletAddress);
+
+    // Reject before signature verification if the message isn't a live,
+    // unconsumed challenge this server issued for this wallet.
+    const challengeValid = await consumeAuthChallenge('login', normalized, message);
+    if (!challengeValid) {
+      return res
+        .status(401)
+        .json({ error: 'Invalid or expired sign-in challenge. Request a new nonce and retry.' });
+    }
+
     const valid = await verifyMessage({
       address: normalized,
       message,
@@ -35,7 +70,7 @@ router.post('/verify-signature', async (req, res) => {
       accessModel: 'pay_per_task',
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'verify-signature failed' });
+    return sendServerError(res, 'auth/verify-signature', error, 'verify-signature failed');
   }
 });
 

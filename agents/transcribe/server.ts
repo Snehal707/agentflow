@@ -4,6 +4,7 @@ import { isAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
+import { toClientMessage } from '../../lib/http-errors';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
 import { transcribeAudioForChat, validateAudioPayloadForTranscription } from '../../lib/mediaAgentUtils';
@@ -72,7 +73,7 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
     }
     next();
   } catch (error) {
-    res.status(500).json({ error: toMessage(error) });
+    res.status(500).json({ error: toClientMessage('transcribe', error) });
   }
 };
 
@@ -197,10 +198,12 @@ app.post(
     } catch (error) {
       await recordTranscribeReputation(20);
       const message = toMessage(error);
-      const status = message.includes('Mic captured near-silence') ? 400 : 500;
-      return res.status(status).json({
+      if (message.includes('Mic captured near-silence')) {
+        return res.status(400).json({ success: false, error: message });
+      }
+      return res.status(500).json({
         success: false,
-        error: message,
+        error: toClientMessage('transcribe', error),
       });
     }
   },

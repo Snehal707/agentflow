@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { getAddress, isAddress } from 'viem';
 import { adminDb } from '../db/client';
 import { authMiddleware, type JWTPayload } from '../lib/auth';
+import { sendServerError } from '../lib/http-errors';
 
 const router = Router();
 
@@ -32,7 +33,7 @@ router.post('/claim', authMiddleware, async (req, res) => {
       .maybeSingle();
 
     if (existingError) {
-      return res.status(500).json({ error: existingError.message });
+      return sendServerError(res, 'access/claim', existingError, 'access claim failed');
     }
 
     if (!existing || existing.revoked) {
@@ -65,7 +66,7 @@ router.post('/claim', authMiddleware, async (req, res) => {
       .maybeSingle();
 
     if (updateError) {
-      return res.status(500).json({ error: updateError.message });
+      return sendServerError(res, 'access/claim', updateError, 'access claim failed');
     }
 
     if (!updated) {
@@ -76,7 +77,7 @@ router.post('/claim', authMiddleware, async (req, res) => {
         .maybeSingle();
 
       if (refetchError) {
-        return res.status(500).json({ error: refetchError.message });
+        return sendServerError(res, 'access/claim', refetchError, 'access claim failed');
       }
 
       if (!refetched || refetched.revoked) {
@@ -102,7 +103,7 @@ router.post('/claim', authMiddleware, async (req, res) => {
       claimedAt: updated.claimed_at,
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'access claim failed' });
+    return sendServerError(res, 'access/claim', error, 'access claim failed');
   }
 });
 
@@ -121,14 +122,14 @@ router.get('/status', authMiddleware, async (req, res) => {
       .eq('revoked', false);
 
     if (error) {
-      return res.status(500).json({ error: error.message });
+      return sendServerError(res, 'access/status', error, 'access status failed');
     }
 
     return res.json({
       hasAccess: Number(count ?? 0) > 0,
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? 'access status failed' });
+    return sendServerError(res, 'access/status', error, 'access status failed');
   }
 });
 

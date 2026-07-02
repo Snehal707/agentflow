@@ -5,6 +5,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
 import { type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
+import { toClientMessage } from '../../lib/http-errors';
 import { checkRateLimit } from '../../lib/ratelimit';
 import { getOrCreateUserAgentWallet } from '../../lib/dcw';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';
@@ -108,9 +109,6 @@ function parseOptionalBigInt(value: unknown): bigint | null {
   return typeof value === 'string' && value.trim() ? BigInt(value) : null;
 }
 
-function toMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 async function resolveExecutionWalletAddress(
   userWalletAddress: `0x${string}`,
@@ -258,7 +256,7 @@ const rateLimitMiddleware = async (req: Request, res: Response, next: NextFuncti
     }
     next();
   } catch (error) {
-    res.status(500).json({ error: toMessage(error) });
+    res.status(500).json({ error: toClientMessage('predmarket', error) });
   }
 };
 
@@ -531,7 +529,7 @@ app.post(
             },
           });
         } catch (error) {
-          return res.status(502).json({ success: false, error: toMessage(error) });
+          return res.status(502).json({ success: false, error: toClientMessage('predmarket', error) });
         }
       }
 
@@ -653,7 +651,7 @@ app.post(
             },
           });
         } catch (error) {
-          return res.status(502).json({ success: false, error: toMessage(error) });
+          return res.status(502).json({ success: false, error: toClientMessage('predmarket', error) });
         }
       }
 
@@ -696,7 +694,7 @@ app.post(
             },
           });
         } catch (error) {
-          return res.status(502).json({ success: false, error: toMessage(error) });
+          return res.status(502).json({ success: false, error: toClientMessage('predmarket', error) });
         }
       }
 
@@ -738,7 +736,7 @@ app.post(
           },
         });
       } catch (error) {
-        return res.status(502).json({ success: false, error: toMessage(error) });
+        return res.status(502).json({ success: false, error: toClientMessage('predmarket', error) });
       }
     } catch (error) {
       console.error('[predmarket.handler.error]', {
