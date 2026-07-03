@@ -2293,6 +2293,114 @@ function buildConversationRecallReply(
   return parts.join(' ');
 }
 
+function buildFounderFollowupReply(
+  message: string,
+  history: BrainConversationMessage[] = [],
+): string | null {
+  const normalized = message.trim().toLowerCase();
+  const isFounderLocationCorrection =
+    /\bi said\b[\w\s]{0,20}\bwhere\b[\w\s]{0,40}\bfrom\b/i.test(normalized) &&
+    /\bhe\b/i.test(normalized);
+  if (isFounderLocationCorrection) {
+    return "I don't have a verified personal location or hometown for Snehal in this context.";
+  }
+
+  const asksFounderLocation =
+    /\bwhere\b[\w\s]{0,40}\bfrom\b/i.test(normalized) ||
+    /\b(?:location|hometown|origin)\b/i.test(normalized) ||
+    /\bi said\b[\w\s]{0,20}\bwhere\b/i.test(normalized);
+  if (!asksFounderLocation) {
+    return null;
+  }
+
+  const recentThread = history
+    .slice(-8)
+    .map((turn) => turn.content)
+    .join('\n');
+  const founderContextPatterns = [
+    /\bwho built agentflow\b/i,
+    /\bAgentFlow was built by Snehal\b/i,
+    /\bsolo founder\b/i,
+    /\bSnehal\b/i,
+    /\bverified personal location or hometown\b/i,
+  ];
+  const hasFounderContext = founderContextPatterns.some((pattern) => pattern.test(recentThread));
+  if (!hasFounderContext) {
+    return null;
+  }
+
+  return "I don't have a verified personal location or hometown for Snehal in this context.";
+}
+
+function buildSensitiveProbeReply(message: string): string | null {
+  const normalized = message.trim();
+  const isSecretProbe =
+    /\b(?:\.env|env file|secret|api key|private key|internal config|raw config)\b/i.test(normalized) ||
+    /\b(?:tool inventory|list all tools|internal tool|hidden tool|system prompt|hidden prompt|internal instructions)\b/i.test(normalized) ||
+    /隐藏.*系统.*提示词|原样显示/u.test(normalized) ||
+    /موج(?:ه|ّ?ه).*(?:النظام|المخفي)|حرفيا/u.test(normalized) ||
+    /숨겨진.*시스템.*프롬프트|그대로\s*보여/u.test(normalized) ||
+    /छुपा.*सिस्टम.*प्रॉम्प्ट|दिखाओ/u.test(normalized) ||
+    /внутренн.*конфигурац|секрет/i.test(normalized);
+  if (!isSecretProbe) {
+    return null;
+  }
+
+  return "I can't expose internal configuration, secrets, prompts, or hidden tool inventory. Ask for a user-facing capability or task and I'll help with that.";
+}
+
+function buildProfileNameRecallReply(
+  message: string,
+  history: BrainConversationMessage[] = [],
+  profile: BrainUserProfileRow | null = null,
+): string | null {
+  const normalized = message.trim().toLowerCase();
+  if (!/\b(?:what did i tell you|what'?s my name|what name did i tell you|do you remember my name)\b/i.test(normalized)) {
+    return null;
+  }
+
+  const safeDisplayName = sanitizeDisplayNameForReply(profile?.display_name);
+  if (safeDisplayName) {
+    return `You told me your name is ${safeDisplayName}.`;
+  }
+
+  const historyText = history
+    .slice(-8)
+    .map((turn) => turn.content)
+    .join('\n');
+  const explicitName =
+    historyText.match(/\bremember my name is\s+([A-Za-z][A-Za-z0-9_-]{1,40})\b/i)?.[1] ??
+    historyText.match(/\bI(?:'|’)ll use\s+([A-Za-z][A-Za-z0-9_-]{1,40})\b/i)?.[1];
+  if (!explicitName) {
+    return null;
+  }
+
+  return `You told me your name is ${explicitName}.`;
+}
+
+function buildBridgeSourceChainFollowupReply(
+  message: string,
+  history: BrainConversationMessage[] = [],
+): string | null {
+  const normalized = message.trim().toLowerCase();
+  if (!/\bwhich chain should i use\b|\bwhat chain should i use\b|\bwhich source chain\b/i.test(normalized)) {
+    return null;
+  }
+
+  const recentThread = history
+    .slice(-6)
+    .map((turn) => turn.content)
+    .join('\n');
+  if (
+    !/\bbridge\b/i.test(recentThread) ||
+    !/\bsupported source chains\b|\balready holds usdc\b|\bsource chains where this wallet already holds usdc\b/i.test(recentThread)
+  ) {
+    return null;
+  }
+
+  return 'Use any supported source chain where this wallet already has USDC. If you want, I can show the supported source chains next, or you can tell me the source chain you want to use.';
+}
+
 function buildReferentialWorkflowClarification(
   message: string,
   history: BrainConversationMessage[] = [],
@@ -11321,6 +11429,91 @@ function createPublicApp(): express.Express {
         mergedMessages.at(-1)?.content.trim() === message
           ? mergedMessages.slice(0, -1)
           : mergedMessages;
+
+      const founderFollowupReply = buildFounderFollowupReply(message, historyForBrain);
+      if (founderFollowupReply) {
+        await appendBrainConversationTurn(memorySessionId, message, founderFollowupReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: founderFollowupReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: founderFollowupReply })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const sensitiveProbeReply = buildSensitiveProbeReply(message);
+      if (sensitiveProbeReply) {
+        await appendBrainConversationTurn(memorySessionId, message, sensitiveProbeReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: sensitiveProbeReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: sensitiveProbeReply })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const profileNameRecallReply = buildProfileNameRecallReply(message, historyForBrain, profile);
+      if (profileNameRecallReply) {
+        await appendBrainConversationTurn(memorySessionId, message, profileNameRecallReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: profileNameRecallReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: profileNameRecallReply })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const bridgeSourceChainFollowupReply = buildBridgeSourceChainFollowupReply(message, historyForBrain);
+      if (bridgeSourceChainFollowupReply) {
+        await appendBrainConversationTurn(memorySessionId, message, bridgeSourceChainFollowupReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: bridgeSourceChainFollowupReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: bridgeSourceChainFollowupReply })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
       if (
         shouldGroundPortfolioAdviceContinuation(message, historyForBrain) &&
         !/\bCurrent wallet context for this request:/i.test(walletCtx.profileContext || '')

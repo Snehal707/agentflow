@@ -1603,15 +1603,6 @@ export async function* runAgentBrain(
     .join('\n\n');
 
   try {
-    const alive = await isHermesAlive();
-    if (!alive) {
-      yield {
-        type: 'delta',
-        delta: sanitizeAssistantStreamDelta('AgentFlow is restarting, please try again in a moment...'),
-      };
-      return;
-    }
-
     const runId = await createHermesRun(message, history, resolvedSessionId, systemPrompt);
 
     for await (const event of streamHermesRunEvents(runId)) {
@@ -1749,11 +1740,9 @@ export async function* runAgentBrain(
       }
     }
   } catch (err) {
-    const messageText =
-      err instanceof Error && err.message.trim()
-        ? err.message.trim()
-        : 'The chat service is unavailable right now.';
-    const fallback = sanitizeAssistantStreamDelta(`The chat service is unavailable right now. ${messageText}`);
+    const fallback = sanitizeAssistantStreamDelta(
+      'The chat service is unavailable right now. Please try again in a moment.',
+    );
     if (fallback) {
       yield { type: 'delta', delta: fallback };
     }
