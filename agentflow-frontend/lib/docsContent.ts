@@ -537,7 +537,7 @@ export const DOC_SECTIONS: DocSection[] = [
         summary:
           "AgentFlow has wallet-scoped rate limits and daily caps to keep paid agent work controlled.",
         facts: [
-          "Default pay-per-task rate limits are 200 actions per wallet per day and 10 actions per wallet per minute unless configured otherwise.",
+          "Default pay-per-task rate limits are 50 actions per wallet per day and 10 actions per wallet per minute unless configured otherwise.",
           "A maximum transaction size limit can be configured with PAY_PER_TASK_MAX_TX_USDC.",
           "Vision defaults to 5 attachment analyses per wallet per day unless VISION_DAILY_LIMIT is changed.",
           "Voice input defaults to 5 transcriptions per wallet per day unless TRANSCRIBE_DAILY_LIMIT is changed.",
