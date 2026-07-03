@@ -34,7 +34,8 @@ const next = path.join(root, "agentflow-frontend", "node_modules", ".bin", "next
 module.exports = {
   apps: [
     {
-      // Public API + embedded agents + facilitator (server.ts) on port 4000.
+      // Public API + embedded facilitator/research/analyst/writer (server.ts)
+      // on port 4000.
       name: "agentflow-backend",
       cwd: root,
       script: tsx,
@@ -43,6 +44,72 @@ module.exports = {
       env: { NODE_ENV: "production" },
       autorestart: true,
       max_memory_restart: "1500M",
+      time: true,
+    },
+    {
+      // Paid/DCW swap agent on :3011.
+      name: "agentflow-swap",
+      cwd: root,
+      script: tsx,
+      args: "agents/swap/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Vault agent on :3012.
+      name: "agentflow-vault",
+      cwd: root,
+      script: tsx,
+      args: "agents/vault/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Portfolio agent on :3014.
+      name: "agentflow-portfolio",
+      cwd: root,
+      script: tsx,
+      args: "agents/portfolio/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Vision agent on :3016.
+      name: "agentflow-vision",
+      cwd: root,
+      script: tsx,
+      args: "agents/vision/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Transcribe agent on :3017.
+      name: "agentflow-transcribe",
+      cwd: root,
+      script: tsx,
+      args: "agents/transcribe/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Bridge agent on :3021.
+      name: "agentflow-bridge",
+      cwd: root,
+      script: tsx,
+      args: "agents/bridge/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
       time: true,
     },
     {
