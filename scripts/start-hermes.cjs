@@ -5,7 +5,8 @@ const dotenv = require("dotenv");
 
 const repoRoot = path.resolve(__dirname, "..");
 const hermesHome = path.join(repoRoot, "hermes-brain");
-const hermesPython = path.join(hermesHome, ".venv", "Scripts", "python.exe");
+const hermesPythonWindows = path.join(hermesHome, ".venv", "Scripts", "python.exe");
+const hermesPythonPosix = path.join(hermesHome, ".venv", "bin", "python");
 const hermesConfigPath = path.join(hermesHome, "config.yaml");
 const launcherLockPath = path.join(hermesHome, "gateway_launcher.lock.json");
 const MAX_RESTARTS_PER_MINUTE = 5;
@@ -17,6 +18,9 @@ const HERMES_PORT = String(
 );
 
 function runPowerShell(command) {
+  if (process.platform !== "win32") {
+    return { stdout: "", stderr: "", status: 0 };
+  }
   return spawnSync(
     "powershell.exe",
     ["-NoProfile", "-Command", command],
@@ -25,6 +29,9 @@ function runPowerShell(command) {
 }
 
 function cleanupExistingHermes() {
+  if (process.platform !== "win32") {
+    return;
+  }
   const command = `
 $targets = @()
 $gateway = Get-CimInstance Win32_Process | Where-Object {
@@ -58,6 +65,9 @@ foreach ($targetPid in $targets) {
 }
 
 function findOtherLauncherPids() {
+  if (process.platform !== "win32") {
+    return [];
+  }
   const command = `
 $launchers = Get-CimInstance Win32_Process | Where-Object {
   $_.Name -match '^node(\\.exe)?$' -and
@@ -109,7 +119,11 @@ const hermesEnv = {
   TELEGRAM_FALLBACK_IPS: "",
 };
 
-const pythonCommand = fs.existsSync(hermesPython) ? hermesPython : "python";
+const pythonCommand = fs.existsSync(hermesPythonWindows)
+  ? hermesPythonWindows
+  : fs.existsSync(hermesPythonPosix)
+    ? hermesPythonPosix
+    : "python";
 let currentHermes = null;
 let shuttingDown = false;
 let restartTimestamps = [];
