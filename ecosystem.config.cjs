@@ -34,6 +34,19 @@ const next = path.join(root, "agentflow-frontend", "node_modules", ".bin", "next
 module.exports = {
   apps: [
     {
+      // Hermes gateway on :8000. This powers the non-LLM AgentFlow reasoning
+      // runtime used by chat QA, intent routing, and the local chat core stack.
+      name: "agentflow-hermes",
+      cwd: root,
+      script: process.execPath,
+      args: "scripts/start-hermes.cjs",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      max_memory_restart: "1000M",
+      time: true,
+    },
+    {
       // Public API + embedded facilitator/research/analyst/writer (server.ts)
       // on port 4000.
       name: "agentflow-backend",
