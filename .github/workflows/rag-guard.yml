@@ -27,19 +27,9 @@ on:
 jobs:
   rag-accuracy:
     runs-on: ubuntu-latest
-    env:
-      CLOUDSMITH_TOKEN: ${{ secrets.CLOUDSMITH_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-      - name: Require Cloudsmith token
-        run: |
-          if [ -z "$CLOUDSMITH_TOKEN" ]; then
-            echo "::error::Missing CLOUDSMITH_TOKEN GitHub Actions secret required for npm install."
-            exit 1
-          fi
-      - run: npm ci
-      - run: npm run check:rag-accuracy
+          node-version: 22
+      - run: npx -y tsx scripts/check-rag-accuracy.ts
