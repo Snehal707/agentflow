@@ -1,14 +1,10 @@
 # AgentFlow
 
-**Monorepo:** [github.com/Snehal707/agentflow](https://github.com/Snehal707/agentflow) — Arc Testnet **backend** (`server.ts`, agents, x402) plus **Next.js 14** UI in [`agentflow-frontend/`](agentflow-frontend/).
+Single private monorepo for the current AgentFlow live dapp: Arc Testnet backend (`server.ts`, agents, x402) plus the Next.js 14 UI in [`agentflow-frontend/`](agentflow-frontend/).
 
 AgentFlow is a demo **AI agent economy** on **Arc Testnet**, with **Circle x402** micropayments, **Hermes** for chat/orchestration, and **Circle developer-controlled wallets** + Gateway where configured.
 
-| Repo | Role |
-|------|------|
-| [**agentflow**](https://github.com/Snehal707/agentflow) (this tree) | Canonical **monorepo** — backend + `agentflow-frontend/`. |
-| [**agentflow-backend**](https://github.com/Snehal707/agentflow-backend) | **Same `main`** — for API-only checkouts / links. |
-| [**agentflow-frontend**](https://github.com/Snehal707/agentflow-frontend) | **Next.js only** — Vercel deploys; stays aligned with `agentflow-frontend/` here. |
+This repository is the deploy source of truth for the full stack. Backend and frontend live together here and should ship together.
 
 ## Quick start
 

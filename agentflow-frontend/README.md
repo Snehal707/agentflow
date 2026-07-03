@@ -2,13 +2,7 @@
 
 Next.js 14 app with RainbowKit wallet connection, Arc Testnet support, and SSE streaming from the AgentFlow backend.
 
-## Related repositories
-
-| Repo | Use |
-|------|-----|
-| [**agentflow**](https://github.com/Snehal707/agentflow) | **Canonical monorepo** — this app lives in `agentflow-frontend/` next to `server.ts`, agents, and `npm run dev:stack`. |
-| [**agentflow-backend**](https://github.com/Snehal707/agentflow-backend) | Same backend `main` as the monorepo; useful if you deploy API-only from a dedicated repo. |
-| [**agentflow-frontend**](https://github.com/Snehal707/agentflow-frontend) | This repo — deploy on Vercel with **root = repo root** and `NEXT_PUBLIC_BACKEND_URL` pointing at your API. |
+This frontend lives inside the main AgentFlow monorepo at `agentflow-frontend/` and ships together with the backend.
 
 ### App flow
 
@@ -67,13 +61,13 @@ npm start
 
 ## Vercel deployment
 
-1. Deploy this folder (or the agentflow-frontend repo) as a Next.js project on Vercel.
+1. Deploy this app from the monorepo as a Next.js project with `agentflow-frontend` as the root directory.
 2. Set environment variable: `NEXT_PUBLIC_BACKEND_URL` = your backend URL.
 3. Optionally set `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID`.
 
 ## Backend requirements
 
-Point `NEXT_PUBLIC_BACKEND_URL` at a running AgentFlow API (e.g. `http://localhost:4000` locally). The full surface includes chat (`/api/chat/respond`, SSE), AgentPay, wallet, and agent proxies — see the monorepo [README](https://github.com/Snehal707/agentflow/blob/main/README.md) and [DEPLOY.md](https://github.com/Snehal707/agentflow/blob/main/DEPLOY.md).
+Point `NEXT_PUBLIC_BACKEND_URL` at a running AgentFlow API (e.g. `http://localhost:4000` locally). The full surface includes chat (`/api/chat/respond`, SSE), AgentPay, wallet, and agent proxies — see the root [README](../README.md) and [DEPLOY.md](../DEPLOY.md).
 
 Legacy minimal expectations (older demos):
 
