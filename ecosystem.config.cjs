@@ -113,6 +113,61 @@ module.exports = {
       time: true,
     },
     {
+      // Invoice agent on :3015.
+      name: "agentflow-invoice",
+      cwd: root,
+      script: tsx,
+      args: "agents/invoice/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Split agent on :3019.
+      name: "agentflow-split",
+      cwd: root,
+      script: tsx,
+      args: "agents/split/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Batch agent on :3020.
+      name: "agentflow-batch",
+      cwd: root,
+      script: tsx,
+      args: "agents/batch/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Schedule agent on :3018.
+      name: "agentflow-schedule",
+      cwd: root,
+      script: tsx,
+      args: "agents/schedule/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
+      // Prediction market agent on :3013.
+      name: "agentflow-predmarket",
+      cwd: root,
+      script: tsx,
+      args: "agents/predmarket/server.ts",
+      interpreter: "none",
+      env: { NODE_ENV: "production" },
+      autorestart: true,
+      time: true,
+    },
+    {
       // Scheduler. THIS is the snapshot-freshness fix: semantic-memory
       // consolidation (every 6h), treasury top-up (hourly), daily reports,
       // scheduled USDC payments, yield monitor, training export, monthly digest.
