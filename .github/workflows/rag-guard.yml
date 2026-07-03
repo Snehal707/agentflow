@@ -5,9 +5,11 @@ name: RAG accuracy guard
 # caps. Pure check: no secrets / no network required.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
+      - ".github/workflows/rag-guard.yml"
       - "lib/product-rag.ts"
       - "lib/coreAgentSpecs.ts"
       - "lib/bridge/supportedSources.ts"
@@ -15,6 +17,7 @@ on:
       - "scripts/check-rag-accuracy.ts"
   pull_request:
     paths:
+      - ".github/workflows/rag-guard.yml"
       - "lib/product-rag.ts"
       - "lib/coreAgentSpecs.ts"
       - "lib/bridge/supportedSources.ts"
