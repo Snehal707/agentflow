@@ -2443,6 +2443,93 @@ function buildReferentialWorkflowClarification(
   return null;
 }
 
+function titleCaseWords(value: string): string {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function buildStandaloneWorkflowClarification(message: string): string | null {
+  const trimmed = message.trim();
+  const normalized = trimmed.toLowerCase();
+  if (!trimmed) {
+    return null;
+  }
+
+  const hasExplicitAmount = /\b\d+(?:\.\d+)?\b/.test(normalized);
+
+  if (
+    !hasExplicitAmount &&
+    /\b(?:swap|turn|flip|convert)\b/i.test(trimmed) &&
+    /\busdc\b/i.test(trimmed) &&
+    /\beurc\b/i.test(trimmed)
+  ) {
+    return 'How much USDC do you want to swap into EURC?';
+  }
+
+  if (
+    !hasExplicitAmount &&
+    /\b(?:bridge|get funds onto|move funds onto|move .* to arc|onto arc)\b/i.test(trimmed)
+  ) {
+    const sourceMatch = trimmed.match(/\bfrom\s+([a-z][a-z0-9\s-]{1,30})\b/i);
+    const source = sourceMatch?.[1] ? titleCaseWords(sourceMatch[1]) : null;
+    if (source) {
+      return `How much do you want to bridge from ${source} to Arc?`;
+    }
+    return 'How much do you want to bridge, and which source chain should I use?';
+  }
+
+  if (
+    !hasExplicitAmount &&
+    /\b(?:pay|send|transfer)\b/i.test(trimmed) &&
+    !/\b(?:every|weekly|monthly|daily)\b/i.test(trimmed)
+  ) {
+    const handleMatch =
+      trimmed.match(/\bto\s+([a-z0-9_.-]+(?:\.arc)?)\b/i) ??
+      trimmed.match(/\b(?:pay|send|transfer)\s+([a-z0-9_.-]+(?:\.arc)?)\b/i);
+    const recipient = handleMatch?.[1];
+    if (recipient && !/^(?:me|myself|them|him|her|it|that)$/i.test(recipient)) {
+      return `How much do you want to send to ${recipient}?`;
+    }
+  }
+
+  if (
+    /\b(?:payment link|pay link|qr|scan to pay|scan\b.*pay)\b/i.test(trimmed) &&
+    !/\b(?:for|to)\s+[a-z0-9_.-]+(?:\.arc)?\b/i.test(trimmed)
+  ) {
+    return 'Who should pay through the payment link?';
+  }
+
+  if (
+    !hasExplicitAmount &&
+    /\bsplit\b/i.test(trimmed) &&
+    !/\b(?:what is|tell me about|format|how to)\b/i.test(trimmed)
+  ) {
+    return 'What total amount do you want to split?';
+  }
+
+  return null;
+}
+
+function buildLanguageCapabilityReply(message: string): string | null {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (/คุณพูดภาษาไทยได้ไหม/u.test(trimmed) || /\b(?:speak|talk|reply|answer)\b[\s\S]{0,20}\bthai\b/i.test(trimmed)) {
+    if (/[ก-๙]/u.test(trimmed)) {
+      return 'ได้ ผมคุยเป็นภาษาไทยได้ ถ้าคุณพิมพ์เป็นภาษาไทย ผมจะตอบเป็นภาษาไทยให้ครับ';
+    }
+    return 'Yes. If you write to me in Thai, I can reply in Thai.';
+  }
+
+  return null;
+}
+
 function shouldAttachBrainProfileContext(message: string): boolean {
   const trimmed = message.trim();
   if (!trimmed) {
@@ -11694,6 +11781,48 @@ function createPublicApp(): express.Express {
           assistantAt: Date.now(),
         });
         res.write(`data: ${JSON.stringify({ delta: referentialWorkflowClarification })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const languageCapabilityReply = buildLanguageCapabilityReply(message);
+      if (languageCapabilityReply) {
+        await appendBrainConversationTurn(memorySessionId, message, languageCapabilityReply);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: languageCapabilityReply,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: languageCapabilityReply })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      const standaloneWorkflowClarification = buildStandaloneWorkflowClarification(message);
+      if (standaloneWorkflowClarification) {
+        await appendBrainConversationTurn(memorySessionId, message, standaloneWorkflowClarification);
+        await updateBrainEvent(brainEventId, {
+          intent_label: 'general.chat',
+          intent_source: 'fastpath',
+          ...buildFastpathBrainEventFields('general.chat'),
+          final_response_summary: standaloneWorkflowClarification,
+          outcome: 'success',
+          total_latency_ms: Date.now() - responseStartedAt,
+        });
+        recentBrainEventsBySession.set(memorySessionId, {
+          eventId: brainEventId,
+          assistantAt: Date.now(),
+        });
+        res.write(`data: ${JSON.stringify({ delta: standaloneWorkflowClarification })}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
         return;
