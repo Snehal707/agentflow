@@ -19,6 +19,7 @@ import { createViemAdapterFromProvider } from "@circle-fin/adapter-viem-v2";
 import { BridgeChain, BridgeKit } from "@circle-fin/bridge-kit";
 import {
   createPublicClient,
+  type Address,
   type EIP1193Provider,
   formatUnits,
   getAddress,
@@ -4262,6 +4263,8 @@ function ChatPageInner() {
 
     const finalizeRequestId = createBrowserX402RequestId();
     let paymentRequestId: string | null = null;
+    let paymentMode: "eoa" | "dcw" = "dcw";
+    let paymentPayer: Address = connectedAddress;
     let paymentAttemptSnapshot: X402AttemptSnapshot | null = null;
     let finalizeWarning: string | null = null;
 
@@ -4335,6 +4338,8 @@ function ChatPageInner() {
         BRIDGE_FINALIZE_TIMEOUT_MS,
         `Bridge receipt payment verification timed out. Request ID: ${finalizeRequestId}`,
       );
+      paymentMode = finalized.payment?.mode ?? paymentMode;
+      paymentPayer = (finalized.payment?.payer ?? paymentPayer) as Address;
       paymentRequestId = finalized.requestId;
       paymentAttemptSnapshot = await readX402AttemptSnapshot(finalized.requestId);
     } catch (error) {
@@ -4382,8 +4387,8 @@ function ChatPageInner() {
                 requestId: paymentRequestId,
                 agent: "bridge",
                 price: paymentPriceLabel("bridge"),
-                payer: connectedAddress,
-                mode: "eoa",
+                payer: paymentPayer,
+                mode: paymentMode,
               },
             ],
           }

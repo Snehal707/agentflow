@@ -1,4 +1,4 @@
-import { type Address, type WalletClient } from "viem";
+import { getAddress, type Address, type WalletClient } from "viem";
 import { defaultPriceBySlug, getAgentRunUrl } from "@/lib/agentEndpoints";
 import { ARC_CHAIN_ID } from "@/lib/arcChain";
 import { fetchBrowserApi, getBrowserBackendUrl } from "@/lib/browserApi";
@@ -1071,20 +1071,64 @@ export async function finalizeBridgeRun(input: {
     agent: string;
     price: string;
     payer: Address;
-    mode: "eoa";
+    mode: "eoa" | "dcw";
   } | null;
 }> {
   const requestId = input.requestId?.trim() || createBrowserX402RequestId();
+  const serverResponse = await fetch("/api/bridge/finalize", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-agentflow-request-id": requestId,
+      ...input.authHeaders,
+    },
+    body: JSON.stringify(input.body),
+    cache: "no-store",
+  });
+  const serverPayload = (await serverResponse.json().catch(() => ({}))) as {
+    error?: string;
+    fallbackToEoa?: boolean;
+    payment?: {
+      requestId?: string;
+      agent?: string;
+      price?: string;
+      payer?: string;
+      mode?: string;
+    } | null;
+  };
+
+  if (serverResponse.ok) {
+    const payment = serverPayload.payment;
+    return {
+      requestId: payment?.requestId || requestId,
+      payment: payment?.requestId
+        ? {
+            requestId: payment.requestId,
+            agent: payment.agent || "bridge",
+            price: payment.price || paymentPriceLabel("bridge"),
+            payer: getAddress((payment.payer || input.payer) as Address),
+            mode: payment.mode?.toLowerCase() === "eoa" ? "eoa" : "dcw",
+          }
+        : null,
+    };
+  }
+
+  if (serverResponse.status !== 409 || !serverPayload.fallbackToEoa) {
+    throw new Error(serverPayload.error || "Bridge finalize failed");
+  }
+
+  const fallbackRequestId = createBrowserX402RequestId();
   const { response, requestId: finalizedRequestId } = await payProtectedFetchWithMeta({
     url: "/api/bridge/finalize",
     method: "POST",
-    requestId,
+    requestId: fallbackRequestId,
     body: input.body,
     walletClient: input.walletClient,
     payer: input.payer,
     chainId: ARC_CHAIN_ID,
     headers: {
       "Content-Type": "application/json",
+      "x-agentflow-bridge-rail": "eoa",
       ...input.authHeaders,
     },
     onAwaitSignature: input.onAwaitSignature,

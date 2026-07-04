@@ -392,6 +392,11 @@ const BRIDGE_URL = resolveAgentRunUrl(
   process.env.BRIDGE_AGENT_URL?.trim(),
   'http://127.0.0.1:3021/run',
 );
+const BRIDGE_FINALIZE_URL = (
+  process.env.BRIDGE_AGENT_URL?.trim()
+    ? process.env.BRIDGE_AGENT_URL.trim().replace(/\/run\/?$/i, '/bridge/finalize')
+    : 'http://127.0.0.1:3021/bridge/finalize'
+).replace(/\/+$/, '');
 const PORTFOLIO_URL = resolveAgentRunUrl(
   process.env.PORTFOLIO_AGENT_URL?.trim(),
   'http://127.0.0.1:3014/run',
@@ -9555,6 +9560,10 @@ function getDcwPaidAgentPrice(slug: DcwPaidAgentSlug): string {
   }
 }
 
+function bridgePriceLabel(): string {
+  return process.env.BRIDGE_AGENT_PRICE ? `$${process.env.BRIDGE_AGENT_PRICE} USDC` : '$0.009 USDC';
+}
+
 function getPaidAgentUrlBySlug(slug: string): string | null {
   switch (slug.toLowerCase()) {
     case 'research':
@@ -9619,6 +9628,14 @@ function isX402AttemptStage(value: unknown): value is X402AttemptStage {
 
 function isX402AttemptMode(value: unknown): value is X402AttemptMode {
   return value === 'eoa' || value === 'dcw';
+}
+
+function isBridgeGatewayFallbackError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /gateway top-up failed/i.test(message) ||
+    /gateway balance is still too low/i.test(message)
+  );
 }
 
 function parseOptionalNumber(value: unknown): number | undefined {
@@ -10502,6 +10519,71 @@ function createPublicApp(): express.Express {
       return res.json({ ok: true, record });
     } catch (error) {
       return sendServerError(res, 'server', error, 'Request failed');
+    }
+  });
+
+  app.post('/api/bridge/finalize', authMiddleware, async (req: Request, res: Response) => {
+    const auth = (req as any).auth as JWTPayload | undefined;
+    if (!auth?.walletAddress || !isAddress(auth.walletAddress)) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const requestId = req.header('x-agentflow-request-id')?.trim() || createRunId('bridge_finalize');
+
+    try {
+      const normalizedWallet = getAddress(auth.walletAddress);
+      const executionWallet = await getOrCreateUserAgentWallet(normalizedWallet);
+      const upstreamBody =
+        req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+      const payer = getAddress(executionWallet.address) as `0x${string}`;
+
+      const result = await payProtectedResourceServer<Record<string, unknown>, Record<string, unknown>>({
+        url: BRIDGE_FINALIZE_URL,
+        method: 'POST',
+        body: {
+          ...upstreamBody,
+          walletAddress: normalizedWallet,
+          executionTarget: 'DCW',
+        },
+        circleWalletId: executionWallet.wallet_id,
+        payer,
+        chainId: ARC.chainId,
+        headers: {
+          Authorization: `Bearer ${generateJWT(normalizedWallet)}`,
+        },
+        requestId,
+        idempotencyKey: requestId,
+      });
+
+      const settlementTxHash =
+        result.transaction && typeof result.transaction === 'object' && 'txHash' in result.transaction
+          ? String(result.transaction.txHash ?? '') || null
+          : null;
+
+      return res.status(result.status).json({
+        ...(typeof result.data === 'object' && result.data ? result.data : { result: result.data }),
+        payment: {
+          mode: 'dcw',
+          payer,
+          agent: 'bridge',
+          price: bridgePriceLabel(),
+          requestId: result.requestId,
+          transaction: result.transactionRef ?? null,
+          transactionRef: result.transactionRef ?? null,
+          settlement: result.settlement ?? null,
+          settlementTxHash,
+        },
+      });
+    } catch (err) {
+      if (isBridgeGatewayFallbackError(err)) {
+        return res.status(409).json({
+          error:
+            'Bridge receipt payment could not be covered from your Gateway/DCW balance. Connected-wallet fallback is required.',
+          fallbackToEoa: true,
+          requestId,
+        });
+      }
+      return sendServerError(res, 'server/bridge-finalize', err, 'bridge finalize failed');
     }
   });
 

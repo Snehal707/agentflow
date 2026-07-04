@@ -90,6 +90,9 @@ function paymentSubtitle(
       ? `${agentName(entry.buyerAgent)} paid via A2A/Gateway`
       : "Agent-paid via A2A/Gateway";
   }
+  if (entry.mode === "eoa") {
+    return "User-paid via connected wallet";
+  }
   return "User-paid via Gateway/DCW";
 }
 

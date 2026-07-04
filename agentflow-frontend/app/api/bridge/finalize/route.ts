@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { proxyBackendRequest } from "@/lib/backendProxy";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -16,6 +17,10 @@ function getBridgeAgentUrl(): string {
 }
 
 export async function POST(request: Request) {
+  if (request.headers.get("x-agentflow-bridge-rail") !== "eoa") {
+    return proxyBackendRequest(request, "/api/bridge/finalize");
+  }
+
   const headers = new Headers();
   const authorization = request.headers.get("authorization");
   const paymentSignature = request.headers.get("payment-signature");

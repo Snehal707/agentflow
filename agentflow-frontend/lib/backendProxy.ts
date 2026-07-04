@@ -31,12 +31,16 @@ export async function proxyBackendRequest(
   const headers = new Headers();
   const contentType = request.headers.get("content-type");
   const authorization = request.headers.get("authorization");
+  const requestId = request.headers.get("x-agentflow-request-id");
 
   if (contentType) {
     headers.set("content-type", contentType);
   }
   if (authorization) {
     headers.set("authorization", authorization);
+  }
+  if (requestId) {
+    headers.set("x-agentflow-request-id", requestId);
   }
 
   // Forward the real client IP. Without this, a same-host backend sees every
