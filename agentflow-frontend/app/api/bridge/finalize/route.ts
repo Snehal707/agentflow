@@ -3,6 +3,7 @@ import { proxyBackendRequest } from "@/lib/backendProxy";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+const UPSTREAM_FETCH_MS = 55_000;
 
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/, "");
@@ -40,25 +41,36 @@ export async function POST(request: Request) {
     headers.set("x-agentflow-request-id", requestId);
   }
 
-  const upstream = await fetch(`${getBridgeAgentUrl()}/bridge/finalize`, {
-    method: "POST",
-    headers,
-    body: await request.text(),
-    cache: "no-store",
-  });
+  const ctrl = new AbortController();
+  const kill = setTimeout(() => ctrl.abort(), UPSTREAM_FETCH_MS);
 
-  const responseHeaders = new Headers();
-  const upstreamContentType = upstream.headers.get("content-type");
-  const paymentRequired = upstream.headers.get("PAYMENT-REQUIRED");
-  const paymentResponse = upstream.headers.get("PAYMENT-RESPONSE");
+  try {
+    const upstream = await fetch(`${getBridgeAgentUrl()}/bridge/finalize`, {
+      method: "POST",
+      headers,
+      body: await request.text(),
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
 
-  if (upstreamContentType) responseHeaders.set("Content-Type", upstreamContentType);
-  if (paymentRequired) responseHeaders.set("PAYMENT-REQUIRED", paymentRequired);
-  if (paymentResponse) responseHeaders.set("PAYMENT-RESPONSE", paymentResponse);
-  responseHeaders.set("Cache-Control", "no-store");
+    const responseHeaders = new Headers();
+    const upstreamContentType = upstream.headers.get("content-type");
+    const paymentRequired = upstream.headers.get("PAYMENT-REQUIRED");
+    const paymentResponse = upstream.headers.get("PAYMENT-RESPONSE");
 
-  return new NextResponse(upstream.body, {
-    status: upstream.status,
-    headers: responseHeaders,
-  });
+    if (upstreamContentType) responseHeaders.set("Content-Type", upstreamContentType);
+    if (paymentRequired) responseHeaders.set("PAYMENT-REQUIRED", paymentRequired);
+    if (paymentResponse) responseHeaders.set("PAYMENT-RESPONSE", paymentResponse);
+    responseHeaders.set("Cache-Control", "no-store");
+
+    return new NextResponse(upstream.body, {
+      status: upstream.status,
+      headers: responseHeaders,
+    });
+  } catch (error) {
+    console.warn("[bridge/finalize proxy]", error);
+    return NextResponse.json({ error: "Bridge finalize proxy failed" }, { status: 502 });
+  } finally {
+    clearTimeout(kill);
+  }
 }

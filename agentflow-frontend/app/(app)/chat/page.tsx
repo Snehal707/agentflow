@@ -4352,14 +4352,20 @@ function ChatPageInner() {
       } else if (isChainMismatchError(error)) {
         paymentRequestId = finalizeRequestId;
         finalizeWarning = `The bridge reached Arc, but your wallet is still connected to the source chain. Switch back to Arc to finish the AgentFlow bridge receipt payment. Request ID: ${finalizeRequestId}`;
-      } else {
+      } else if (paymentAttemptSnapshot) {
         paymentRequestId = finalizeRequestId;
-        finalizeWarning = paymentAttemptSnapshot?.error
+        finalizeWarning = paymentAttemptSnapshot.error
           ? `${paymentAttemptSnapshot.error}\nRequest ID: ${finalizeRequestId}`
           : friendlyChatErrorMessage(
               error,
               `The bridge finished, but AgentFlow could not record the bridge receipt payment. Request ID: ${finalizeRequestId}`,
             );
+      } else {
+        paymentRequestId = undefined;
+        finalizeWarning = friendlyChatErrorMessage(
+          error,
+          `The bridge finished, but AgentFlow could not record the bridge receipt payment. Request ID: ${finalizeRequestId}`,
+        );
       }
     }
 
