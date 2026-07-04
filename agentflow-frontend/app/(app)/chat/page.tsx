@@ -4304,8 +4304,10 @@ function ChatPageInner() {
         paymentRequestId = finalizeRequestId;
         finalizeWarning = `The bridge reached Arc, and AgentFlow is still verifying the bridge receipt payment. Request ID: ${finalizeRequestId}`;
       } else if (isChainMismatchError(error)) {
+        paymentRequestId = finalizeRequestId;
         finalizeWarning = `The bridge reached Arc, but your wallet is still connected to the source chain. Switch back to Arc to finish the AgentFlow bridge receipt payment. Request ID: ${finalizeRequestId}`;
       } else {
+        paymentRequestId = finalizeRequestId;
         finalizeWarning = paymentAttemptSnapshot?.error
           ? `${paymentAttemptSnapshot.error}\nRequest ID: ${finalizeRequestId}`
           : friendlyChatErrorMessage(
