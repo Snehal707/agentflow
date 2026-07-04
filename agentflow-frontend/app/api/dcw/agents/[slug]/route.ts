@@ -71,14 +71,10 @@ async function proxyDcwAgentRequest(
       cache: "no-store",
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Upstream DCW agent request failed";
     console.error(`[dcw agent proxy] ${params.slug} upstream fetch failed`, error);
     return NextResponse.json(
       {
         error: `DCW agent upstream unavailable for ${params.slug}`,
-        details: message,
-        upstream: upstreamUrl,
       },
       { status: 502 },
     );

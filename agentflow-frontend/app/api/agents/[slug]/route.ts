@@ -114,14 +114,10 @@ async function proxyAgentRequest(
       cache: "no-store",
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Upstream agent request failed";
     console.error(`[agent proxy] ${params.slug} upstream fetch failed`, error);
     return NextResponse.json(
       {
         error: `Agent upstream unavailable for ${params.slug}`,
-        details: message,
-        upstream: target.toString(),
       },
       { status: 502 },
     );

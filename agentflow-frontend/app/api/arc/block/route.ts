@@ -43,8 +43,9 @@ export async function GET() {
       },
     );
   } catch (error) {
+    console.warn("[arc/block]", error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Block lookup failed" },
+      { error: "Block lookup failed" },
       { status: 500 },
     );
   }

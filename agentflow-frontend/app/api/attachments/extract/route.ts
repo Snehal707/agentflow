@@ -505,10 +505,10 @@ export async function POST(req: NextRequest) {
       extractor: "openai",
     });
   } catch (error) {
+    console.warn("[attachments/extract]", error);
     return NextResponse.json(
       {
-        error:
-          error instanceof Error ? error.message : "Attachment extraction failed unexpectedly.",
+        error: "Attachment extraction failed unexpectedly.",
       },
       { status: 500 },
     );
