@@ -107,6 +107,56 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function normalizeHexChainId(value: string | number | bigint): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = trimmed.startsWith("0x") ? Number.parseInt(trimmed, 16) : Number.parseInt(trimmed, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function waitForConnectorChain(
+  provider: EIP1193Provider | undefined,
+  expectedChainId: number,
+  timeoutMs: number,
+): Promise<void> {
+  if (!provider?.request) {
+    return;
+  }
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const rawChainId = await provider.request({ method: "eth_chainId" });
+      const normalized = normalizeHexChainId(
+        typeof rawChainId === "string" || typeof rawChainId === "number" || typeof rawChainId === "bigint"
+          ? rawChainId
+          : String(rawChainId),
+      );
+      if (normalized === expectedChainId) {
+        return;
+      }
+    } catch {
+      // keep polling until the wallet provider catches up after the network switch
+    }
+    await sleep(350);
+  }
+
+  throw new Error("Wallet network switch has not settled yet. Please keep the wallet on Arc and try again.");
+}
+
+function isChainMismatchError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /does not match the connection's chain|current chain id|expected chain id/i.test(message);
+}
+
 function isTerminalX402AttemptStage(stage?: string | null): boolean {
   return stage === "succeeded" || stage === "failed" || stage === "preflight_failed";
 }
@@ -4201,6 +4251,14 @@ function ChatPageInner() {
     }
 
     try {
+      const arcProvider = (await connector?.getProvider?.({
+        chainId: ARC_CHAIN_ID,
+      })) as EIP1193Provider | undefined;
+      await waitForConnectorChain(
+        arcProvider,
+        ARC_CHAIN_ID,
+        BRIDGE_WALLET_CLIENT_TIMEOUT_MS,
+      );
       const arcWalletClient = await withTimeout(
         getWalletClient(wagmiConfig, {
           account: connectedAddress,
@@ -4245,6 +4303,8 @@ function ChatPageInner() {
       } else if (isBridgeFinalizePendingStage(paymentAttemptSnapshot?.stage)) {
         paymentRequestId = finalizeRequestId;
         finalizeWarning = `The bridge reached Arc, and AgentFlow is still verifying the bridge receipt payment. Request ID: ${finalizeRequestId}`;
+      } else if (isChainMismatchError(error)) {
+        finalizeWarning = `The bridge reached Arc, but your wallet is still connected to the source chain. Switch back to Arc to finish the AgentFlow bridge receipt payment. Request ID: ${finalizeRequestId}`;
       } else {
         finalizeWarning = paymentAttemptSnapshot?.error
           ? `${paymentAttemptSnapshot.error}\nRequest ID: ${finalizeRequestId}`
