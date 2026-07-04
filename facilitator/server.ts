@@ -11,7 +11,9 @@ const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.FACILITATOR_PORT) || 3000;
-const gatewayClient = new BatchFacilitatorClient();
+const gatewayClient = new BatchFacilitatorClient({
+  url: resolveGatewayApiOrigin(),
+});
 
 function getErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -123,3 +125,9 @@ app.post('/v1/x402/settle', async (req: Request, res: Response) => {
 app.listen(PORT, () => {
   console.log(`Facilitator listening on http://localhost:${PORT}`);
 });
+
+function resolveGatewayApiOrigin(): string {
+  const configured =
+    process.env.GATEWAY_API_BASE_URL?.trim() || 'https://gateway-api-testnet.circle.com/v1';
+  return configured.replace(/\/v1\/?$/i, '').replace(/\/+$/, '');
+}

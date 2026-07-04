@@ -9799,7 +9799,9 @@ async function fetchGatewayBalanceForAddress(address: Address): Promise<{
 function createFacilitatorApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: AGENT_JSON_LIMIT }));
-  const gatewayClient = new BatchFacilitatorClient();
+  const gatewayClient = new BatchFacilitatorClient({
+    url: resolveGatewayApiOrigin(),
+  });
 
   app.get('/health', (_req, res) => {
     res.status(200).json({ status: 'ok' });
@@ -9875,6 +9877,10 @@ function createFacilitatorApp(): express.Express {
   });
 
   return app;
+}
+
+function resolveGatewayApiOrigin(): string {
+  return GATEWAY_API_BASE_URL.replace(/\/v1\/?$/i, '').replace(/\/+$/, '');
 }
 
 function createAgentApp(
