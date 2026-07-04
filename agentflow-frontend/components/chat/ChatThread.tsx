@@ -426,6 +426,10 @@ function extractMarketAddress(value?: string): string | null {
   return match ? match[0].toLowerCase() : null;
 }
 
+function quickActionHasDetail(action: { detail?: string }): boolean {
+  return typeof action.detail === "string" && action.detail.trim().length > 0;
+}
+
 function parsePredmarketInlineBlocks(
   content: string,
   groups?: LiveChatMessage["quickActionGroups"],
@@ -995,11 +999,16 @@ export function ChatThread({
                                         }
                                         className={
                                           action.tone === "secondary"
-                                            ? "inline-flex min-h-10 items-center justify-center gap-2 rounded-full border border-white/10 bg-[#201f1f] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-white/55 transition hover:border-[rgba(242,202,80,0.25)] hover:text-white/90"
-                                            : "inline-flex min-h-10 items-center justify-center gap-2 rounded-full border border-[rgba(242,202,80,0.35)] bg-[rgba(242,202,80,0.12)] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#f2ca50] transition hover:bg-[rgba(242,202,80,0.20)]"
+                                            ? `inline-flex min-h-10 rounded-full border border-white/10 bg-[#201f1f] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-white/55 transition hover:border-[rgba(242,202,80,0.25)] hover:text-white/90 ${quickActionHasDetail(action) ? "flex-col items-start justify-center gap-1 text-left" : "items-center justify-center gap-2"}`
+                                            : `inline-flex min-h-10 rounded-full border border-[rgba(242,202,80,0.35)] bg-[rgba(242,202,80,0.12)] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#f2ca50] transition hover:bg-[rgba(242,202,80,0.20)] ${quickActionHasDetail(action) ? "flex-col items-start justify-center gap-1 text-left" : "items-center justify-center gap-2"}`
                                         }
                                       >
-                                        {action.label}
+                                        <span>{action.label}</span>
+                                        {quickActionHasDetail(action) ? (
+                                          <span className="text-[10px] font-semibold normal-case tracking-[0.06em] text-white/58">
+                                            {action.detail}
+                                          </span>
+                                        ) : null}
                                       </button>
                                     ))}
                                   </div>
@@ -1355,11 +1364,16 @@ export function ChatThread({
                               }
                               className={
                                 action.tone === "secondary"
-                                  ? "inline-flex min-h-10 items-center justify-center gap-2 rounded-full border border-white/10 bg-[#201f1f] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-white/55 transition hover:border-[rgba(242,202,80,0.25)] hover:text-white/90"
-                                  : "inline-flex min-h-10 items-center justify-center gap-2 rounded-full border border-[rgba(242,202,80,0.35)] bg-[rgba(242,202,80,0.12)] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#f2ca50] transition hover:bg-[rgba(242,202,80,0.20)]"
+                                  ? `inline-flex min-h-10 rounded-full border border-white/10 bg-[#201f1f] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-white/55 transition hover:border-[rgba(242,202,80,0.25)] hover:text-white/90 ${quickActionHasDetail(action) ? "flex-col items-start justify-center gap-1 text-left" : "items-center justify-center gap-2"}`
+                                  : `inline-flex min-h-10 rounded-full border border-[rgba(242,202,80,0.35)] bg-[rgba(242,202,80,0.12)] px-4 py-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#f2ca50] transition hover:bg-[rgba(242,202,80,0.20)] ${quickActionHasDetail(action) ? "flex-col items-start justify-center gap-1 text-left" : "items-center justify-center gap-2"}`
                               }
                             >
-                              {action.label}
+                              <span>{action.label}</span>
+                              {quickActionHasDetail(action) ? (
+                                <span className="text-[10px] font-semibold normal-case tracking-[0.06em] text-white/58">
+                                  {action.detail}
+                                </span>
+                              ) : null}
                             </button>
                           ))}
                         </div>

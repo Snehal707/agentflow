@@ -89,6 +89,7 @@ export type LiveChatMessage = {
     title?: string;
     actions: Array<{
       label: string;
+      detail?: string;
       prompt: string;
       actionId?: string;
       routeIntent?:

@@ -432,6 +432,20 @@ type BridgeSourceHolding = {
   nativeBalanceRaw: bigint;
 };
 
+function formatBridgeSourceUsdcBalance(value: bigint): string {
+  const numeric = Number(formatUnits(value, 6));
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return "0 USDC";
+  }
+  if (numeric >= 100) {
+    return `${numeric.toFixed(0)} USDC`;
+  }
+  if (numeric >= 10) {
+    return `${numeric.toFixed(2).replace(/\.?0+$/, "")} USDC`;
+  }
+  return `${numeric.toFixed(3).replace(/\.?0+$/, "")} USDC`;
+}
+
 const VAULT_ADDRESS_BY_SYMBOL: Record<"luneUSDC" | "luneEURC", `0x${string}`> = {
   luneUSDC: "0x66CF9CA9D75FD62438C6E254bA35E61775EF9496",
   luneEURC: "0xcF2C839B12ECf6D9eEcd4607521B73fcFb7E8713",
@@ -4904,6 +4918,7 @@ function ChatPageInner() {
           const fundedChains = holdings.filter((entry) => entry.usdcBalanceRaw > BigInt(0));
           const choices = (fundedChains.length ? fundedChains : holdings).map((entry) => ({
             label: entry.label,
+            detail: formatBridgeSourceUsdcBalance(entry.usdcBalanceRaw),
             prompt: formatBridgeAmountPrompt(amount, entry.label),
             routeIntent: "Bridge" as const,
             tone: "primary" as const,
