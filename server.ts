@@ -138,6 +138,7 @@ import { detectWalletIntent } from './lib/orchestrator';
 import { matchesBrainInternalKey } from './lib/internal-key';
 import { ipRateLimit } from './lib/ip-rate-limit';
 import { sendServerError } from './lib/http-errors';
+import { ARC } from './lib/arc-config';
 import authApiRouter from './api/auth';
 import accessApiRouter from './api/access';
 import walletApiRouter from './api/wallet';
