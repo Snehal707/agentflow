@@ -35,7 +35,7 @@ import type {
   ReportMeta,
   ReportSource,
 } from "@/components/chat/types";
-import { ARC_CHAIN_ID, ARC_USDC_ADDRESS } from "@/lib/arcChain";
+import { ARC_CHAIN_ID, ARC_CHAIN_ID_HEX, ARC_EXPLORER_URL, ARC_USDC_ADDRESS } from "@/lib/arcChain";
 import { defaultPriceBySlug } from "@/lib/agentEndpoints";
 import { authHeadersForWallet } from "@/lib/authSession";
 import { normalizeChatHistoryFromStorage } from "@/lib/chatHistory";
@@ -150,6 +150,46 @@ async function waitForConnectorChain(
   }
 
   throw new Error("Wallet network switch has not settled yet. Please keep the wallet on Arc and try again.");
+}
+
+async function requestWalletSwitchToArc(provider: EIP1193Provider | undefined): Promise<void> {
+  if (!provider?.request) {
+    return;
+  }
+
+  try {
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: ARC_CHAIN_ID_HEX }],
+    });
+    return;
+  } catch (error) {
+    const code =
+      typeof error === "object" && error && "code" in error
+        ? Number((error as { code?: unknown }).code)
+        : NaN;
+
+    if (code !== 4902) {
+      throw error;
+    }
+  }
+
+  await provider.request({
+    method: "wallet_addEthereumChain",
+    params: [
+      {
+        chainId: ARC_CHAIN_ID_HEX,
+        chainName: "Arc Testnet",
+        nativeCurrency: {
+          name: "USD Coin",
+          symbol: "USDC",
+          decimals: 18,
+        },
+        rpcUrls: ["https://rpc.testnet.arc.network"],
+        blockExplorerUrls: [ARC_EXPLORER_URL],
+      },
+    ],
+  });
 }
 
 function isChainMismatchError(error: unknown): boolean {
@@ -4233,6 +4273,7 @@ function ChatPageInner() {
       }));
 
       try {
+        await requestWalletSwitchToArc(browserProvider);
         await withTimeout(
           switchChainAsync({ chainId: ARC_CHAIN_ID }),
           BRIDGE_SWITCH_TIMEOUT_MS,
