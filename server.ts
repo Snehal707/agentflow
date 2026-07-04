@@ -2483,9 +2483,17 @@ function buildStandaloneWorkflowClarification(message: string): string | null {
   }
 
   if (
+    /\b(?:payment link|pay link|qr|scan to pay|scan\b.*pay)\b/i.test(trimmed) &&
+    !/\b(?:for|to)\s+[a-z0-9_.-]+(?:\.arc)?\b/i.test(trimmed)
+  ) {
+    return 'Who should pay through the payment link?';
+  }
+
+  if (
     !hasExplicitAmount &&
     /\b(?:pay|send|transfer)\b/i.test(trimmed) &&
-    !/\b(?:every|weekly|monthly|daily)\b/i.test(trimmed)
+    !/\b(?:every|weekly|monthly|daily)\b/i.test(trimmed) &&
+    !/\b(?:payment link|pay link|qr|scan to pay|scan\b.*pay)\b/i.test(trimmed)
   ) {
     const handleMatch =
       trimmed.match(/\bto\s+([a-z0-9_.-]+(?:\.arc)?)\b/i) ??
@@ -2494,13 +2502,6 @@ function buildStandaloneWorkflowClarification(message: string): string | null {
     if (recipient && !/^(?:me|myself|them|him|her|it|that)$/i.test(recipient)) {
       return `How much do you want to send to ${recipient}?`;
     }
-  }
-
-  if (
-    /\b(?:payment link|pay link|qr|scan to pay|scan\b.*pay)\b/i.test(trimmed) &&
-    !/\b(?:for|to)\s+[a-z0-9_.-]+(?:\.arc)?\b/i.test(trimmed)
-  ) {
-    return 'Who should pay through the payment link?';
   }
 
   if (
