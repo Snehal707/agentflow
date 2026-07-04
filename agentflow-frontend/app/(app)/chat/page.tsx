@@ -4361,7 +4361,7 @@ function ChatPageInner() {
               `The bridge finished, but AgentFlow could not record the bridge receipt payment. Request ID: ${finalizeRequestId}`,
             );
       } else {
-        paymentRequestId = undefined;
+        paymentRequestId = null;
         finalizeWarning = friendlyChatErrorMessage(
           error,
           `The bridge finished, but AgentFlow could not record the bridge receipt payment. Request ID: ${finalizeRequestId}`,
