@@ -7,7 +7,7 @@ function normalizeBaseUrl(value: string): string {
 export function getBackendUrl(path: string): string {
   const base =
     process.env.BACKEND_URL?.trim() ||
-    process.env.NEXT_PUBLIC_BACKEND_URL?.trim() ||
+    process.env.BACKEND_INTERNAL_URL?.trim() ||
     "http://localhost:4000";
 
   return `${normalizeBaseUrl(base)}${path.startsWith("/") ? path : `/${path}`}`;
