@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import { GatewayClient } from '@circlefin/x402-batching/client';
+import { GatewayClient } from '@circle-fin/x402-batching/client';
 
 dotenv.config();
 
@@ -36,4 +36,3 @@ main().catch((err) => {
   console.error('Deposit script failed:', err);
   process.exit(1);
 });
-

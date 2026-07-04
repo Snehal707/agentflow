@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { privateKeyToAccount } from 'viem/accounts';
-import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
+import { createGatewayMiddleware } from '@circle-fin/x402-batching/server';
 import { callHermesFast } from '../../lib/hermes';
 import {
   understandMarketResearch,

@@ -2,7 +2,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import dotenv from 'dotenv';
 import { isAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
+import { createGatewayMiddleware } from '@circle-fin/x402-batching/server';
 import { authMiddleware, type JWTPayload } from '../../lib/auth';
 import { paidInternalOrAuthMiddleware } from '../../lib/agent-internal-auth';
 import { toClientMessage } from '../../lib/http-errors';

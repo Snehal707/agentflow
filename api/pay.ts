@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import ExcelJS from 'exceljs';
 import { createPublicClient, decodeFunctionData, defineChain, getAddress, http, isAddress, parseUnits } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
+import { createGatewayMiddleware } from '@circle-fin/x402-batching/server';
 import { ARC } from '../lib/arc-config';
 import { authMiddleware, type JWTPayload } from '../lib/auth';
 import { adminDb, getRedis } from '../db/client';

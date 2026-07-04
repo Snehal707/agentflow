@@ -1,6 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import dotenv from 'dotenv';
-import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
+import { createGatewayMiddleware } from '@circle-fin/x402-batching/server';
 import { getAddress, isAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 

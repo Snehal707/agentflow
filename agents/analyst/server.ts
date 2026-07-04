@@ -1,7 +1,7 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import dotenv from 'dotenv';
 import { privateKeyToAccount } from 'viem/accounts';
-import { createGatewayMiddleware } from '@circlefin/x402-batching/server';
+import { createGatewayMiddleware } from '@circle-fin/x402-batching/server';
 import { callHermesFast } from '../../lib/hermes';
 import { ANALYST_SYSTEM_PROMPT } from '../../lib/agentPrompts';
 import { resolveAgentPrivateKey } from '../../lib/agentPrivateKey';

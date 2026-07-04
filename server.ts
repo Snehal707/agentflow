@@ -9,7 +9,7 @@ import {
   BatchFacilitatorClient,
   createGatewayMiddleware,
   isBatchPayment,
-} from '@circlefin/x402-batching/server';
+} from '@circle-fin/x402-batching/server';
 import {
   callHermesFast,
 } from './lib/hermes';

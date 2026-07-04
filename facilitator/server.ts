@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import {
   BatchFacilitatorClient,
   isBatchPayment,
-} from '@circlefin/x402-batching/server';
+} from '@circle-fin/x402-batching/server';
 
 dotenv.config();
 
