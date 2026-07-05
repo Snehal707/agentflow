@@ -525,6 +525,10 @@ function paymentPriceLabel(slug: string): string {
   return price ? `$${price} USDC` : "";
 }
 
+function isTxHash(value?: string | null): boolean {
+  return Boolean(value && /^0x[a-fA-F0-9]{64}$/.test(value));
+}
+
 function attachBrowserPaymentMetadata<TResponse>(
   slug: string,
   payer: Address,
@@ -534,6 +538,10 @@ function attachBrowserPaymentMetadata<TResponse>(
     return result.data;
   }
   const data = result.data as PaymentBearingResponse;
+  const fallbackTransaction = typeof result.transaction === "string" ? result.transaction : null;
+  const fallbackSettlementTxHash = isTxHash(fallbackTransaction) ? fallbackTransaction : null;
+  const fallbackTransactionRef =
+    fallbackTransaction && !isTxHash(fallbackTransaction) ? fallbackTransaction : null;
   data.payment = {
     ...(data.payment ?? {}),
     requestId: data.payment?.requestId ?? result.requestId,
@@ -541,9 +549,9 @@ function attachBrowserPaymentMetadata<TResponse>(
     price: data.payment?.price ?? paymentPriceLabel(slug),
     payer: data.payment?.payer ?? payer,
     mode: data.payment?.mode ?? "EOA",
-    transaction: data.payment?.transaction ?? result.transaction ?? null,
-    transactionRef: data.payment?.transactionRef ?? result.transaction ?? null,
-    settlementTxHash: data.payment?.settlementTxHash ?? result.transaction ?? null,
+    transaction: data.payment?.transaction ?? fallbackTransaction,
+    transactionRef: data.payment?.transactionRef ?? fallbackTransactionRef,
+    settlementTxHash: data.payment?.settlementTxHash ?? fallbackSettlementTxHash,
   };
   return data as TResponse;
 }

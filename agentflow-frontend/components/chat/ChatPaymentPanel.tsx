@@ -74,6 +74,22 @@ function shortHash(value?: string | null): string {
   return value.length > 18 ? `${value.slice(0, 10)}...${value.slice(-6)}` : value;
 }
 
+function isTxHash(value?: string | null): boolean {
+  return Boolean(value && /^0x[a-fA-F0-9]{64}$/.test(value));
+}
+
+function paymentRefForDisplay(
+  ref?: string | null,
+  fallbackAttemptTransaction?: string | null,
+): string | null {
+  if (ref) {
+    return ref;
+  }
+  return fallbackAttemptTransaction && !isTxHash(fallbackAttemptTransaction)
+    ? fallbackAttemptTransaction
+    : null;
+}
+
 function agentName(slug?: string | null): string {
   if (!slug) return "Agent";
   return `${slug.charAt(0).toUpperCase()}${slug.slice(1)} Agent`;
@@ -246,7 +262,7 @@ export function ChatPaymentPanel({
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-white/45">Payment ref</span>
                   <span className="font-mono text-white/85">
-                    {shortHash(entry.transactionRef || attempt?.transaction)}
+                    {shortHash(paymentRefForDisplay(entry.transactionRef, attempt?.transaction))}
                   </span>
                 </div>
                 <div className="flex items-center justify-between gap-3">

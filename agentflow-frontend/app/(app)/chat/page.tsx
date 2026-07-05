@@ -945,19 +945,32 @@ function shortPaymentRef(value?: string | null): string {
   return value.length > 18 ? `${value.slice(0, 10)}...${value.slice(-6)}` : value;
 }
 
+function isTxHash(value?: string | null): boolean {
+  return Boolean(value && /^0x[a-fA-F0-9]{64}$/.test(value));
+}
+
 function extractSettlementTx(value: unknown): string | null {
   if (!value) {
     return null;
   }
   if (typeof value === "string") {
-    return value;
+    return isTxHash(value.trim()) ? value.trim() : null;
   }
   if (typeof value !== "object") {
     return null;
   }
   const record = value as Record<string, unknown>;
-  const txHash = record.txHash ?? record.rawTransaction ?? record.transaction ?? record.id;
-  return typeof txHash === "string" && txHash.trim() ? txHash.trim() : null;
+  const txHash = record.txHash ?? record.rawTransaction ?? record.transaction;
+  return typeof txHash === "string" && isTxHash(txHash.trim()) ? txHash.trim() : null;
+}
+
+function extractSettlementRef(value: unknown): string | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const ref = record.id ?? record.rawTransaction ?? record.transaction;
+  return typeof ref === "string" && ref.trim() && !isTxHash(ref.trim()) ? ref.trim() : null;
 }
 
 function formatVoicePaymentLabel(
@@ -1006,7 +1019,10 @@ function buildPaymentMetaFromResult(
   const settlementTxHash =
     payment.settlementTxHash ?? extractSettlementTx(payment.settlement) ?? null;
   const transactionRef =
-    payment.transactionRef ?? payment.transaction ?? extractSettlementTx(payment.settlement) ?? null;
+    payment.transactionRef ??
+    payment.transaction ??
+    extractSettlementRef(payment.settlement) ??
+    null;
   return {
     entries: [
       {
